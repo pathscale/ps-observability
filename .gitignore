@@ -1,1 +1,4 @@
 target/
+
+# Resolved per build from caret ranges; a committed lock only conflicts.
+Cargo.lock
