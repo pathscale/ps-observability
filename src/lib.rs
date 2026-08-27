@@ -72,11 +72,11 @@ fn create_dist_document(dist: &std::path::Path, url: &str) -> Result<ScriptDocum
         let start = html
             .find(&marker)
             .map(|index| index + marker.len())
-            .ok_or_else(|| format!("index.html has no {attribute} asset"))?;
+            .ok_or_else(|| format!("the page has no {attribute} asset"))?;
         let end = html[start..]
             .find('"')
             .map(|index| start + index)
-            .ok_or_else(|| format!("index.html has an unterminated {attribute} asset"))?;
+            .ok_or_else(|| format!("the page has an unterminated {attribute} asset"))?;
         Ok(&html[start..end])
     }
 
@@ -101,10 +101,32 @@ fn create_dist_document(dist: &std::path::Path, url: &str) -> Result<ScriptDocum
         }
     }
 
-    trace(&format!("loading dist: {}", dist.display()));
-    let index_path = dist.join("index.html");
-    let index = fs::read_to_string(&index_path)
-        .map_err(|error| format!("could not read {}: {error}", index_path.display()))?;
+    /*
+     * A page, or a directory holding one.
+     *
+     * Pointing this at a directory and demanding `index.html` inside it forced
+     * every consumer to reshape its build first: a bundler that emits one page
+     * per component (`button.html` beside `button.js`) has no `index.html` at
+     * all, so the QA harness carried a `stage.ts` whose whole job was copying
+     * one page into a throwaway directory under a different name. Accepting the
+     * page directly deletes that step from every project.
+     *
+     * Assets resolve against the page's own directory, which is where a
+     * bundler's relative `src=` and `href=` already point.
+     */
+    let (page_path, asset_root) = if dist.is_dir() {
+        (dist.join("index.html"), dist.to_path_buf())
+    } else {
+        let parent = dist
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", dist.display()))?;
+        (dist.to_path_buf(), parent.to_path_buf())
+    };
+    let dist = asset_root.as_path();
+
+    trace(&format!("loading page: {}", page_path.display()));
+    let index = fs::read_to_string(&page_path)
+        .map_err(|error| format!("could not read {}: {error}", page_path.display()))?;
     let javascript_url = asset_url(&index, "src")?;
     let stylesheet_url = asset_url(&index, "href")?;
     let css = read_brotli_asset(dist, stylesheet_url, "external CSS")?;
