@@ -1,0 +1,31 @@
+[package]
+name = "qa-headless-host"
+description = "Host a Blitz document over the inspection socket, with no window"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pathscale/qa-headless-host"
+keywords = ["qa", "testing", "blitz", "headless", "ui"]
+categories = ["development-tools::testing"]
+
+# This is the half of a QA sweep that must link a renderer. `ps-qa` drives it
+# over a socket and is forbidden from depending on blitz, tauri, winit or wgpu,
+# precisely so that driving a control does not build a browser engine. Keeping
+# the host in its own crate is what lets both stay true.
+[dependencies]
+blitz-dom = { package = "ps-blitz-dom", version = "^0.3.0-beta.11", features = ["system-fonts"] }
+blitz-script = { package = "ps-blitz-script", version = "^0.3.0-beta.11", features = ["system-fonts"] }
+blitz-traits = { package = "ps-blitz-traits", version = "^0.3.0-beta.11" }
+brotli = { version = "^8.0.4", default-features = false, features = ["std"] }
+tauri-runtime-blitz = { version = "^0.1.8", features = ["agent-control"] }
+# Only the channel: `ControlBridge` hands its answer back on a
+# `tokio::sync::oneshot`, so the type has to match. No runtime, no reactor.
+tokio = { version = "^1", default-features = false, features = ["sync"] }
+url = "^2.5.8"
+
+[patch.crates-io]
+# Until TRB#35 is published. It exports `AgentControlServer::start`,
+# `inspect_document`, `click_agent_node` and `press_agent_key`, which is what
+# lets a host serve inspection without opening a window.
+tauri-runtime-blitz = { path = "../tauri-runtime-blitz/crates/tauri-runtime-blitz" }
+blitz-control-protocol = { path = "../tauri-runtime-blitz/crates/blitz-control-protocol" }
