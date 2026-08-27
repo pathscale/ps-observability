@@ -31,9 +31,13 @@ url = "^2.5.8"
 # both on together.
 diagnostics = ["tauri-runtime-blitz/diagnostics"]
 
-# Temporary, until tauri-runtime-blitz publishes `hover_agent_node` (TRB#36).
-# A control revealed on hover is unreachable without it. Drop this and the CI
-# checkout step together once 0.1.10 is on crates.io.
+# Until tauri-runtime-blitz publishes `hover_agent_node`, which this host needs
+# to reach a control revealed on hover. A git dependency rather than a path
+# patch: a path needs a sibling checkout that exists on nobody's CI runner, and
+# working around that meant checking the sibling out inside the workspace and
+# moving it, which is two hacks stacked on a third.
+#
+# Drop back to a plain version once 0.1.10 is on crates.io.
 [patch.crates-io]
-tauri-runtime-blitz = { path = "../tauri-runtime-blitz/crates/tauri-runtime-blitz" }
-blitz-control-protocol = { path = "../tauri-runtime-blitz/crates/blitz-control-protocol" }
+tauri-runtime-blitz = { git = "https://github.com/pathscale/tauri-runtime-blitz", branch = "master" }
+blitz-control-protocol = { git = "https://github.com/pathscale/tauri-runtime-blitz", branch = "master" }
