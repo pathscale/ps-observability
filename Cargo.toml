@@ -30,3 +30,10 @@ url = "^2.5.8"
 # being an unexpected condition. A host that wants to answer diagnostics turns
 # both on together.
 diagnostics = ["tauri-runtime-blitz/diagnostics"]
+
+# Temporary, until tauri-runtime-blitz publishes `hover_agent_node` (TRB#36).
+# A control revealed on hover is unreachable without it. Drop this and the CI
+# checkout step together once 0.1.10 is on crates.io.
+[patch.crates-io]
+tauri-runtime-blitz = { path = "../tauri-runtime-blitz/crates/tauri-runtime-blitz" }
+blitz-control-protocol = { path = "../tauri-runtime-blitz/crates/blitz-control-protocol" }
