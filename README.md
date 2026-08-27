@@ -1,9 +1,9 @@
-# qa-headless-host
+# qa-inspect-host
 
 Host a Blitz document over the inspection socket, with no window.
 
 ```sh
-QA_HOST_DIST=/path/to/one/built/page qa-headless-host
+QA_INSPECT_PAGE=/path/to/one/built/page qa-inspect-host
 ```
 
 It prints its descriptor path on stdout once it is serving, then serves until

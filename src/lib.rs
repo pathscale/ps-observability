@@ -23,7 +23,7 @@
 //! # Use
 //!
 //! ```sh
-//! QA_HOST_DIST=/path/to/one/components/dist qa-headless-host
+//! QA_INSPECT_PAGE=/path/to/one/components/dist qa-inspect-host
 //! ```
 //!
 //! It prints its descriptor path on stdout when it is ready, then serves until
@@ -39,7 +39,7 @@ use std::io::Read;
 use url::Url;
 
 fn trace(message: &str) {
-    eprintln!("qa-headless-host: {message}");
+    eprintln!("qa-inspect-host: {message}");
 }
 
 struct DistScriptFetcher {
@@ -189,9 +189,9 @@ pub fn serve() -> Result<(), String> {
     let width = dimension("QA_HOST_WIDTH", 1344);
     let height = dimension("QA_HOST_HEIGHT", 900);
 
-    trace("headless inspection started");
-    let dist = std::env::var_os("QA_HOST_DIST")
-        .ok_or_else(|| "QA_HOST_DIST is not set; point it at one built page".to_owned())?;
+    trace("inspection host started");
+    let dist = std::env::var_os("QA_INSPECT_PAGE")
+        .ok_or_else(|| "QA_INSPECT_PAGE is not set; point it at one built page".to_owned())?;
     let mut document = create_dist_document(std::path::Path::new(&dist), "tauri://localhost/")?;
     document
         .inner_mut()
@@ -208,7 +208,7 @@ pub fn serve() -> Result<(), String> {
         document.poll(None);
     }
     document.inner_mut().resolve(0.0);
-    trace("headless document ready");
+    trace("document ready");
 
     /*
      * The bridge hands a request to this thread and waits for the answer.
@@ -233,7 +233,7 @@ pub fn serve() -> Result<(), String> {
                 }
                 let _ = response_tx.send(DebugResponse::Error(DebugError {
                     code: "documentUnavailable".into(),
-                    message: "the headless document is no longer serving".into(),
+                    message: "the document is no longer serving".into(),
                 }));
             }
             // This crate does not enable tauri-runtime-blitz's `diagnostics`
@@ -244,7 +244,7 @@ pub fn serve() -> Result<(), String> {
             ControlBridgeRequest::Diagnostics(_) => {
                 let _ = response_tx.send(DebugResponse::Error(DebugError {
                     code: "diagnosticsUnavailable".into(),
-                    message: "the headless host serves inspection only".into(),
+                    message: "this host serves inspection only".into(),
                 }));
             }
         }
@@ -254,7 +254,7 @@ pub fn serve() -> Result<(), String> {
     let server = AgentControlServer::start(bridge)
         .map_err(|error| format!("could not host the control socket: {error}"))?;
     trace(&format!(
-        "headless inspection listening: {}",
+        "inspection socket listening: {}",
         server.descriptor_path().display()
     ));
     // The descriptor path on stdout, so a caller can attach without guessing
@@ -336,7 +336,7 @@ pub fn serve() -> Result<(), String> {
             // silently did nothing reports the component as broken.
             _ => DebugResponse::Error(DebugError {
                 code: "unsupported".into(),
-                message: "the headless host serves Inspect and Click only".into(),
+                message: "this host serves Inspect, Click and Key only".into(),
             }),
         };
         if reply.send(response).is_err() {
@@ -344,6 +344,6 @@ pub fn serve() -> Result<(), String> {
         }
     }
 
-    trace("headless inspection finished");
+    trace("inspection host finished");
     Ok(())
 }

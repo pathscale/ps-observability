@@ -1,11 +1,11 @@
 [package]
-name = "qa-headless-host"
-description = "Host a Blitz document over the inspection socket, with no window"
+name = "qa-inspect-host"
+description = "Host a Blitz document and serve it over the inspection socket"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pathscale/qa-headless-host"
-keywords = ["qa", "testing", "blitz", "headless", "ui"]
+repository = "https://github.com/pathscale/qa-inspect-host"
+keywords = ["qa", "testing", "blitz", "inspection", "ui"]
 categories = ["development-tools::testing"]
 
 # This is the half of a QA sweep that must link a renderer. `ps-qa` drives it
