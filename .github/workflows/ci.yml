@@ -32,3 +32,9 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
         run: cargo build --release
+      # Launches a real host against a real page and connects to the socket it
+      # announces. `ps-qa` cannot cover this: it is forbidden from linking
+      # blitz, so nothing on its side can start a host. Without this the whole
+      # serving path had no CI at all.
+      - name: Test
+        run: cargo test --release
