@@ -31,9 +31,9 @@
 //! waits for that line.
 
 use blitz_dom::Document;
-use brotli::Decompressor;
 use blitz_dom::DocumentConfig;
 use blitz_script::{DefaultScriptFetcher, FetchError, ScriptDocument, ScriptFetcher};
+use brotli::Decompressor;
 use std::fs;
 use std::io::Read;
 use url::Url;
@@ -195,27 +195,29 @@ pub fn serve() -> Result<(), String> {
      * server thread must not block indefinitely if this loop has gone away, so
      * the reply travels on a per-request oneshot the caller owns.
      */
-    let (request_tx, request_rx) = mpsc::channel::<(
-        AgentControlRequest,
-        std::sync::mpsc::Sender<DebugResponse>,
-    )>();
+    let (request_tx, request_rx) =
+        mpsc::channel::<(AgentControlRequest, std::sync::mpsc::Sender<DebugResponse>)>();
 
     let bridge: tauri_runtime_blitz::ControlBridge = std::sync::Arc::new(move |request| {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         match request {
             ControlBridgeRequest::Agent(agent_request) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
-                if request_tx.send((agent_request, reply_tx)).is_ok() {
-                    if let Ok(reply) = reply_rx.recv() {
-                        let _ = response_tx.send(reply);
-                        return response_rx;
-                    }
+                if request_tx.send((agent_request, reply_tx)).is_ok()
+                    && let Ok(reply) = reply_rx.recv()
+                {
+                    let _ = response_tx.send(reply);
+                    return response_rx;
                 }
                 let _ = response_tx.send(DebugResponse::Error(DebugError {
                     code: "documentUnavailable".into(),
                     message: "the headless document is no longer serving".into(),
                 }));
             }
+            // This crate does not enable tauri-runtime-blitz's `diagnostics`
+            // feature, so the variant is absent and the match is exhaustive
+            // without it. Kept behind the same cfg as the variant so enabling
+            // the feature still compiles.
             #[cfg(feature = "diagnostics")]
             ControlBridgeRequest::Diagnostics(_) => {
                 let _ = response_tx.send(DebugResponse::Error(DebugError {
@@ -272,7 +274,10 @@ pub fn serve() -> Result<(), String> {
                 }
             }
             AgentControlRequest::Act(AgentAction::Input(InputCommand::Key {
-                key, code, phase, ..
+                key,
+                code,
+                phase,
+                ..
             })) => {
                 /*
                  * One press per Down, and nothing on the matching Up.

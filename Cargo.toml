@@ -23,6 +23,14 @@ tauri-runtime-blitz = { version = "^0.1.8", features = ["agent-control"] }
 tokio = { version = "^1", default-features = false, features = ["sync"] }
 url = "^2.5.8"
 
+[features]
+# Off by default. The bridge has an arm for diagnostics requests behind this,
+# matching the variant tauri-runtime-blitz only defines when its own
+# `diagnostics` feature is on; declaring it here is what stops the `cfg` from
+# being an unexpected condition. A host that wants to answer diagnostics turns
+# both on together.
+diagnostics = ["tauri-runtime-blitz/diagnostics"]
+
 [patch.crates-io]
 # Until TRB#35 is published. It exports `AgentControlServer::start`,
 # `inspect_document`, `click_agent_node` and `press_agent_key`, which is what

@@ -5486,6 +5486,7 @@ dependencies = [
 name = "tauri-runtime-blitz"
 version = "0.1.8"
 dependencies = [
+ "base64 0.22.1",
  "blitz-control-protocol",
  "endpoint-libs",
  "http",
@@ -5497,7 +5498,9 @@ dependencies = [
  "peniko",
  "ps-anyrender",
  "ps-anyrender-vello",
+ "ps-anyrender-vello-cpu",
  "ps-blitz-dom",
+ "ps-blitz-paint",
  "ps-blitz-script",
  "ps-blitz-shell",
  "ps-blitz-traits",
