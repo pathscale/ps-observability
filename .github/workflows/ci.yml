@@ -22,22 +22,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      #
-      # The sibling the `[patch.crates-io]` in Cargo.toml points at, until
-      # tauri-runtime-blitz publishes `hover_agent_node` (TRB#36). A path patch
-      # needs the path to exist, and a runner has no sibling checkout, so every
-      # job failed to load the dependency before compiling anything.
-      #
-      # Checked out inside the workspace and moved: `actions/checkout` refuses
-      # a path outside the repository directory. Delete this step and the patch
-      # together once 0.1.10 is on crates.io.
-      - uses: actions/checkout@v4
-        with:
-          repository: pathscale/tauri-runtime-blitz
-          ref: master
-          path: .trb-checkout
-      - name: Put the sibling where the patch expects it
-        run: mv .trb-checkout ../tauri-runtime-blitz
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
