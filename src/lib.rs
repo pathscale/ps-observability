@@ -174,8 +174,8 @@ pub fn serve() -> Result<(), String> {
         AgentAction, AgentControlRequest, DebugError, DebugResponse, InputCommand, KeyPhase,
     };
     use tauri_runtime_blitz::{
-        AgentControlServer, ControlBridgeRequest, click_agent_node, inspect_document,
-        press_agent_key,
+        AgentControlServer, ControlBridgeRequest, click_agent_node, hover_agent_node,
+        inspect_document, press_agent_key,
     };
 
     fn dimension(variable: &str, default: u32) -> u32 {
@@ -289,6 +289,39 @@ pub fn serve() -> Result<(), String> {
                     Err(error) => DebugResponse::Error(error),
                 }
             }
+            AgentControlRequest::Act(AgentAction::ScrollIntoView { .. }) => {
+                /*
+                 * Acknowledged rather than refused. A driver scrolls a control
+                 * into view before hovering it, which is right for an
+                 * application with a scrolling region and a no-op on a page
+                 * holding one component: everything is already in view.
+                 *
+                 * Refusing it failed every hovering check with "unsupported"
+                 * before the hover was ever attempted, which reads as a host
+                 * that cannot hover rather than one that cannot scroll.
+                 */
+                DebugResponse::Ack
+            }
+            AgentControlRequest::Act(AgentAction::Hover { node_id }) => {
+                /*
+                 * A control revealed on hover is unreachable without this, and
+                 * a defect that only shows on the second entry is unreachable
+                 * even with one hover: a pill whose hover appends a shadow
+                 * layer and never removes it looks right once.
+                 */
+                match hover_agent_node(&mut document, node_id) {
+                    Ok(_) => {
+                        for _ in 0..4 {
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                            document.eval("void 0");
+                            document.poll(None);
+                        }
+                        document.inner_mut().resolve(0.0);
+                        DebugResponse::Ack
+                    }
+                    Err(error) => DebugResponse::Error(error),
+                }
+            }
             AgentControlRequest::Act(AgentAction::DoubleClick { node_id }) => {
                 match click_agent_node(&mut document, node_id, 2) {
                     Ok(_) => DebugResponse::Ack,
@@ -336,7 +369,7 @@ pub fn serve() -> Result<(), String> {
             // silently did nothing reports the component as broken.
             _ => DebugResponse::Error(DebugError {
                 code: "unsupported".into(),
-                message: "this host serves Inspect, Click and Key only".into(),
+                message: "this host serves Inspect, Hover, Click and Key only".into(),
             }),
         };
         if reply.send(response).is_err() {
