@@ -22,26 +22,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      # The sibling checkout the `[patch.crates-io]` in Cargo.toml points at.
-      #
-      # That patch is temporary: it exists until tauri-runtime-blitz publishes
-      # the exports this host needs (`AgentControlServer::start`,
-      # `inspect_document`, `click_agent_node`, `press_agent_key`). Until then a
-      # path patch is the only way to build, and a path patch needs the path to
-      # exist, so CI checks the sibling out beside this repository exactly as a
-      # developer has it. Delete this step and the patch together.
-      #
-      # Checked out *inside* the workspace, then moved: `actions/checkout`
-      # refuses a path outside the repository directory, so `../` is rejected
-      # outright. Cargo needs it as a sibling, because that is where the patch
-      # in Cargo.toml points and where a developer has it.
-      - uses: actions/checkout@v4
-        with:
-          repository: pathscale/tauri-runtime-blitz
-          ref: expose-headless-inspection
-          path: .trb-checkout
-      - name: Put the sibling where the patch expects it
-        run: mv .trb-checkout ../tauri-runtime-blitz
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
