@@ -168,6 +168,7 @@ fn create_dist_document(dist: &std::path::Path, url: &str) -> Result<ScriptDocum
 }
 
 pub fn serve() -> Result<(), String> {
+    use blitz_traits::events::{BlitzImeEvent, UiEvent};
     use blitz_traits::shell::{ColorScheme, Viewport};
     use std::sync::mpsc;
     use tauri_runtime_blitz::control_protocol::{
@@ -328,6 +329,33 @@ pub fn serve() -> Result<(), String> {
                     Err(error) => DebugResponse::Error(error),
                 }
             }
+            AgentControlRequest::Act(AgentAction::SetValue { node_id, value }) => {
+                let node_id = blitz_dom::NodeId::from_u64(node_id);
+                if !document
+                    .inner()
+                    .get_node(node_id)
+                    .and_then(|node| node.element_data())
+                    .is_some_and(|element| element.text_input_data().is_some())
+                {
+                    DebugResponse::Error(DebugError {
+                        code: "notEditable".into(),
+                        message: "node is not a text input".into(),
+                    })
+                } else {
+                    document.inner_mut().set_focus_to(node_id);
+                    document
+                        .inner_mut()
+                        .with_text_input(node_id, |mut editor| editor.select_all());
+                    document.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(value)));
+                    for _ in 0..6 {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        document.eval("void 0");
+                        document.poll(None);
+                    }
+                    document.inner_mut().resolve(0.0);
+                    DebugResponse::Ack
+                }
+            }
             AgentControlRequest::Act(AgentAction::Input(InputCommand::Key {
                 key,
                 code,
@@ -369,7 +397,7 @@ pub fn serve() -> Result<(), String> {
             // silently did nothing reports the component as broken.
             _ => DebugResponse::Error(DebugError {
                 code: "unsupported".into(),
-                message: "this host serves Inspect, Hover, Click and Key only".into(),
+                message: "this host serves Inspect, Hover, Click, SetValue and Key only".into(),
             }),
         };
         if reply.send(response).is_err() {
