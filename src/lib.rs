@@ -12,7 +12,8 @@
 //! `AgentControlServer::start` was private to the runtime. A sweep of 71
 //! components then meant 71 windows over whatever the person at the machine was
 //! doing. Nothing about the server needs a window, and this is what that fact
-//! buys: a process that owns a document, serves inspection and paints nothing.
+//! buys: a process that owns a document, serves inspection and only paints
+//! offscreen when a visual assertion explicitly asks for pixels.
 //!
 //! # Why it is not part of ps-qa
 //!
@@ -171,6 +172,8 @@ pub fn serve() -> Result<(), String> {
     use blitz_traits::events::{BlitzImeEvent, UiEvent};
     use blitz_traits::shell::{ColorScheme, Viewport};
     use std::sync::mpsc;
+    #[cfg(feature = "diagnostics")]
+    use tauri_runtime_blitz::control_protocol::DiagnosticsRequest;
     use tauri_runtime_blitz::control_protocol::{
         AgentAction, AgentControlRequest, DebugError, DebugResponse, InputCommand, KeyPhase,
     };
@@ -187,6 +190,20 @@ pub fn serve() -> Result<(), String> {
             .unwrap_or(default)
     }
 
+    // Drain synchronous script and reactive work without imposing a timer on
+    // every control. Delayed outcomes are polled by ps-qa against the exact
+    // declared verdict, so sleeping here only makes fast controls slow and
+    // duplicates the caller's timeout.
+    fn settle_immediate(document: &mut ScriptDocument) {
+        for _ in 0..8 {
+            document.eval("void 0");
+            if !document.poll(None) {
+                break;
+            }
+        }
+        document.inner_mut().resolve(0.0);
+    }
+
     let width = dimension("QA_HOST_WIDTH", 1344);
     let height = dimension("QA_HOST_HEIGHT", 900);
 
@@ -199,16 +216,9 @@ pub fn serve() -> Result<(), String> {
         .set_viewport(Viewport::new(width, height, 1.0, ColorScheme::Dark));
     document.execute_scripts();
 
-    // Let the page settle before anyone can ask about it. The fixture backend
-    // resolves commands after 90 ms, so a client that attaches instantly would
-    // otherwise inspect a document that has not mounted yet and see an empty
-    // page, which reads as a component that renders nothing.
-    for _ in 0..8 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        document.eval("void 0");
-        document.poll(None);
-    }
-    document.inner_mut().resolve(0.0);
+    // Script execution is synchronous; drain the reactive work it queued
+    // before announcing the socket instead of sleeping for a fixed 800 ms.
+    settle_immediate(&mut document);
     trace("document ready");
 
     /*
@@ -219,36 +229,21 @@ pub fn serve() -> Result<(), String> {
      * the reply travels on a per-request oneshot the caller owns.
      */
     let (request_tx, request_rx) =
-        mpsc::channel::<(AgentControlRequest, std::sync::mpsc::Sender<DebugResponse>)>();
+        mpsc::channel::<(ControlBridgeRequest, std::sync::mpsc::Sender<DebugResponse>)>();
 
     let bridge: tauri_runtime_blitz::ControlBridge = std::sync::Arc::new(move |request| {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        match request {
-            ControlBridgeRequest::Agent(agent_request) => {
-                let (reply_tx, reply_rx) = mpsc::channel();
-                if request_tx.send((agent_request, reply_tx)).is_ok()
-                    && let Ok(reply) = reply_rx.recv()
-                {
-                    let _ = response_tx.send(reply);
-                    return response_rx;
-                }
-                let _ = response_tx.send(DebugResponse::Error(DebugError {
-                    code: "documentUnavailable".into(),
-                    message: "the document is no longer serving".into(),
-                }));
-            }
-            // This crate does not enable tauri-runtime-blitz's `diagnostics`
-            // feature, so the variant is absent and the match is exhaustive
-            // without it. Kept behind the same cfg as the variant so enabling
-            // the feature still compiles.
-            #[cfg(feature = "diagnostics")]
-            ControlBridgeRequest::Diagnostics(_) => {
-                let _ = response_tx.send(DebugResponse::Error(DebugError {
-                    code: "diagnosticsUnavailable".into(),
-                    message: "this host serves inspection only".into(),
-                }));
-            }
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if request_tx.send((request, reply_tx)).is_ok()
+            && let Ok(reply) = reply_rx.recv()
+        {
+            let _ = response_tx.send(reply);
+            return response_rx;
         }
+        let _ = response_tx.send(DebugResponse::Error(DebugError {
+            code: "documentUnavailable".into(),
+            message: "the document is no longer serving".into(),
+        }));
         response_rx
     });
 
@@ -266,138 +261,128 @@ pub fn serve() -> Result<(), String> {
     let _ = std::io::stdout().flush();
 
     let mut revision = 0_u64;
-    while let Ok((request, reply)) = request_rx.recv() {
+    'serve: while let Ok((request, reply)) = request_rx.recv() {
         let response = match request {
-            AgentControlRequest::Inspect { root, max_depth } => {
-                revision += 1;
-                inspect_document(&mut document, root, max_depth, revision)
-            }
-            AgentControlRequest::Act(AgentAction::Click { node_id }) => {
-                match click_agent_node(&mut document, node_id, 1) {
-                    Ok(_) => {
-                        // Settle before acknowledging. A click that opens a menu
-                        // needs the effect to have run before the next Inspect,
-                        // or the check reads the tree from before its own action
-                        // and reports that nothing happened.
-                        for _ in 0..6 {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            document.eval("void 0");
-                            document.poll(None);
-                        }
-                        document.inner_mut().resolve(0.0);
-                        DebugResponse::Ack
-                    }
-                    Err(error) => DebugResponse::Error(error),
+            ControlBridgeRequest::Agent(request) => match request {
+                AgentControlRequest::Inspect { root, max_depth } => {
+                    revision += 1;
+                    inspect_document(&mut document, root, max_depth, revision)
                 }
-            }
-            AgentControlRequest::Act(AgentAction::ScrollIntoView { .. }) => {
-                /*
-                 * Acknowledged rather than refused. A driver scrolls a control
-                 * into view before hovering it, which is right for an
-                 * application with a scrolling region and a no-op on a page
-                 * holding one component: everything is already in view.
-                 *
-                 * Refusing it failed every hovering check with "unsupported"
-                 * before the hover was ever attempted, which reads as a host
-                 * that cannot hover rather than one that cannot scroll.
-                 */
-                DebugResponse::Ack
-            }
-            AgentControlRequest::Act(AgentAction::Hover { node_id }) => {
-                /*
-                 * A control revealed on hover is unreachable without this, and
-                 * a defect that only shows on the second entry is unreachable
-                 * even with one hover: a pill whose hover appends a shadow
-                 * layer and never removes it looks right once.
-                 */
-                match hover_agent_node(&mut document, node_id) {
-                    Ok(_) => {
-                        for _ in 0..4 {
-                            std::thread::sleep(std::time::Duration::from_millis(25));
-                            document.eval("void 0");
-                            document.poll(None);
-                        }
-                        document.inner_mut().resolve(0.0);
-                        DebugResponse::Ack
-                    }
-                    Err(error) => DebugResponse::Error(error),
-                }
-            }
-            AgentControlRequest::Act(AgentAction::DoubleClick { node_id }) => {
-                match click_agent_node(&mut document, node_id, 2) {
-                    Ok(_) => DebugResponse::Ack,
-                    Err(error) => DebugResponse::Error(error),
-                }
-            }
-            AgentControlRequest::Act(AgentAction::SetValue { node_id, value }) => {
-                let node_id = blitz_dom::NodeId::from_u64(node_id);
-                if !document
-                    .inner()
-                    .get_node(node_id)
-                    .and_then(|node| node.element_data())
-                    .is_some_and(|element| element.text_input_data().is_some())
-                {
-                    DebugResponse::Error(DebugError {
-                        code: "notEditable".into(),
-                        message: "node is not a text input".into(),
-                    })
-                } else {
-                    document.inner_mut().set_focus_to(node_id);
-                    document
-                        .inner_mut()
-                        .with_text_input(node_id, |mut editor| editor.select_all());
-                    document.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(value)));
-                    for _ in 0..6 {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        document.eval("void 0");
-                        document.poll(None);
-                    }
-                    document.inner_mut().resolve(0.0);
-                    DebugResponse::Ack
-                }
-            }
-            AgentControlRequest::Act(AgentAction::Input(InputCommand::Key {
-                key,
-                code,
-                phase,
-                ..
-            })) => {
-                /*
-                 * One press per Down, and nothing on the matching Up.
-                 *
-                 * `press_agent_key` sends both halves, because a control that
-                 * acts on keyup never fires if only a keydown arrives. A client
-                 * that sends the pair would otherwise press the key twice, and
-                 * Escape pressed twice closes a menu and then whatever was
-                 * behind it.
-                 */
-                if matches!(phase, KeyPhase::Up) {
-                    DebugResponse::Ack
-                } else {
-                    match press_agent_key(&mut document, &key, &code) {
-                        Ok(()) => {
-                            for _ in 0..6 {
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                                document.eval("void 0");
-                                document.poll(None);
-                            }
-                            document.inner_mut().resolve(0.0);
+                AgentControlRequest::Act(AgentAction::Click { node_id }) => {
+                    match click_agent_node(&mut document, node_id, 1) {
+                        Ok(_) => {
+                            settle_immediate(&mut document);
                             DebugResponse::Ack
                         }
                         Err(error) => DebugResponse::Error(error),
                     }
                 }
+                AgentControlRequest::Act(AgentAction::ScrollIntoView { .. }) => {
+                    /*
+                     * Acknowledged rather than refused. A driver scrolls a control
+                     * into view before hovering it, which is right for an
+                     * application with a scrolling region and a no-op on a page
+                     * holding one component: everything is already in view.
+                     *
+                     * Refusing it failed every hovering check with "unsupported"
+                     * before the hover was ever attempted, which reads as a host
+                     * that cannot hover rather than one that cannot scroll.
+                     */
+                    DebugResponse::Ack
+                }
+                AgentControlRequest::Act(AgentAction::Hover { node_id }) => {
+                    /*
+                     * A control revealed on hover is unreachable without this, and
+                     * a defect that only shows on the second entry is unreachable
+                     * even with one hover: a pill whose hover appends a shadow
+                     * layer and never removes it looks right once.
+                     */
+                    match hover_agent_node(&mut document, node_id) {
+                        Ok(_) => {
+                            settle_immediate(&mut document);
+                            DebugResponse::Ack
+                        }
+                        Err(error) => DebugResponse::Error(error),
+                    }
+                }
+                AgentControlRequest::Act(AgentAction::DoubleClick { node_id }) => {
+                    match click_agent_node(&mut document, node_id, 2) {
+                        Ok(_) => DebugResponse::Ack,
+                        Err(error) => DebugResponse::Error(error),
+                    }
+                }
+                AgentControlRequest::Act(AgentAction::SetValue { node_id, value }) => {
+                    let node_id = blitz_dom::NodeId::from_u64(node_id);
+                    if !document
+                        .inner()
+                        .get_node(node_id)
+                        .and_then(|node| node.element_data())
+                        .is_some_and(|element| element.text_input_data().is_some())
+                    {
+                        DebugResponse::Error(DebugError {
+                            code: "notEditable".into(),
+                            message: "node is not a text input".into(),
+                        })
+                    } else {
+                        document.inner_mut().set_focus_to(node_id);
+                        document
+                            .inner_mut()
+                            .with_text_input(node_id, |mut editor| editor.select_all());
+                        document.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(value)));
+                        settle_immediate(&mut document);
+                        DebugResponse::Ack
+                    }
+                }
+                AgentControlRequest::Act(AgentAction::Input(InputCommand::Key {
+                    key,
+                    code,
+                    phase,
+                    ..
+                })) => {
+                    /*
+                     * One press per Down, and nothing on the matching Up.
+                     *
+                     * `press_agent_key` sends both halves, because a control that
+                     * acts on keyup never fires if only a keydown arrives. A client
+                     * that sends the pair would otherwise press the key twice, and
+                     * Escape pressed twice closes a menu and then whatever was
+                     * behind it.
+                     */
+                    if matches!(phase, KeyPhase::Up) {
+                        DebugResponse::Ack
+                    } else {
+                        match press_agent_key(&mut document, &key, &code) {
+                            Ok(()) => {
+                                settle_immediate(&mut document);
+                                DebugResponse::Ack
+                            }
+                            Err(error) => DebugResponse::Error(error),
+                        }
+                    }
+                }
+                AgentControlRequest::Quit => {
+                    let _ = reply.send(DebugResponse::Ack);
+                    break 'serve;
+                }
+                // Everything else needs runtime state this host does not have, and
+                // saying so is better than a plausible-looking Ack: a check that
+                // silently did nothing reports the component as broken.
+                _ => DebugResponse::Error(DebugError {
+                    code: "unsupported".into(),
+                    message: "this host serves Inspect, Hover, Click, SetValue and Key only".into(),
+                }),
+            },
+            #[cfg(feature = "diagnostics")]
+            ControlBridgeRequest::Diagnostics(DiagnosticsRequest::Capture(request)) => {
+                match tauri_runtime_blitz::capture_document(&mut document, request) {
+                    Ok(captured) => DebugResponse::Captured(captured),
+                    Err(error) => DebugResponse::Error(error),
+                }
             }
-            AgentControlRequest::Quit => {
-                let _ = reply.send(DebugResponse::Ack);
-                break;
-            }
-            // Everything else needs runtime state this host does not have, and
-            // saying so is better than a plausible-looking Ack: a check that
-            // silently did nothing reports the component as broken.
-            _ => DebugResponse::Error(DebugError {
+            #[cfg(feature = "diagnostics")]
+            ControlBridgeRequest::Diagnostics(_) => DebugResponse::Error(DebugError {
                 code: "unsupported".into(),
-                message: "this host serves Inspect, Hover, Click, SetValue and Key only".into(),
+                message: "the headless host serves diagnostics Capture only".into(),
             }),
         };
         if reply.send(response).is_err() {
