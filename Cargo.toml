@@ -13,11 +13,11 @@ categories = ["development-tools::testing"]
 # precisely so that driving a control does not build a browser engine. Keeping
 # the host in its own crate is what lets both stay true.
 [dependencies]
-blitz-dom = { package = "ps-blitz-dom", version = "^0.3.0-beta.11", features = ["system-fonts"] }
-blitz-script = { package = "ps-blitz-script", version = "^0.3.0-beta.11", features = ["system-fonts"] }
-blitz-traits = { package = "ps-blitz-traits", version = "^0.3.0-beta.11" }
+blitz-dom = { package = "ps-blitz-dom", version = "^0.3.1", features = ["system-fonts"] }
+blitz-script = { package = "ps-blitz-script", version = "^0.3.1", features = ["system-fonts"] }
+blitz-traits = { package = "ps-blitz-traits", version = "^0.3.1" }
 brotli = { version = "^8.0.4", default-features = false, features = ["std"] }
-tauri-runtime-blitz = { version = "^0.1.10", features = ["agent-control"] }
+tauri-runtime-blitz = { version = "^0.1.11", features = ["agent-control"] }
 # Only the channel: `ControlBridge` hands its answer back on a
 # `tokio::sync::oneshot`, so the type has to match. No runtime, no reactor.
 tokio = { version = "^1", default-features = false, features = ["sync"] }
