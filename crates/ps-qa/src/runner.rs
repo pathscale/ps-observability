@@ -651,13 +651,14 @@ fn rgb_pixels_hold(
     }
 }
 
-/// Require hover feedback to change pixels without changing the region's box.
+/// Require visible feedback in either the region's pixels or its box.
+///
+/// A label change can legitimately resize an auto-width trigger, and a hover
+/// treatment can deliberately grow a petal. Both are stronger evidence of a
+/// visible response than a same-size pixel delta.
 fn pixels_change(before: &CapturedImage, after: &CapturedImage) -> std::result::Result<(), String> {
     if before.width != after.width || before.height != after.height {
-        return Err(format!(
-            "hover changed the capture region size from {}x{} to {}x{}",
-            before.width, before.height, after.width, after.height
-        ));
+        return Ok(());
     }
     if captured_pixels_hold(before, after, CAPTURE_CHANNEL_TOLERANCE)? {
         Err("hover left every rendered pixel unchanged".to_owned())
@@ -1503,6 +1504,19 @@ async fn run_qa(
                      ({after_first} -> {after_repeats}); something later entries add is never removed"
                 ));
             }
+        }
+
+        // Action-driven pixel assertions compare a persistent subject while
+        // clicking some other control. Put that subject fully in the viewport
+        // before the baseline: a minimally visible trigger can otherwise
+        // expose only the clipped edge of its text, making two different
+        // labels produce the same captured pixels.
+        if open_error.is_none()
+            && check.expect == qa::Expect::PixelsChange
+            && check.after_prepare_hover.is_none()
+            && let Err(error) = scroll_hover_target_into_view(client, &check.subject).await
+        {
+            open_error = Some(format!("could not reveal pixel subject: {error}"));
         }
 
         // Hover can mount the action that the check will drive. Capture the
@@ -5395,6 +5409,15 @@ mod tests {
             "1 rendered pixel(s) changed after the pointer returned to the same state"
         );
         assert!(pixels_change(&before, &after).is_ok());
+
+        let resized = CapturedImage {
+            width: 2,
+            height: 1,
+            rgba_base64: base64::engine::general_purpose::STANDARD
+                .encode([20, 20, 20, 255, 20, 20, 20, 255]),
+            node_id: Some(7),
+        };
+        assert!(pixels_change(&before, &resized).is_ok());
 
         let alpha_only = capture(&[20, 20, 20, 80]);
         assert!(rgb_pixels_hold(&before, &alpha_only).is_ok());
