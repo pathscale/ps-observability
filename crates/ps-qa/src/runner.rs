@@ -60,24 +60,21 @@ async fn wait_for_arrival(
     let mut painted_streak = 0;
     let mut root = None;
     loop {
-        let tree = if let Some(node_id) = root {
+        let (tree, scoped) = if let Some(node_id) = root {
             match inspect_subtree(client, node_id).await {
-                Ok((tree, _)) => tree,
+                Ok((tree, _)) => (tree, true),
                 // A reconciliation may replace the node between samples. One
                 // full read reacquires it; a stale id is not a failed check.
                 Err(_) => {
                     root = None;
                     painted_streak = 0;
-                    inspect(client).await?.0
+                    (inspect(client).await?.0, false)
                 }
             }
         } else {
-            inspect(client).await?.0
+            (inspect(client).await?.0, false)
         };
-        let arrived = destination.map_or_else(
-            || painted_named(&tree.nodes, want_here),
-            |surface| reach::on_surface(&tree.nodes, surface),
-        );
+        let arrived = arrival_sample_matches(&tree.nodes, destination, want_here, scoped);
         if arrived && root.is_none() {
             root = arrival_anchor(&tree.nodes, destination, want_here);
         } else if !arrived && root.is_some() {
@@ -90,6 +87,28 @@ async fn wait_for_arrival(
             return Ok(false);
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn arrival_sample_matches(
+    nodes: &[SemanticNode],
+    destination: Option<&reach::Surface>,
+    want_here: &str,
+    scoped: bool,
+) -> bool {
+    if scoped {
+        // The anchor subtree intentionally excludes permanent chrome such as
+        // the selected tab. The preceding full snapshot already proved that
+        // chrome state; scoped polls only need to prove that the destination
+        // marker remains painted. Reapplying the whole-surface rule here made
+        // every permanent surface oscillate full -> subtree -> full until its
+        // deadline.
+        arrival_anchor(nodes, destination, want_here).is_some()
+    } else {
+        destination.map_or_else(
+            || painted_named(nodes, want_here),
+            |surface| reach::on_surface(nodes, surface),
+        )
     }
 }
 
@@ -5262,8 +5281,8 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InventoryClass, OutcomeStability, arrived_without_navigation, duplicate_dom_ids,
-        generated_dom_id, inventory_class, is_pagination_control, name_matches,
+        InventoryClass, OutcomeStability, arrival_sample_matches, arrived_without_navigation,
+        duplicate_dom_ids, generated_dom_id, inventory_class, is_pagination_control, name_matches,
         named_document_is_active, named_document_is_active_with_permanent,
         named_document_opener_for, outcome_check_ids, outcome_verdict, pagination_advanced,
         painted_bounds, painted_named, pixels_change, pixels_hold, resolved_action_target,
@@ -5394,6 +5413,24 @@ mod tests {
         assert!(!stable_arrival(&mut streak, true));
         assert!(!stable_arrival(&mut streak, true));
         assert!(stable_arrival(&mut streak, true));
+    }
+
+    #[test]
+    fn scoped_arrival_needs_only_its_painted_marker() {
+        let marker = component("Search settings", true, true);
+        let settings = SurfaceSpec {
+            name: "settings".into(),
+            opener: "Settings".into(),
+            marker: Some("Search settings".into()),
+            reveal_with: Some("Search settings".into()),
+        };
+
+        assert!(arrival_sample_matches(
+            &[marker],
+            Some(&settings),
+            "Glass opacity",
+            true
+        ));
     }
 
     #[test]
