@@ -175,7 +175,8 @@ pub fn serve() -> Result<(), String> {
     #[cfg(feature = "diagnostics")]
     use tauri_runtime_blitz::control_protocol::DiagnosticsRequest;
     use tauri_runtime_blitz::control_protocol::{
-        AgentAction, AgentControlRequest, DebugError, DebugResponse, InputCommand, KeyPhase,
+        AgentAction, AgentControlRequest, DebugError, DebugEvent, DebugResponse, InputCommand,
+        KeyPhase,
     };
     use tauri_runtime_blitz::{
         AgentControlServer, ControlBridgeRequest, DocumentCapture, click_agent_node,
@@ -202,6 +203,13 @@ pub fn serve() -> Result<(), String> {
             }
         }
         document.inner_mut().resolve(0.0);
+    }
+
+    fn commit_render(events: &tokio::sync::watch::Sender<Option<DebugEvent>>, revision: &mut u64) {
+        *revision = revision.saturating_add(1);
+        events.send_replace(Some(DebugEvent::PaintCommitted {
+            revision: *revision,
+        }));
     }
 
     let width = dimension("QA_HOST_WIDTH", 1344);
@@ -247,7 +255,8 @@ pub fn serve() -> Result<(), String> {
         response_rx
     });
 
-    let server = AgentControlServer::start(bridge)
+    let (render_events, render_event_receiver) = tokio::sync::watch::channel(None);
+    let server = AgentControlServer::start_with_events(bridge, render_event_receiver)
         .map_err(|error| format!("could not host the control socket: {error}"))?;
     trace(&format!(
         "inspection socket listening: {}",
@@ -261,6 +270,7 @@ pub fn serve() -> Result<(), String> {
     let _ = std::io::stdout().flush();
 
     let mut revision = 0_u64;
+    let mut render_revision = 0_u64;
     #[cfg(feature = "diagnostics")]
     let mut capture = DocumentCapture::new();
     'serve: while let Ok((request, reply)) = request_rx.recv() {
@@ -275,6 +285,7 @@ pub fn serve() -> Result<(), String> {
                     match focus_agent_node(&mut document, node_id) {
                         Ok(()) => {
                             settle_immediate(&mut document);
+                            commit_render(&render_events, &mut render_revision);
                             DebugResponse::Ack
                         }
                         Err(error) => DebugResponse::Error(error),
@@ -284,6 +295,7 @@ pub fn serve() -> Result<(), String> {
                     match click_agent_node(&mut document, node_id, 1) {
                         Ok(_) => {
                             settle_immediate(&mut document);
+                            commit_render(&render_events, &mut render_revision);
                             DebugResponse::Ack
                         }
                         Err(error) => DebugResponse::Error(error),
@@ -312,6 +324,7 @@ pub fn serve() -> Result<(), String> {
                     match hover_agent_node(&mut document, node_id) {
                         Ok(_) => {
                             settle_immediate(&mut document);
+                            commit_render(&render_events, &mut render_revision);
                             DebugResponse::Ack
                         }
                         Err(error) => DebugResponse::Error(error),
@@ -319,7 +332,11 @@ pub fn serve() -> Result<(), String> {
                 }
                 AgentControlRequest::Act(AgentAction::DoubleClick { node_id }) => {
                     match click_agent_node(&mut document, node_id, 2) {
-                        Ok(_) => DebugResponse::Ack,
+                        Ok(_) => {
+                            settle_immediate(&mut document);
+                            commit_render(&render_events, &mut render_revision);
+                            DebugResponse::Ack
+                        }
                         Err(error) => DebugResponse::Error(error),
                     }
                 }
@@ -342,6 +359,7 @@ pub fn serve() -> Result<(), String> {
                             .with_text_input(node_id, |mut editor| editor.select_all());
                         document.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(value)));
                         settle_immediate(&mut document);
+                        commit_render(&render_events, &mut render_revision);
                         DebugResponse::Ack
                     }
                 }
@@ -366,6 +384,7 @@ pub fn serve() -> Result<(), String> {
                         match press_agent_key(&mut document, &key, &code) {
                             Ok(()) => {
                                 settle_immediate(&mut document);
+                                commit_render(&render_events, &mut render_revision);
                                 DebugResponse::Ack
                             }
                             Err(error) => DebugResponse::Error(error),
