@@ -179,7 +179,7 @@ pub fn serve() -> Result<(), String> {
     };
     use tauri_runtime_blitz::{
         AgentControlServer, ControlBridgeRequest, DocumentCapture, click_agent_node,
-        focus_agent_node, hover_agent_node, inspect_document, press_agent_key,
+        focus_agent_node, hover_agent_node, inspect_document, press_agent_key, snapshot_document,
     };
 
     fn dimension(variable: &str, default: u32) -> u32 {
@@ -393,9 +393,17 @@ pub fn serve() -> Result<(), String> {
                 }
             }
             #[cfg(feature = "diagnostics")]
+            ControlBridgeRequest::Diagnostics(DiagnosticsRequest::Snapshot(request)) => {
+                revision += 1;
+                match snapshot_document(&mut document, request, revision) {
+                    Ok(snapshot) => DebugResponse::Snapshot(snapshot),
+                    Err(error) => DebugResponse::Error(error),
+                }
+            }
+            #[cfg(feature = "diagnostics")]
             ControlBridgeRequest::Diagnostics(_) => DebugResponse::Error(DebugError {
                 code: "unsupported".into(),
-                message: "the headless host serves diagnostics Capture only".into(),
+                message: "the headless host serves diagnostics Capture and Snapshot only".into(),
             }),
         };
         if reply.send(response).is_err() {
