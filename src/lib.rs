@@ -178,8 +178,8 @@ pub fn serve() -> Result<(), String> {
         AgentAction, AgentControlRequest, DebugError, DebugResponse, InputCommand, KeyPhase,
     };
     use tauri_runtime_blitz::{
-        AgentControlServer, ControlBridgeRequest, click_agent_node, hover_agent_node,
-        inspect_document, press_agent_key,
+        AgentControlServer, ControlBridgeRequest, DocumentCapture, click_agent_node,
+        focus_agent_node, hover_agent_node, inspect_document, press_agent_key,
     };
 
     fn dimension(variable: &str, default: u32) -> u32 {
@@ -261,12 +261,24 @@ pub fn serve() -> Result<(), String> {
     let _ = std::io::stdout().flush();
 
     let mut revision = 0_u64;
+    #[cfg(feature = "diagnostics")]
+    let mut capture = DocumentCapture::new();
     'serve: while let Ok((request, reply)) = request_rx.recv() {
         let response = match request {
             ControlBridgeRequest::Agent(request) => match request {
                 AgentControlRequest::Inspect { root, max_depth } => {
                     revision += 1;
                     inspect_document(&mut document, root, max_depth, revision)
+                }
+                AgentControlRequest::Act(AgentAction::Focus { node_id }) => {
+                    let node_id = blitz_dom::NodeId::from_u64(node_id);
+                    match focus_agent_node(&mut document, node_id) {
+                        Ok(()) => {
+                            settle_immediate(&mut document);
+                            DebugResponse::Ack
+                        }
+                        Err(error) => DebugResponse::Error(error),
+                    }
                 }
                 AgentControlRequest::Act(AgentAction::Click { node_id }) => {
                     match click_agent_node(&mut document, node_id, 1) {
@@ -369,12 +381,13 @@ pub fn serve() -> Result<(), String> {
                 // silently did nothing reports the component as broken.
                 _ => DebugResponse::Error(DebugError {
                     code: "unsupported".into(),
-                    message: "this host serves Inspect, Hover, Click, SetValue and Key only".into(),
+                    message: "this host serves Inspect, Focus, Hover, Click, SetValue and Key only"
+                        .into(),
                 }),
             },
             #[cfg(feature = "diagnostics")]
             ControlBridgeRequest::Diagnostics(DiagnosticsRequest::Capture(request)) => {
-                match tauri_runtime_blitz::capture_document(&mut document, request) {
+                match capture.capture(&mut document, request) {
                     Ok(captured) => DebugResponse::Captured(captured),
                     Err(error) => DebugResponse::Error(error),
                 }

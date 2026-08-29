@@ -1,7 +1,7 @@
 [package]
 name = "qa-inspect-host"
 description = "Host a Blitz document and serve it over the inspection socket"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pathscale/qa-inspect-host"
@@ -17,7 +17,7 @@ blitz-dom = { package = "ps-blitz-dom", version = "^0.3.1", features = ["system-
 blitz-script = { package = "ps-blitz-script", version = "^0.3.1", features = ["system-fonts"] }
 blitz-traits = { package = "ps-blitz-traits", version = "^0.3.1" }
 brotli = { version = "^8.0.4", default-features = false, features = ["std"] }
-tauri-runtime-blitz = { version = "^0.1.13", features = ["agent-control"] }
+tauri-runtime-blitz = { version = "^0.1.17", features = ["agent-control"] }
 # Only the channel: `ControlBridge` hands its answer back on a
 # `tokio::sync::oneshot`, so the type has to match. No runtime, no reactor.
 tokio = { version = "^1", default-features = false, features = ["sync"] }
