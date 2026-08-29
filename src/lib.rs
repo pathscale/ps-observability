@@ -195,14 +195,16 @@ pub fn serve() -> Result<(), String> {
     // every control. Delayed outcomes are polled by ps-qa against the exact
     // declared verdict, so sleeping here only makes fast controls slow and
     // duplicates the caller's timeout.
-    fn settle_immediate(document: &mut ScriptDocument) {
+    fn settle_immediate(document: &mut ScriptDocument, clock: &std::time::Instant) -> bool {
+        let before = document.inner().paint_damage().generation;
         for _ in 0..8 {
             document.eval("void 0");
             if !document.poll(None) {
                 break;
             }
         }
-        document.inner_mut().resolve(0.0);
+        document.inner_mut().resolve(clock.elapsed().as_secs_f64());
+        document.inner().paint_damage().generation != before
     }
 
     fn commit_render(events: &tokio::sync::watch::Sender<Option<DebugEvent>>, revision: &mut u64) {
@@ -222,11 +224,13 @@ pub fn serve() -> Result<(), String> {
     document
         .inner_mut()
         .set_viewport(Viewport::new(width, height, 1.0, ColorScheme::Dark));
+    document.inner_mut().set_paint_damage_tracking(true);
     document.execute_scripts();
 
     // Script execution is synchronous; drain the reactive work it queued
     // before announcing the socket instead of sleeping for a fixed 800 ms.
-    settle_immediate(&mut document);
+    let animation_clock = std::time::Instant::now();
+    settle_immediate(&mut document, &animation_clock);
     trace("document ready");
 
     /*
@@ -274,6 +278,7 @@ pub fn serve() -> Result<(), String> {
     #[cfg(feature = "diagnostics")]
     let mut capture = DocumentCapture::new();
     'serve: while let Ok((request, reply)) = request_rx.recv() {
+        let mut painted = false;
         let response = match request {
             ControlBridgeRequest::Agent(request) => match request {
                 AgentControlRequest::Inspect { root, max_depth } => {
@@ -284,8 +289,7 @@ pub fn serve() -> Result<(), String> {
                     let node_id = blitz_dom::NodeId::from_u64(node_id);
                     match focus_agent_node(&mut document, node_id) {
                         Ok(()) => {
-                            settle_immediate(&mut document);
-                            commit_render(&render_events, &mut render_revision);
+                            painted = settle_immediate(&mut document, &animation_clock);
                             DebugResponse::Ack
                         }
                         Err(error) => DebugResponse::Error(error),
@@ -294,8 +298,7 @@ pub fn serve() -> Result<(), String> {
                 AgentControlRequest::Act(AgentAction::Click { node_id }) => {
                     match click_agent_node(&mut document, node_id, 1) {
                         Ok(_) => {
-                            settle_immediate(&mut document);
-                            commit_render(&render_events, &mut render_revision);
+                            painted = settle_immediate(&mut document, &animation_clock);
                             DebugResponse::Ack
                         }
                         Err(error) => DebugResponse::Error(error),
@@ -323,8 +326,7 @@ pub fn serve() -> Result<(), String> {
                      */
                     match hover_agent_node(&mut document, node_id) {
                         Ok(_) => {
-                            settle_immediate(&mut document);
-                            commit_render(&render_events, &mut render_revision);
+                            painted = settle_immediate(&mut document, &animation_clock);
                             DebugResponse::Ack
                         }
                         Err(error) => DebugResponse::Error(error),
@@ -333,8 +335,7 @@ pub fn serve() -> Result<(), String> {
                 AgentControlRequest::Act(AgentAction::DoubleClick { node_id }) => {
                     match click_agent_node(&mut document, node_id, 2) {
                         Ok(_) => {
-                            settle_immediate(&mut document);
-                            commit_render(&render_events, &mut render_revision);
+                            painted = settle_immediate(&mut document, &animation_clock);
                             DebugResponse::Ack
                         }
                         Err(error) => DebugResponse::Error(error),
@@ -358,8 +359,7 @@ pub fn serve() -> Result<(), String> {
                             .inner_mut()
                             .with_text_input(node_id, |mut editor| editor.select_all());
                         document.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(value)));
-                        settle_immediate(&mut document);
-                        commit_render(&render_events, &mut render_revision);
+                        painted = settle_immediate(&mut document, &animation_clock);
                         DebugResponse::Ack
                     }
                 }
@@ -383,8 +383,7 @@ pub fn serve() -> Result<(), String> {
                     } else {
                         match press_agent_key(&mut document, &key, &code) {
                             Ok(()) => {
-                                settle_immediate(&mut document);
-                                commit_render(&render_events, &mut render_revision);
+                                painted = settle_immediate(&mut document, &animation_clock);
                                 DebugResponse::Ack
                             }
                             Err(error) => DebugResponse::Error(error),
@@ -427,6 +426,9 @@ pub fn serve() -> Result<(), String> {
         };
         if reply.send(response).is_err() {
             break;
+        }
+        if painted {
+            commit_render(&render_events, &mut render_revision);
         }
     }
 
