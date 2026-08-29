@@ -16,6 +16,68 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use endpoint_libs::libs::ws::MessageStream;
+use endpoint_libs::libs::ws::mcp_wire::JsonRpcId;
+use endpoint_libs::libs::ws::transport::{TransportStream, framed_json};
+use tauri_runtime_blitz::control_protocol::{
+    AgentAction, AgentControlRequest, DebugEvent, DebugResponse, DebugStream, DiagnosticsRequest,
+    decode_diagnostics_event, decode_response, encode_agent_request, encode_diagnostics_request,
+};
+
+async fn request(
+    stream: &mut dyn MessageStream,
+    next_id: &mut i64,
+    request: &AgentControlRequest,
+) -> DebugResponse {
+    *next_id += 1;
+    let id = JsonRpcId::Number(*next_id);
+    stream
+        .send(encode_agent_request(id.clone(), request).expect("encode agent request"))
+        .await
+        .expect("send agent request");
+    loop {
+        let message = stream
+            .recv()
+            .await
+            .expect("the host keeps serving")
+            .expect("read agent response");
+        if let Ok((response_id, response)) = decode_response(message)
+            && response_id == id
+        {
+            return response;
+        }
+    }
+}
+
+async fn observe_paint(stream: &mut dyn MessageStream, next_id: &mut i64) {
+    *next_id += 1;
+    let id = JsonRpcId::Number(*next_id);
+    stream
+        .send(
+            encode_diagnostics_request(
+                id.clone(),
+                &DiagnosticsRequest::Observe {
+                    streams: vec![DebugStream::Paint],
+                },
+            )
+            .expect("encode observe request"),
+        )
+        .await
+        .expect("send observe request");
+    loop {
+        let message = stream
+            .recv()
+            .await
+            .expect("the host keeps serving")
+            .expect("read observe response");
+        if let Ok((response_id, DebugResponse::Ack)) = decode_response(message)
+            && response_id == id
+        {
+            return;
+        }
+    }
+}
+
 /// Kill the host however the test ends, including on a panic.
 struct Host(std::process::Child);
 
@@ -81,4 +143,84 @@ fn serves_a_page_over_the_inspection_socket() {
         "the inspection socket should accept a connection at {}",
         socket.display()
     );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let socket = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect async client");
+        let mut stream = TransportStream::new(framed_json(socket));
+        let mut next_id = 0;
+        let snapshot = request(
+            &mut stream,
+            &mut next_id,
+            &AgentControlRequest::Inspect {
+                root: None,
+                max_depth: 20,
+            },
+        )
+        .await;
+        let DebugResponse::AgentSnapshot(snapshot) = snapshot else {
+            panic!("inspect should return a semantic snapshot");
+        };
+        let button = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.role.eq_ignore_ascii_case("button"))
+            .unwrap_or_else(|| panic!("fixture button missing from {:?}", snapshot.nodes))
+            .id;
+
+        observe_paint(&mut stream, &mut next_id).await;
+        assert!(matches!(
+            request(
+                &mut stream,
+                &mut next_id,
+                &AgentControlRequest::Act(AgentAction::ScrollIntoView { node_id: button }),
+            )
+            .await,
+            DebugResponse::Ack
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.recv())
+                .await
+                .is_err(),
+            "a supported no-op must not fabricate a paint event"
+        );
+
+        assert!(matches!(
+            request(
+                &mut stream,
+                &mut next_id,
+                &AgentControlRequest::Act(AgentAction::ScrollBy {
+                    node_id: button,
+                    delta_x: 0.0,
+                    delta_y: 10.0,
+                }),
+            )
+            .await,
+            DebugResponse::Error(error) if error.code == "unsupported"
+        ));
+
+        assert!(matches!(
+            request(
+                &mut stream,
+                &mut next_id,
+                &AgentControlRequest::Act(AgentAction::Hover { node_id: button }),
+            )
+            .await,
+            DebugResponse::Ack
+        ));
+        let event = tokio::time::timeout(Duration::from_millis(250), stream.recv())
+            .await
+            .expect("a real hover repaint should emit an event")
+            .expect("the host keeps serving")
+            .expect("read paint event");
+        assert!(matches!(
+            decode_diagnostics_event(event),
+            Ok(DebugEvent::PaintCommitted { .. })
+        ));
+    });
 }

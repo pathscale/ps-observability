@@ -28,3 +28,7 @@ url = "^2.5.8"
 # feature named lets minimal embedders opt out with `--no-default-features`.
 default = ["diagnostics"]
 diagnostics = ["tauri-runtime-blitz/diagnostics"]
+
+[dev-dependencies]
+endpoint-libs = { version = "2.1.5", default-features = false, features = ["agent-control"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "time"] }
