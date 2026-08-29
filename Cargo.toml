@@ -1,34 +1,25 @@
-[package]
-name = "qa-inspect-host"
-description = "Host a Blitz document and serve it over the inspection socket"
-version = "0.1.4"
+[workspace]
+resolver = "3"
+members = [
+    "crates/blitz-control-protocol",
+    "crates/ps-blitz-debug-control",
+    "crates/ps-qa",
+    "crates/qa-inspect-host",
+]
+
+[workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pathscale/qa-inspect-host"
-keywords = ["qa", "testing", "blitz", "inspection", "ui"]
-categories = ["development-tools::testing"]
+repository = "https://github.com/pathscale/ps-observability"
 
-# This is the half of a QA sweep that must link a renderer. `ps-qa` drives it
-# over a socket and is forbidden from depending on blitz, tauri, winit or wgpu,
-# precisely so that driving a control does not build a browser engine. Keeping
-# the host in its own crate is what lets both stay true.
-[dependencies]
-blitz-dom = { package = "ps-blitz-dom", version = "^0.3", features = ["system-fonts"] }
-blitz-script = { package = "ps-blitz-script", version = "^0.3", features = ["system-fonts"] }
-blitz-traits = { package = "ps-blitz-traits", version = "^0.3" }
-brotli = { version = "^8.0.4", default-features = false, features = ["std"] }
-tauri-runtime-blitz = { version = "^0.1", features = ["agent-control"] }
-# Only the channel: `ControlBridge` hands its answer back on a
-# `tokio::sync::oneshot`, so the type has to match. No runtime, no reactor.
-tokio = { version = "^1", default-features = false, features = ["sync"] }
-url = "^2.5.8"
+[workspace.dependencies]
+blitz-control-protocol = { version = "^0.1", path = "crates/blitz-control-protocol" }
+endpoint-libs = { version = "^2", default-features = false, features = ["agent-control"] }
+serde = { version = "^1", features = ["derive"] }
+serde_json = "^1"
+schemars = "^1"
+tokio = { version = "^1" }
 
-[features]
-# Native visual QA is a core host capability, not a special build. Keeping the
-# feature named lets minimal embedders opt out with `--no-default-features`.
-default = ["diagnostics"]
-diagnostics = ["tauri-runtime-blitz/diagnostics"]
-
-[dev-dependencies]
-endpoint-libs = { version = "2.1.5", default-features = false, features = ["agent-control"] }
-tokio = { version = "1", features = ["io-util", "net", "rt", "time"] }
+[patch.crates-io]
+blitz-control-protocol = { path = "crates/blitz-control-protocol" }
+ps-blitz-debug-control = { path = "crates/ps-blitz-debug-control" }

@@ -1,0 +1,26 @@
+[package]
+name = "blitz-control-protocol"
+description = "Wire types for the Blitz agent-control and diagnostics protocol"
+version = "0.1.20"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/pathscale/ps-observability"
+publish = true
+
+# Deliberately tiny. This crate exists so a client can speak the protocol
+# without building the runtime that serves it: adding anything here that pulls
+# in a window, a renderer or a font stack defeats the whole point. The check
+# is `cargo tree -p blitz-control-protocol`, which should stay in the dozens
+# of crates rather than the hundreds.
+[dependencies]
+endpoint-libs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+
+[dev-dependencies]
+# The framing round-trip test drives a real duplex pipe rather than asserting
+# on a string, because the bug this protocol keeps hitting is at the seam
+# between the typed value and the bytes, not inside serde.
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }

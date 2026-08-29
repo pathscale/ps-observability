@@ -14,12 +14,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  host:
-    name: Host (macOS)
-    # A renderer, so this is not a Linux-only check: the host links blitz and
-    # builds the same way the QA sweep runs it.
-    runs-on: macos-latest
-    timeout-minutes: 30
+  core:
+    name: Protocol, transports, and driver (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,12 +27,43 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Build
-        run: cargo build --release
-      # Launches a real host against a real page and connects to the socket it
-      # announces. `ps-qa` cannot cover this: it is forbidden from linking
-      # blitz, so nothing on its side can start a host. Without this the whole
-      # serving path had no CI at all.
+        run: cargo clippy -p blitz-control-protocol -p ps-blitz-debug-control -p ps-qa --all-targets -- -D warnings
       - name: Test
-        run: cargo test --release
+        run: cargo test -p blitz-control-protocol -p ps-blitz-debug-control -p ps-qa
+      - name: Keep the driver renderer-free
+        run: |
+          cargo tree -p ps-qa > /tmp/ps-qa-tree.txt
+          if grep -Eq '(^| )((ps-)?blitz-(dom|html|paint|shell)|tauri|winit|wgpu) v' /tmp/ps-qa-tree.txt; then
+            echo 'ps-qa pulled a renderer or window runtime into its dependency tree' >&2
+            exit 1
+          fi
+
+  host:
+    name: Renderer host and live socket (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy host
+        run: cargo clippy -p qa-inspect-host --all-targets -- -D warnings
+      - name: Test real host transport
+        run: cargo test -p qa-inspect-host --release
+
+  package:
+    name: Package boundaries
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package independently versioned crates
+        run: |
+          cargo package -p blitz-control-protocol
+          cargo package -p ps-blitz-debug-control
+          cargo package -p qa-inspect-host --no-verify
+          cargo package -p ps-qa --no-verify

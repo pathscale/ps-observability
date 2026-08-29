@@ -1,18 +1,22 @@
-name: Publish
+name: Publish changed crates
 
-# A reviewed version bump is the release trigger. Source-only pushes at an
-# already-published version exit cleanly instead of attempting to overwrite it.
 on:
   push:
     branches: [master]
     paths:
+      - crates/**
       - Cargo.toml
-      - src/**
       - .github/workflows/publish.yml
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Package without uploading
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
-  group: publish-qa-inspect-host
+  group: publish-ps-observability
   cancel-in-progress: false
 
 permissions:
@@ -20,11 +24,9 @@ permissions:
 
 jobs:
   publish:
-    name: crates.io
-    # The host links the native renderer. Its Linux runtime cannot currently
-    # implement Tauri's GTK-only traits, so package it on the supported host.
+    name: Changed packages, dependency order
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
@@ -32,26 +34,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check registry state
-        id: registry
+      - name: Publish versions absent from crates.io
+        shell: zsh {0}
         run: |
-          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          published="$(curl -sS -H 'User-Agent: pathscale-ci' \
-            'https://crates.io/api/v1/crates/qa-inspect-host/versions' \
-            | jq -r --arg version "$version" \
-              '.versions[]? | select(.num == $version) | .num')"
-          if [ -n "$published" ]; then
-            echo 'publish=false' >> "$GITHUB_OUTPUT"
-            echo "qa-inspect-host $version is already published"
-          else
-            echo 'publish=true' >> "$GITHUB_OUTPUT"
-            echo "qa-inspect-host $version is new"
-          fi
+          set -euo pipefail
 
-      - name: Verify package
-        if: steps.registry.outputs.publish == 'true'
-        run: cargo package
+          publish_if_new() {
+            local package="$1"
+            local manifest="crates/$2/Cargo.toml"
+            local version
+            version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$manifest" | head -1)"
+            local published
+            published="$(curl -fsS -H 'User-Agent: pathscale-ci' \
+              "https://crates.io/api/v1/crates/$package/versions" \
+              | jq -r --arg version "$version" \
+                '.versions[]? | select(.num == $version) | .num')"
 
-      - name: Publish package
-        if: steps.registry.outputs.publish == 'true'
-        run: cargo publish
+            if [[ -n "$published" ]]; then
+              print "$package $version is already published"
+              return
+            fi
+
+            cargo package -p "$package"
+            if [[ '${{ inputs.dry_run }}' == 'true' ]]; then
+              print "dry run: $package $version packaged"
+            else
+              cargo publish -p "$package"
+            fi
+          }
+
+          publish_if_new blitz-control-protocol blitz-control-protocol
+          publish_if_new ps-blitz-debug-control ps-blitz-debug-control
+          publish_if_new qa-inspect-host qa-inspect-host
+          publish_if_new ps-qa ps-qa

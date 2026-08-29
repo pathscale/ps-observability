@@ -1,0 +1,15 @@
+[package]
+name = "ps-blitz-debug-control"
+description = "Debug-only WebDriver-compatible control transport for Blitz"
+documentation = "https://docs.rs/ps-blitz-debug-control"
+version = "0.3.5"
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/pathscale/ps-observability"
+categories = ["development-tools::debugging", "development-tools::testing"]
+edition.workspace = true
+
+[dependencies]
+getrandom = "^0.4"
+serde.workspace = true
+serde_json.workspace = true

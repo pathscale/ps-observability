@@ -16,9 +16,7 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use endpoint_libs::libs::ws::MessageStream;
-use endpoint_libs::libs::ws::mcp_wire::JsonRpcId;
-use endpoint_libs::libs::ws::transport::{TransportStream, framed_json};
+use blitz_control_protocol::{JsonRpcId, MessageStream, TransportStream, framed_json};
 use tauri_runtime_blitz::control_protocol::{
     AgentAction, AgentControlRequest, DebugEvent, DebugResponse, DebugStream, DiagnosticsRequest,
     decode_diagnostics_event, decode_response, encode_agent_request, encode_diagnostics_request,
