@@ -1,40 +1,60 @@
-# qa-inspect-host
+# ps-observability
 
-Host a Blitz document over the inspection socket, with no window.
+The observability and QA stack for native Blitz applications. This workspace
+keeps the protocol, transports, renderer host, driver, fixtures, and release
+documentation together so the system has one ownership boundary.
 
-```sh
-QA_INSPECT_PAGE=/path/to/one/built/page qa-inspect-host
+```text
+application / tauri-runtime-blitz
+              |
+              | typed events, snapshots, actions
+              v
+blitz-control-protocol
+       |                         |
+       | endpoint-libs framed    | WebDriver-compatible HTTP
+       v                         v
+qa-inspect-host          ps-blitz-debug-control
+       |
+       v
+     ps-qa
 ```
 
-It prints its descriptor path on stdout once it is serving, then serves until
-killed. `ps-qa sweep-components` launches one per component and waits for that
-line.
+`endpoint-libs` owns framing and MCP/JSON-RPC wire primitives. This workspace
+owns observability semantics: commands, events, revision rules, session
+behaviour, discovery, diagnostics, and QA outcomes. Renderer crates expose
+instrumentation hooks but do not own a control server.
 
-## Why
+## Crates
 
-A component sweep asks what happens when a control is pressed. Answering that
-needs a live document behind a socket: a screenshot says only that something
-painted, and a semantic tree written to a file says only what was on screen at
-one instant, so every check involving a click is undecidable against either.
+- `blitz-control-protocol`: transport-neutral observability domain types and
+  their MCP wire encoding. It deliberately has no renderer dependency.
+- `ps-blitz-debug-control`: loopback WebDriver-compatible transport adapter.
+- `qa-inspect-host`: a real renderer host for headless fixtures and CI.
+- `ps-qa`: the lightweight driver, audit runner, and report generator.
 
-Hosting the socket used to require opening a window, because
-`AgentControlServer::start` was private to the runtime. A sweep of 71 components
-meant 71 windows over whatever the person at the machine was doing. Nothing
-about that server needs a window, and this crate is what that buys: a process
-that owns a document, serves inspection, and paints nothing.
+## Quick start
 
-## Why not part of ps-qa
+```zsh
+cargo install ps-qa
+cargo run -p qa-inspect-host
+ps-qa sweep --help
+```
 
-`ps-qa` may not depend on blitz, tauri, winit or wgpu, so that driving a control
-does not build a browser engine. A host has to link a renderer. Two crates, one
-socket between them.
+The host prints its descriptor path when ready. `ps-qa` discovers that live
+descriptor automatically, or accepts an explicit descriptor path.
 
-## What it answers
+## Security
 
-`Inspect`, `Click`, `DoubleClick` and `Key`. Anything else returns `unsupported`
-rather than a plausible `Ack`, because a check that silently did nothing reports
-a working component as broken.
+Observability endpoints are debugger interfaces, not application sandboxes.
+They must bind only to local transports. The WebDriver adapter uses loopback,
+an unpredictable per-process token, and owner-only discovery files on Unix.
+The framed inspection socket has the same same-user trust boundary: any
+process able to access the socket can inspect the UI and request supported
+actions. Arbitrary script execution, where enabled, has the same posture as a
+browser remote-debugging port and must remain disabled in production builds.
 
-Pointer and wheel events are not implemented: those carry pointer position and
-button state on the runtime itself, which a windowless host has nothing to
-attach to.
+## Releases
+
+Crates keep independent versions. Release automation publishes only packages
+whose manifest version is not already present in the registry; changing one
+adapter does not force a version train across the workspace.

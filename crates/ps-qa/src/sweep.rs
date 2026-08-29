@@ -1,0 +1,571 @@
+//! Click every button and check that it did what it says.
+//!
+//! # Why this exists
+//!
+//! The audit next door measures what a control *shows*. That is not what a
+//! button is for. A `Delete` that paints perfectly and deletes nothing is a
+//! working picture of a broken feature, and a user asked, correctly and more
+//! than once, for the thing that presses them.
+//!
+//! So this presses them. Run it against an application-configured throwaway
+//! profile so destructive controls cannot affect real data; profile setup is
+//! owned by the application, not this harness.
+//!
+//! # What an expectation is
+//!
+//! Every button claims something in its accessible name. `Collapse Records` says
+//! a section will collapse; `Delete X` says a row will disappear; `Close X` says
+//! a tab will go. Each of those is a statement about the tree *after* the click,
+//! and the tree is readable, so each is checkable without knowing anything about
+//! the application's internals.
+//!
+//! The check is deliberately shallow and mechanical: does the control's own
+//! promise hold. It does not know what a project is, and it does not need to.
+//! That is what lets one rule cover forty buttons and keep covering them when
+//! forty-one appear.
+
+use blitz_control_protocol::SemanticNode;
+
+/// What a button's own name promises will happen when it is pressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expectation {
+    /// The button is replaced by its opposite: `Collapse X` becomes `Expand X`.
+    ///
+    /// The strongest cheap signal available. A disclosure control that does not
+    /// swap did not act, and the swap is visible in the tree with no knowledge
+    /// of what was disclosed.
+    Toggles { into: String },
+    /// A named row disappears from the tree.
+    Removes { subject: String },
+    /// Something new appears: the tree grows.
+    Adds,
+    /// The tree changes in some way, which is all a generic action promises.
+    Changes,
+    /// Pressing it must be safe and change nothing observable.
+    Inert,
+}
+
+/// One button, its promise, and how to recognise it afterwards.
+#[derive(Debug, Clone)]
+pub struct Case {
+    pub id: u64,
+    pub name: String,
+    pub family: &'static str,
+    pub expect: Expectation,
+}
+
+/// What the tree should look like after the click, from the button's name.
+///
+/// Derived rather than configured. A table of button-name-to-behaviour would be
+/// another thing to keep in step with the application, and the day it drifts is
+/// the day the sweep starts lying; the accessible name is already the contract
+/// and is already asserted by the accessibility layer.
+pub fn expectation_for(name: &str, explicitly_inert: bool) -> Expectation {
+    let lower = name.to_lowercase();
+
+    if explicitly_inert {
+        return Expectation::Inert;
+    }
+
+    /*
+     * Disclosure pairs, which name their own inverse.
+     *
+     * Built from the *original* name, not the lowercased one: the comparison
+     * downstream is case-insensitive, but a subject taken from `lower` and
+     * pasted after a capitalised verb produces a string that matches nothing
+     * and reports every working toggle as broken.
+     */
+    for (from, to) in [("collapse ", "Expand "), ("expand ", "Collapse ")] {
+        if lower.starts_with(from) {
+            let subject = &name[from.len()..];
+            return Expectation::Toggles {
+                into: format!("{to}{subject}"),
+            };
+        }
+    }
+    if lower.starts_with("hide ") {
+        return Expectation::Changes;
+    }
+
+    // Destructive controls name their subject: "Delete Foo", "Close Foo".
+    for prefix in ["delete ", "close ", "retire ", "remove "] {
+        if let Some(subject) = lower.strip_prefix(prefix) {
+            return Expectation::Removes {
+                subject: subject.to_owned(),
+            };
+        }
+    }
+
+    if lower.starts_with("add ") || lower.starts_with("new ") || lower.contains("create") {
+        return Expectation::Adds;
+    }
+
+    // A copy control writes to the clipboard and must not disturb the document.
+    if lower.starts_with("copy") {
+        return Expectation::Inert;
+    }
+
+    Expectation::Changes
+}
+
+/// Buttons worth clicking, in the order they appear.
+///
+/// Only visible, enabled, named buttons with a box: a control a person cannot
+/// reach is not one whose behaviour can be asserted, and pressing it would test
+/// the harness rather than the application.
+pub fn cases(
+    nodes: &[SemanticNode],
+    family: Option<&str>,
+    family_of: impl Fn(&str) -> &'static str,
+    is_inert: impl Fn(&str) -> bool,
+) -> Vec<Case> {
+    nodes
+        .iter()
+        .filter(|node| node.role == "button" && node.visible && node.enabled)
+        .filter(|node| !node.name.trim().is_empty())
+        .filter(|node| node.bounds.is_some_and(|b| b[2] > 0.0 && b[3] > 0.0))
+        .map(|node| {
+            let family_name = family_of(&node.name);
+            Case {
+                id: node.id,
+                name: node.name.clone(),
+                family: family_name,
+                expect: expectation_for(&node.name, is_inert(&node.name)),
+            }
+        })
+        .filter(|case| family.is_none_or(|want| case.family == want))
+        .collect()
+}
+
+/// Whether a button of this name exists in the tree.
+pub fn has_button(nodes: &[SemanticNode], name: &str) -> bool {
+    let wanted = name.to_lowercase();
+    nodes
+        .iter()
+        .any(|node| painted_button(node) && node.name.to_lowercase() == wanted)
+}
+
+/// Whether a button belongs to what the user can currently operate.
+///
+/// Retained panes keep hidden copies of rows after another pane replaces them.
+/// Presence anywhere in the tree therefore cannot prove a row survived a
+/// delete; it only proves some inactive pane remembers an old copy.
+fn painted_button(node: &SemanticNode) -> bool {
+    node.role == "button"
+        && node.visible
+        && node
+            .bounds
+            .is_some_and(|bounds| bounds[2] > 0.0 && bounds[3] > 0.0)
+}
+
+/// The result of pressing one button.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub case: Case,
+    /// `None` when the button did what it promised.
+    pub failure: Option<String>,
+}
+
+/// Judge one click from the trees either side of it.
+pub fn judge(case: &Case, before: &[SemanticNode], after: &[SemanticNode]) -> Option<String> {
+    match &case.expect {
+        Expectation::Toggles { into } => {
+            if has_button(after, into) {
+                None
+            } else if has_button(after, &case.name) {
+                Some(format!("still reads {:?}; it did not toggle", case.name))
+            } else {
+                Some(format!(
+                    "neither {:?} nor {into:?} is present now",
+                    case.name
+                ))
+            }
+        }
+        Expectation::Removes { subject } => {
+            /*
+             * A confirmation is the control working, not failing.
+             *
+             * `Delete` on a project row does not delete: it swaps the row for
+             * an inline "Delete? Delete Cancel", and the row is still there
+             * until the second press. Judging only on the row's absence called
+             * every one of those broken - six of them in one run - when the
+             * guard is the feature. What the first press promises is that it
+             * asks, and that is what is checked.
+             */
+            if confirmation_appeared(before, after) {
+                return None;
+            }
+            // The subject may be named by more than one control, so what is
+            // asserted is that *this* button is gone, not every mention of it.
+            if has_button(after, &case.name) {
+                Some(format!("{:?} is still there; nothing was removed", subject))
+            } else {
+                None
+            }
+        }
+        Expectation::Adds => {
+            // A create action may either reveal the new UI or disappear once
+            // its external resource exists (for example, creating a recommended
+            // directory). Both are visible acknowledgements of success.
+            if after.len() > before.len() || !has_button(after, &case.name) {
+                None
+            } else {
+                Some(format!(
+                    "the tree did not grow: {} nodes before, {} after",
+                    before.len(),
+                    after.len()
+                ))
+            }
+        }
+        Expectation::Changes => {
+            if tree_fingerprint(before) == tree_fingerprint(after) {
+                let selected_choice = before
+                    .iter()
+                    .find(|node| node.id == case.id)
+                    .filter(|node| node.selected)
+                    .is_some_and(|selected| {
+                        before.iter().any(|sibling| {
+                            sibling.id != selected.id
+                                && sibling.parent == selected.parent
+                                && sibling.role == selected.role
+                                && sibling.enabled
+                                && !sibling.selected
+                        })
+                    });
+                if selected_choice {
+                    None
+                } else {
+                    Some("nothing in the tree changed".to_owned())
+                }
+            } else {
+                None
+            }
+        }
+        Expectation::Inert => {
+            /*
+             * Its own "Copied" feedback is not a document change.
+             *
+             * A copy control flips a label or shows a tick for a second, which
+             * is the only way a person knows it worked. Once visibility joined
+             * the fingerprint - needed to catch controls that only reveal
+             * something - that feedback started reading as a violation, and
+             * every `Copy` in the app was reported for mutating the document
+             * while the node count was identical either side.
+             *
+             * What `Inert` is actually for is a copy that adds, removes or
+             * disables something, so that is what is checked.
+             */
+            /*
+             * Counted, not diffed, and only for the controls.
+             *
+             * A running app's tree drifts on its own - it grew by a hundred
+             * nodes between two reads here with nothing pressed, which is the
+             * degradation this harness has open as a separate bug - so any
+             * exact before/after comparison reports every `Copy` in the app for
+             * mutating the document. What `Inert` is for is a copy that adds,
+             * removes or disables a control, and that survives the drift.
+             */
+            let controls = |nodes: &[SemanticNode]| {
+                let mut rows: Vec<(String, bool)> = nodes
+                    .iter()
+                    // Copy feedback may retain the node or remount it with a
+                    // `Copied …` label. Ignore that whole feedback family;
+                    // changes to every non-copy neighbour still fail.
+                    .filter(|node| {
+                        let name = node.name.to_lowercase();
+                        node.role == "button"
+                            && !name.starts_with("copy")
+                            && !name.starts_with("copied")
+                    })
+                    .map(|node| (node.name.clone(), node.enabled))
+                    .collect();
+                rows.sort();
+                rows
+            };
+            if controls(before) == controls(after) {
+                None
+            } else {
+                Some(
+                    "a control appeared, vanished or changed state; this should only copy"
+                        .to_owned(),
+                )
+            }
+        }
+    }
+}
+
+/// Whether the click put a confirmation in front of the user.
+///
+/// Recognised by a `Cancel` that was not there before: a guarded action offers
+/// a way out, and an ordinary re-render does not grow one. Deliberately narrow,
+/// because treating any new control as a confirmation would excuse a `Delete`
+/// that merely redrew its own row.
+fn confirmation_appeared(before: &[SemanticNode], after: &[SemanticNode]) -> bool {
+    let cancels = |nodes: &[SemanticNode]| {
+        nodes
+            .iter()
+            .filter(|node| {
+                let lower = node.name.to_lowercase();
+                painted_button(node)
+                    && (lower == "cancel" || lower.ends_with("cancel") || lower.contains("delete?"))
+            })
+            .count()
+    };
+    cancels(after) > cancels(before)
+}
+
+/// A cheap summary of the tree, for "did anything happen".
+///
+/// Semantic names, roles, state and values rather than geometry: a hover highlight or a scroll moves
+/// boxes without the application having done anything, and counting that as a
+/// change would make every button appear to work.
+///
+/// Visibility, selection and value are in the summary because plenty of controls do nothing else. The
+/// rename pencil swaps a `hidden` class on two already-mounted spans, and with
+/// visibility left out this said "nothing in the tree changed" whether the
+/// editor opened or not - it could not have caught the bug it was pointed at.
+fn tree_fingerprint(
+    nodes: &[SemanticNode],
+) -> Vec<(String, String, bool, bool, bool, Option<String>)> {
+    nodes
+        .iter()
+        .map(|node| {
+            (
+                node.role.clone(),
+                node.name.clone(),
+                node.enabled,
+                node.visible,
+                node.selected,
+                node.value.clone(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn button(name: &str) -> SemanticNode {
+        SemanticNode {
+            dom_id: None,
+            id: 0,
+            parent: None,
+            role: "button".to_owned(),
+            name: name.to_owned(),
+            value: None,
+            enabled: true,
+            visible: true,
+            selected: false,
+            bounds: Some([0.0, 0.0, 10.0, 10.0]),
+            slot: None,
+        }
+    }
+
+    #[test]
+    fn a_delete_that_asks_first_has_done_its_job() {
+        // The real shape from a running list: the row grows an inline
+        // "Delete? Delete Cancel" and the project stays until it is confirmed.
+        let case = Case {
+            id: 1,
+            name: "Delete thing".to_owned(),
+            family: "delete",
+            expect: expectation_for("Delete thing", false),
+        };
+        let before = vec![button("Delete thing"), button("Rename thing")];
+        let after = vec![
+            button("Delete thing"),
+            button("Rename thing"),
+            button("Cancel"),
+        ];
+        assert_eq!(judge(&case, &before, &after), None);
+    }
+
+    #[test]
+    fn a_hidden_retained_row_does_not_make_a_delete_fail() {
+        let case = Case {
+            id: 1,
+            name: "Delete thing".to_owned(),
+            family: "delete",
+            expect: expectation_for("Delete thing", false),
+        };
+        let before = vec![button("Delete thing")];
+        let mut retained = button("Delete thing");
+        retained.visible = false;
+        let after = vec![retained];
+        assert_eq!(judge(&case, &before, &after), None);
+    }
+
+    #[test]
+    fn a_hidden_retained_cancel_is_not_a_confirmation() {
+        let case = Case {
+            id: 1,
+            name: "Delete thing".to_owned(),
+            family: "delete",
+            expect: expectation_for("Delete thing", false),
+        };
+        let before = vec![button("Delete thing")];
+        let mut hidden_cancel = button("Cancel");
+        hidden_cancel.visible = false;
+        let after = vec![button("Delete thing"), hidden_cancel];
+        assert!(judge(&case, &before, &after).is_some());
+    }
+
+    #[test]
+    fn a_control_that_only_reveals_something_counts_as_acting() {
+        /*
+         * The rename pencil's whole effect. Nothing is added, removed, renamed
+         * or disabled: one already-mounted span stops being hidden and another
+         * starts. With visibility out of the fingerprint this read as "nothing
+         * in the tree changed" whether the editor opened or not.
+         */
+        let case = Case {
+            id: 1,
+            name: "Rename thing".to_owned(),
+            family: "edit",
+            expect: expectation_for("Rename thing", false),
+        };
+        let mut field = button("Project name");
+        field.role = "textbox".to_owned();
+        field.visible = false;
+        let before = vec![button("Rename thing"), field.clone()];
+
+        let mut revealed = field;
+        revealed.visible = true;
+        let after = vec![button("Rename thing"), revealed];
+
+        assert_eq!(judge(&case, &before, &after), None);
+        // And the failing case the app actually shows: nothing moves at all.
+        assert!(judge(&case, &before, &before).is_some());
+    }
+
+    #[test]
+    fn selection_and_value_changes_count_as_acting() {
+        let selected_case = Case {
+            id: 1,
+            name: "Interface size".to_owned(),
+            family: "interface",
+            expect: Expectation::Changes,
+        };
+        let before = vec![button("Interface size")];
+        let mut selected = before.clone();
+        selected[0].selected = true;
+        assert_eq!(judge(&selected_case, &before, &selected), None);
+
+        let mut valued = before.clone();
+        valued[0].value = Some("large".to_owned());
+        assert_eq!(judge(&selected_case, &before, &valued), None);
+    }
+
+    #[test]
+    fn reselecting_the_current_choice_is_an_expected_noop_but_a_lone_toggle_is_not() {
+        let case = Case {
+            id: 1,
+            name: "Softness 0%".to_owned(),
+            family: "softness",
+            expect: Expectation::Changes,
+        };
+        let mut selected = button("Softness 0%");
+        selected.id = 1;
+        selected.parent = Some(9);
+        selected.selected = true;
+        let mut alternative = button("Softness 50%");
+        alternative.id = 2;
+        alternative.parent = Some(9);
+        let choices = vec![selected.clone(), alternative];
+        assert_eq!(judge(&case, &choices, &choices), None);
+
+        let lone = vec![selected];
+        assert!(judge(&case, &lone, &lone).is_some());
+    }
+
+    #[test]
+    fn a_delete_that_does_nothing_at_all_still_fails() {
+        let case = Case {
+            id: 1,
+            name: "Delete thing".to_owned(),
+            family: "delete",
+            expect: expectation_for("Delete thing", false),
+        };
+        let before = vec![button("Delete thing"), button("Rename thing")];
+        assert!(judge(&case, &before, &before).is_some());
+    }
+
+    #[test]
+    fn an_explicitly_inert_control_may_leave_the_tree_unchanged() {
+        for name in ["Synchronize", "Check remote state"] {
+            let case = Case {
+                id: 1,
+                name: name.to_owned(),
+                family: "other",
+                expect: expectation_for(name, true),
+            };
+            let tree = vec![button(name), button("Neighbour")];
+            assert!(
+                judge(&case, &tree, &tree).is_none(),
+                "{name} should be allowed to leave the tree alone"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicitly_inert_paint_toggle_is_not_called_dead() {
+        let name = "Appearance toggle";
+        let case = Case {
+            id: 1,
+            name: name.to_owned(),
+            family: "other",
+            expect: expectation_for(name, true),
+        };
+        let tree = vec![button(name), button("Neighbour")];
+        assert!(judge(&case, &tree, &tree).is_none());
+    }
+
+    #[test]
+    fn copy_feedback_on_the_activated_control_is_not_a_document_change() {
+        let case = Case {
+            id: 1,
+            name: "Copy session id".to_owned(),
+            family: "copy",
+            expect: expectation_for("Copy session id", false),
+        };
+        let mut copy = button("Copy session id");
+        copy.id = case.id;
+        let neighbour = button("Neighbour");
+        let before = vec![copy.clone(), neighbour.clone()];
+        copy.id = 3;
+        copy.name = "Copied session id".to_owned();
+        let after = vec![copy, neighbour];
+
+        assert_eq!(judge(&case, &before, &after), None);
+    }
+
+    #[test]
+    fn create_can_acknowledge_success_by_removing_its_action() {
+        let case = Case {
+            id: 1,
+            name: "Create recommended folder".to_owned(),
+            family: "add",
+            expect: expectation_for("Create recommended folder", false),
+        };
+        let before = vec![button("Create recommended folder"), button("Neighbour")];
+        let after = vec![button("Created"), button("Neighbour")];
+
+        assert_eq!(judge(&case, &before, &after), None);
+    }
+
+    #[test]
+    fn an_inert_control_that_wrecks_the_document_still_fails() {
+        // `Inert` is a weaker claim than `Changes`, not no claim at all: the
+        // re-fetch may find nothing, but it may not tear down the surface.
+        let case = Case {
+            id: 1,
+            name: "Synchronize".to_owned(),
+            family: "other",
+            expect: expectation_for("Synchronize", true),
+        };
+        let before = vec![button("Synchronize"), button("Neighbour")];
+        let after = vec![button("Synchronize")];
+        assert!(judge(&case, &before, &after).is_some());
+    }
+}

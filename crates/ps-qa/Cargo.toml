@@ -1,0 +1,45 @@
+[package]
+name = "ps-qa"
+description = "Drive a running Blitz app through its MCP control socket and assert what the renderer did"
+version = "0.4.16"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pathscale/ps-observability"
+homepage = "https://github.com/pathscale/ps-observability"
+keywords = ["qa", "testing", "blitz", "mcp", "ui"]
+categories = ["development-tools::testing"]
+publish = true
+# `autotests = false` used to live here, because the check definitions sat
+# directly in `tests/` and cargo built each one as its own test target where
+# `crate::qa` does not exist. They are nested at `tests/ps-qa/` now, which cargo
+# does not chase, so there is nothing to auto-discover and nothing to switch off.
+
+# Nothing here may pull in tauri, winit, wgpu or blitz. The protocol types come
+# from `blitz-control-protocol` precisely so this binary can speak the wire
+# without building the renderer that serves it; depending on
+# `tauri-runtime-blitz` for the same types would build a browser engine to send
+# a wheel event. `cargo tree -p ps-qa` is the check.
+[dependencies]
+blitz-control-protocol.workspace = true
+# The same framing the server uses, from the same crate, for the same reason as
+# the protocol types: a hand-rolled length-prefix reader is how the Python
+# client hung on its first malformed frame.
+eyre = "0.6"
+# Decoding captured frames: the protocol carries RGBA8 as base64 because the
+# transport is line-delimited JSON.
+base64 = "0.22"
+serde.workspace = true
+# The application profile is data, so the harness reads a file rather than
+# hardcoding one product's surface names.
+ron = "0.8"
+# `preserve_order` so the JSON dumps keep the server's field order rather than
+# sorting it. The dump modes exist to be diffed against previous runs, and
+# alphabetising the keys would make every historical comparison useless.
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
+toon-format = { version = "0.5.0", default-features = false }
+clap = { version = "4.6.6", features = ["derive", "env"] }
+
+[[bin]]
+name = "ps-qa"
+path = "src/main.rs"
