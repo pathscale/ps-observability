@@ -578,6 +578,7 @@ impl Command {
                 | Command::Cover { .. }
                 | Command::Inventory { .. }
                 | Command::Qa { .. }
+                | Command::SweepComponents { .. }
         )
     }
 
@@ -596,7 +597,9 @@ impl Command {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, parse_timeout_scale};
+    use std::path::PathBuf;
+
+    use super::{CheckMode, Command, parse_timeout_scale};
 
     #[test]
     fn timeout_scale_is_explicit_and_bounded() {
@@ -614,6 +617,17 @@ mod tests {
             Command::Qa {
                 selector: None,
                 checks: None,
+            }
+            .requires_app_profile()
+        );
+        assert!(
+            Command::SweepComponents {
+                ids: Vec::new(),
+                host: PathBuf::from("host"),
+                dists: PathBuf::from("dist"),
+                checks: None,
+                startup_timeout: 30,
+                mode: CheckMode::Isolated,
             }
             .requires_app_profile()
         );

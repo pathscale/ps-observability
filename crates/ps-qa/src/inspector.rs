@@ -440,3 +440,71 @@ fn response_id(message: &WireMessage) -> Option<JsonRpcId> {
 fn protocol_error(error: DebugProtocolError) -> eyre::Report {
     eyre!("{error}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blitz_control_protocol::{JsonRpcResponse, encode_diagnostics_event};
+    use tokio::net::UnixListener;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_retries_startup_and_exchange_preserves_events() {
+        let socket = std::env::temp_dir().join(format!(
+            "ps-qa-transport-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos()
+        ));
+        let server_socket = socket.clone();
+        let server = async move {
+            // The descriptor can be visible before its socket is bound. Make
+            // that production race deterministic and require the client retry.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let listener = UnixListener::bind(&server_socket).expect("bind test socket");
+            let (stream, _) = listener.accept().await.expect("accept test client");
+            let mut stream = TransportStream::new(framed_json(stream));
+            let _request = stream
+                .recv()
+                .await
+                .expect("client keeps connection open")
+                .expect("read initialize request");
+            stream
+                .send(
+                    encode_diagnostics_event(&DebugEvent::PaintCommitted { revision: 7 })
+                        .expect("encode paint event"),
+                )
+                .await
+                .expect("send paint event");
+            stream
+                .send(
+                    encode_rpc(JsonRpcMessage::Response(JsonRpcResponse::result(
+                        Some(JsonRpcId::Number(1)),
+                        serde_json::json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
+                    )))
+                    .expect("encode initialize response"),
+                )
+                .await
+                .expect("send initialize response");
+        };
+
+        let client_socket = socket.clone();
+        let client = async move {
+            let mut client = Client::connect(&client_socket)
+                .await
+                .expect("client retries until socket is bound");
+            client.initialize().await.expect("initialize completes");
+            assert!(
+                client
+                    .wait_for_paint(Duration::ZERO)
+                    .await
+                    .expect("queued paint remains readable"),
+                "an event arriving before the response must not steal the response or be discarded"
+            );
+        };
+
+        tokio::join!(server, client);
+        let _ = std::fs::remove_file(socket);
+    }
+}
