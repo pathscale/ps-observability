@@ -65,5 +65,8 @@ jobs:
 
           publish_if_new blitz-control-protocol blitz-control-protocol
           publish_if_new ps-blitz-debug-control ps-blitz-debug-control
-          publish_if_new qa-inspect-host qa-inspect-host
           publish_if_new ps-qa ps-qa
+          # The host embeds tauri-runtime-blitz, which in turn consumes the
+          # protocol above. Keep it last so a new protocol and driver can ship
+          # before the corresponding runtime release reaches crates.io.
+          publish_if_new qa-inspect-host qa-inspect-host
