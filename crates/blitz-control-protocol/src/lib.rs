@@ -44,6 +44,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub const DEBUG_PROTOCOL_VERSION: u32 = 1;
+pub const MAX_DEBUG_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MCP_INITIALIZE: &str = "initialize";
 pub const MCP_INITIALIZED_NOTIFICATION: &str = "notifications/initialized";
 pub const MCP_TOOLS_LIST: &str = "tools/list";
@@ -65,6 +66,7 @@ pub struct DebugDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum IncomingRequest {
     Initialize {
         id: JsonRpcId,
@@ -85,6 +87,7 @@ pub enum IncomingRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "command", content = "params", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum AgentControlRequest {
     Inspect { root: Option<u64>, max_depth: u32 },
     Act(AgentAction),
@@ -94,6 +97,7 @@ pub enum AgentControlRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "command", content = "params", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum DiagnosticsRequest {
     Observe {
         streams: Vec<DebugStream>,
@@ -119,10 +123,10 @@ pub enum DiagnosticsRequest {
     /// accessibility node read exactly right, and no tool in this protocol
     /// could see it.
     ///
-    /// Rendered offscreen rather than read back from the window surface, which
-    /// is deliberate and is what makes this portable: there is no swapchain to
-    /// capture, no compositor to ask, and no display server to require. The
-    /// same call works over SSH, in CI, on a headless Linux box and on Android.
+    /// Rendered offscreen rather than read back from the window surface. The
+    /// protocol requires no swapchain, compositor, or display server; concrete
+    /// host availability still depends on the renderer backend for that
+    /// platform.
     Capture(CaptureRequest),
 }
 
@@ -153,6 +157,15 @@ impl Default for CaptureRequest {
     }
 }
 
+impl CaptureRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.scale.is_finite() || !(0.25..=8.0).contains(&self.scale) {
+            return Err("capture scale must be finite and between 0.25 and 8");
+        }
+        Ok(())
+    }
+}
+
 /// An RGBA8 image, as the renderer actually drew it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -172,6 +185,7 @@ pub struct CapturedImage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "result", content = "value", rename_all = "camelCase")]
 #[allow(clippy::large_enum_variant)] // wire shape is public; boxing would break consumers
+#[non_exhaustive]
 pub enum DebugResponse {
     Ack,
     AgentSnapshot(AgentSnapshot),
@@ -205,6 +219,7 @@ pub struct WindowComposition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "event", content = "value", rename_all = "camelCase")]
 #[allow(clippy::large_enum_variant)] // wire shape is public; boxing would break consumers
+#[non_exhaustive]
 pub enum DebugEvent {
     Snapshot(DebugSnapshot),
     Metrics(RendererMetrics),
@@ -222,6 +237,7 @@ pub enum DebugEvent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "event", content = "value", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum AgentControlEvent {
     Ready(DebugDescriptor),
     TreeChanged { revision: u64 },
@@ -364,6 +380,7 @@ pub struct LayoutDiagnosticRow {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "action", content = "params", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum AgentAction {
     /// Give one semantic node keyboard focus without activating it.
     ///
@@ -414,6 +431,7 @@ pub enum AgentAction {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "input", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum InputCommand {
     Key {
         phase: KeyPhase,
@@ -711,6 +729,7 @@ pub struct RuntimeErrorEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "state", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum LifecycleEvent {
     Relaunching { replacement_instance_id: String },
     Ready { instance_id: String },
@@ -748,6 +767,7 @@ struct TextContent {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DebugProtocolError {
     Json(serde_json::Error),
     Rpc(JsonRpcError),
@@ -756,6 +776,7 @@ pub enum DebugProtocolError {
     UnexpectedMessage,
     UnexpectedMethod(String),
     UnexpectedTool(String),
+    PayloadTooLarge(usize),
 }
 
 impl std::fmt::Display for DebugProtocolError {
@@ -772,6 +793,10 @@ impl std::fmt::Display for DebugProtocolError {
             Self::UnexpectedMessage => formatter.write_str("unexpected JSON-RPC message"),
             Self::UnexpectedMethod(method) => write!(formatter, "unexpected method {method}"),
             Self::UnexpectedTool(tool) => write!(formatter, "unexpected tool {tool}"),
+            Self::PayloadTooLarge(bytes) => write!(
+                formatter,
+                "debug response is {bytes} bytes, exceeding the {MAX_DEBUG_FRAME_BYTES}-byte frame limit"
+            ),
         }
     }
 }
@@ -908,10 +933,17 @@ pub fn encode_response(
         structured_content,
         is_error: matches!(response, DebugResponse::Error(_)),
     };
-    encode_rpc(JsonRpcMessage::Response(JsonRpcResponse::result(
+    let message = encode_rpc(JsonRpcMessage::Response(JsonRpcResponse::result(
         Some(id),
         serde_json::to_value(result)?,
-    )))
+    )))?;
+    if matches!(&message, WireMessage::Text(text) if text.len() > MAX_DEBUG_FRAME_BYTES) {
+        let WireMessage::Text(text) = &message else {
+            unreachable!("text encoding checked above")
+        };
+        return Err(DebugProtocolError::PayloadTooLarge(text.len()));
+    }
+    Ok(message)
 }
 
 fn response_summary(response: &DebugResponse) -> String {
@@ -1122,9 +1154,33 @@ mod tests {
     #[test]
     fn node_addressed_actions_round_trip() {
         for action in [
+            AgentAction::Focus { node_id: 8 },
             AgentAction::Click { node_id: 9 },
             AgentAction::DoubleClick { node_id: 10 },
             AgentAction::Hover { node_id: 11 },
+            AgentAction::SetValue {
+                node_id: 12,
+                value: "fixture".into(),
+            },
+            AgentAction::ScrollIntoView { node_id: 13 },
+            AgentAction::ScrollBy {
+                node_id: 14,
+                delta_x: 1.0,
+                delta_y: -2.0,
+            },
+            AgentAction::Input(InputCommand::Pointer {
+                phase: PointerPhase::Move,
+                x: 3.0,
+                y: 4.0,
+                button: 0,
+                modifiers: Modifiers::default(),
+            }),
+            AgentAction::Input(InputCommand::Wheel {
+                delta_x: 0.0,
+                delta_y: 5.0,
+                phase: WheelPhase::Moved,
+                modifiers: Modifiers::default(),
+            }),
         ] {
             let request = AgentControlRequest::Act(action);
             let id = JsonRpcId::Number(8);
@@ -1133,6 +1189,73 @@ mod tests {
                 (id, request)
             );
         }
+
+        for request in [AgentControlRequest::Relaunch, AgentControlRequest::Quit] {
+            let id = JsonRpcId::Number(9);
+            assert_eq!(
+                decode_agent_request(encode_agent_request(id.clone(), &request).unwrap()).unwrap(),
+                (id, request)
+            );
+        }
+    }
+
+    #[test]
+    fn capture_scale_is_bounded_before_a_renderer_allocates() {
+        for scale in [f32::NAN, f32::INFINITY, -1.0, 0.0, 0.24, 8.01] {
+            assert!(
+                CaptureRequest {
+                    node_id: None,
+                    scale
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for scale in [0.25, 1.0, 4.0, 8.0] {
+            assert!(
+                CaptureRequest {
+                    node_id: None,
+                    scale
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_capture_response_is_rejected_before_framing() {
+        let response = DebugResponse::Captured(CapturedImage {
+            width: 1,
+            height: 1,
+            rgba_base64: "A".repeat(MAX_DEBUG_FRAME_BYTES),
+            node_id: None,
+        });
+        assert!(matches!(
+            encode_response(JsonRpcId::Number(1), &response),
+            Err(DebugProtocolError::PayloadTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn click_wire_shape_is_literal_and_foreign_client_readable() {
+        let message = encode_agent_request(
+            JsonRpcId::Number(3),
+            &AgentControlRequest::Act(AgentAction::Click { node_id: 9 }),
+        )
+        .unwrap();
+        let WireMessage::Text(text) = message else {
+            panic!("debug requests must be text frames")
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["method"], MCP_TOOLS_CALL);
+        assert_eq!(value["params"]["name"], AGENT_CONTROL_TOOL);
+        assert_eq!(value["params"]["arguments"]["command"], "act");
+        assert_eq!(value["params"]["arguments"]["params"]["action"], "click");
+        assert_eq!(
+            value["params"]["arguments"]["params"]["params"]["node_id"],
+            9
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

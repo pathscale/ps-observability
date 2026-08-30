@@ -1,13 +1,17 @@
 [package]
 name = "ps-blitz-debug-control"
-description = "Debug-only WebDriver-compatible control transport for Blitz"
+description = "Debug-only WebDriver-style control transport for Blitz"
 documentation = "https://docs.rs/ps-blitz-debug-control"
-version = "0.3.5"
+readme = "README.md"
+version = "0.3.6"
 license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/pathscale/ps-observability"
+publish = true
+keywords = ["debugging", "testing", "blitz", "webdriver", "ui"]
 categories = ["development-tools::debugging", "development-tools::testing"]
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 getrandom = "^0.4"
