@@ -335,17 +335,26 @@ pub fn serve() -> Result<(), String> {
      * server thread must not block indefinitely if this loop has gone away, so
      * the reply travels on a per-request oneshot the caller owns.
      */
-    let (request_tx, request_rx) = mpsc::channel::<(
+    const MAX_PENDING_REQUESTS: usize = 64;
+    let (request_tx, request_rx) = mpsc::sync_channel::<(
         ControlBridgeRequest,
         tokio::sync::oneshot::Sender<DebugResponse>,
-    )>();
+    )>(MAX_PENDING_REQUESTS);
 
     let bridge: tauri_runtime_blitz::ControlBridge = std::sync::Arc::new(move |request| {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        match request_tx.send((request, response_tx)) {
+        match request_tx.try_send((request, response_tx)) {
             Ok(()) => response_rx,
-            Err(error) => {
-                let (_, response_tx) = error.0;
+            Err(mpsc::TrySendError::Full((_, response_tx))) => {
+                let _ = response_tx.send(DebugResponse::Error(DebugError {
+                    code: "documentBusy".into(),
+                    message: format!(
+                        "the document already has {MAX_PENDING_REQUESTS} pending inspection requests"
+                    ),
+                }));
+                response_rx
+            }
+            Err(mpsc::TrySendError::Disconnected((_, response_tx))) => {
                 let _ = response_tx.send(DebugResponse::Error(DebugError {
                     code: "documentUnavailable".into(),
                     message: "the document is no longer serving".into(),

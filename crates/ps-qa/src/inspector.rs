@@ -13,8 +13,8 @@ use blitz_control_protocol::{
     AgentControlRequest, AgentSnapshot, DEBUG_PROTOCOL_VERSION, DebugDescriptor, DebugEvent,
     DebugProtocolError, DebugResponse, DebugStream, DiagnosticsRequest, JsonRpcId, JsonRpcMessage,
     JsonRpcRequest, MCP_PROTOCOL_VERSION, MessageStream, TransportStream, WireMessage,
-    decode_diagnostics_event, decode_response, decode_rpc, encode_agent_request,
-    encode_diagnostics_request, encode_rpc, framed_json,
+    decode_diagnostics_event_value, decode_response_value, decode_wire_value, encode_agent_request,
+    encode_diagnostics_request, encode_rpc, framed_json, peek_value_request_id,
 };
 use eyre::{Context, Result, bail, eyre};
 use tokio::net::UnixStream;
@@ -240,7 +240,11 @@ impl Client {
     /// Matching on the id is not pedantry. The server pushes notifications on
     /// the same socket, so a client that returns the next frame it sees will
     /// eventually hand a console message back as though it were metrics.
-    async fn exchange(&mut self, request: WireMessage, id: &JsonRpcId) -> Result<WireMessage> {
+    async fn exchange(
+        &mut self,
+        request: WireMessage,
+        id: &JsonRpcId,
+    ) -> Result<serde_json::Value> {
         self.stream
             .send(request)
             .await
@@ -256,10 +260,11 @@ impl Client {
                 })?
                 .ok_or_else(|| eyre!("the inspector closed the connection"))?
                 .map_err(|error| eyre!("reading from the inspector failed: {error}"))?;
-            if response_id(&message).as_ref() == Some(id) {
-                return Ok(message);
+            let value = decode_wire_value(message).map_err(protocol_error)?;
+            if peek_value_request_id(&value).as_ref() == Some(id) {
+                return Ok(value);
             }
-            if let Ok(event) = decode_diagnostics_event(message) {
+            if let Ok(event) = decode_diagnostics_event_value(value) {
                 self.queue_event(event);
             }
         }
@@ -279,8 +284,7 @@ impl Client {
             params,
         )))
         .map_err(protocol_error)?;
-        let message = self.exchange(request, &id).await?;
-        envelope(&message)
+        self.exchange(request, &id).await
     }
 
     pub async fn initialize(&mut self) -> Result<serde_json::Value> {
@@ -304,15 +308,15 @@ impl Client {
     pub async fn agent(&mut self, request: &AgentControlRequest) -> Result<Answer> {
         let id = self.next_id();
         let frame = encode_agent_request(id.clone(), request).map_err(protocol_error)?;
-        let message = self.exchange(frame, &id).await?;
-        Answer::new(message)
+        let value = self.exchange(frame, &id).await?;
+        Answer::new(value)
     }
 
     pub async fn diagnostics(&mut self, request: &DiagnosticsRequest) -> Result<Answer> {
         let id = self.next_id();
         let frame = encode_diagnostics_request(id.clone(), request).map_err(protocol_error)?;
-        let message = self.exchange(frame, &id).await?;
-        Answer::new(message)
+        let value = self.exchange(frame, &id).await?;
+        Answer::new(value)
     }
 
     /// Establish a paint-event baseline immediately before driving input.
@@ -364,7 +368,8 @@ impl Client {
             };
             let message = message
                 .map_err(|error| eyre!("reading paint event from inspector failed: {error}"))?;
-            match decode_diagnostics_event(message) {
+            let value = decode_wire_value(message).map_err(protocol_error)?;
+            match decode_diagnostics_event_value(value) {
                 Ok(DebugEvent::PaintCommitted { .. }) => return Ok(true),
                 Ok(event) => self.queue_event(event),
                 Err(_) => {}
@@ -385,8 +390,16 @@ impl Client {
     ) -> Result<serde_json::Value> {
         let id = self.next_id();
         let frame = encode_diagnostics_request(id.clone(), request).map_err(protocol_error)?;
-        let message = self.exchange(frame, &id).await?;
-        envelope(&message)
+        self.exchange(frame, &id).await
+    }
+
+    pub async fn agent_envelope(
+        &mut self,
+        request: &AgentControlRequest,
+    ) -> Result<serde_json::Value> {
+        let id = self.next_id();
+        let frame = encode_agent_request(id.clone(), request).map_err(protocol_error)?;
+        self.exchange(frame, &id).await
     }
 
     /// Collect pushed notifications for a while, as `watch` does.
@@ -401,7 +414,9 @@ impl Client {
             match timeout(remaining, self.stream.recv()).await {
                 Err(_) => return Ok(out),
                 Ok(None) => return Ok(out),
-                Ok(Some(Ok(message))) => out.push(envelope(&message)?),
+                Ok(Some(Ok(message))) => {
+                    out.push(decode_wire_value(message).map_err(protocol_error)?)
+                }
                 Ok(Some(Err(error))) => bail!("reading from the inspector failed: {error}"),
             }
         }
@@ -441,43 +456,20 @@ async fn inspect_from(client: &mut Client, root: Option<u64>) -> Result<(AgentSn
     }
 }
 
-/// A tool-call answer, kept in both forms.
-///
-/// The typed value is what every mode computes from. The envelope is what the
-/// dump modes print, and printing a re-serialized struct instead would quietly
-/// drop any field the server has gained since this binary was built.
 pub struct Answer {
-    pub envelope: serde_json::Value,
     pub response: DebugResponse,
 }
 
 impl Answer {
-    fn new(message: WireMessage) -> Result<Self> {
-        let envelope = envelope(&message)?;
-        let (_, response) = decode_response(message).map_err(protocol_error)?;
+    fn new(value: serde_json::Value) -> Result<Self> {
+        let (_, response) = decode_response_value(value).map_err(protocol_error)?;
         if let DebugResponse::Error(error) = &response {
             return Err(eyre::Report::new(InspectorResponseError {
                 code: error.code.clone(),
                 message: error.message.clone(),
             }));
         }
-        Ok(Self { envelope, response })
-    }
-}
-
-fn envelope(message: &WireMessage) -> Result<serde_json::Value> {
-    match message {
-        WireMessage::Text(text) => {
-            serde_json::from_str(text).context("the inspector sent a non-JSON text frame")
-        }
-        _ => bail!("the inspector sent a non-text frame"),
-    }
-}
-
-fn response_id(message: &WireMessage) -> Option<JsonRpcId> {
-    match decode_rpc(message.clone()) {
-        Ok(JsonRpcMessage::Response(response)) => response.id,
-        _ => None,
+        Ok(Self { response })
     }
 }
 
