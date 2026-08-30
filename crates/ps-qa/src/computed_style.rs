@@ -28,7 +28,7 @@ async fn value_for_node(
             answer.response
         ));
     };
-    snapshot
+    let resolved = snapshot
         .computed_style
         .as_ref()
         .and_then(serde_json::Value::as_array)
@@ -37,9 +37,16 @@ async fn value_for_node(
                 .find(|row| row.get("nodeId").and_then(serde_json::Value::as_u64) == Some(node_id))
         })
         .and_then(|row| row.get(property))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| format!("diagnostics returned no {property} for {selector:?}"))
+        .ok_or_else(|| format!("diagnostics returned no {property} for {selector:?}"))?;
+    if let Some(value) = resolved.as_str() {
+        Ok(value.to_owned())
+    } else if let Some(value) = resolved.as_f64() {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "diagnostics returned non-scalar {property} for {selector:?}"
+        ))
+    }
 }
 
 async fn value(client: &mut Client, selector: &str, property: &str) -> Result<String, String> {
@@ -80,6 +87,10 @@ pub(crate) async fn transparent_background(
     selector: &str,
 ) -> Result<(), String> {
     require_transparent_background(&value(client, selector, "backgroundColor").await?)
+}
+
+pub(crate) async fn full_opacity(client: &mut Client, selector: &str) -> Result<(), String> {
+    require_full_opacity(&value(client, selector, "opacity").await?)
 }
 
 fn parse_font_size(resolved: &str) -> Result<f64, String> {
@@ -152,9 +163,22 @@ pub(crate) fn require_transparent_background(color: &str) -> Result<(), String> 
     }
 }
 
+pub(crate) fn require_full_opacity(resolved: &str) -> Result<(), String> {
+    let opacity = resolved
+        .parse::<f64>()
+        .map_err(|_| format!("resolved opacity {resolved:?} is not numeric"))?;
+    if opacity >= 0.999 {
+        Ok(())
+    } else {
+        Err(format!(
+            "resolved opacity is {opacity:.3}; the control's content must remain fully opaque"
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{require_opaque_background, require_transparent_background};
+    use super::{require_full_opacity, require_opaque_background, require_transparent_background};
 
     #[test]
     fn flat_backgrounds_reject_translucent_resolved_paint() {
@@ -167,5 +191,11 @@ mod tests {
     fn transparent_backgrounds_reject_any_remaining_film() {
         assert!(require_transparent_background("#17202b00").is_ok());
         assert!(require_transparent_background("#17202b01").is_err());
+    }
+
+    #[test]
+    fn full_opacity_rejects_whole_control_fades() {
+        assert!(require_full_opacity("1").is_ok());
+        assert!(require_full_opacity("0.4").is_err());
     }
 }
