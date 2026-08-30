@@ -5066,8 +5066,10 @@ pub async fn run() -> Result<()> {
     match cli.command {
         cli::Command::Metrics => {
             println!("\n== metrics ==");
-            let answer = client.diagnostics(&DiagnosticsRequest::Metrics).await?;
-            println!("{}", report::dump(&answer.envelope, 2000));
+            let envelope = client
+                .diagnostics_envelope(&DiagnosticsRequest::Metrics)
+                .await?;
+            println!("{}", report::dump(&envelope, 2000));
         }
         cli::Command::Watch { seconds } => {
             println!("\n== observing paint/metrics/console/runtimeErrors for {seconds}s ==");
@@ -5096,13 +5098,13 @@ pub async fn run() -> Result<()> {
             // inside protocol variants are snake_case. Encoding from the shared
             // type is what makes that unrepresentable rather than a silent
             // error nobody read.
-            let answer = client
-                .agent(&AgentControlRequest::Inspect {
+            let envelope = client
+                .agent_envelope(&AgentControlRequest::Inspect {
                     root: None,
                     max_depth: 3,
                 })
                 .await?;
-            println!("{}", report::dump(&answer.envelope, 3000));
+            println!("{}", report::dump(&envelope, 3000));
         }
         cli::Command::Find {
             pattern,

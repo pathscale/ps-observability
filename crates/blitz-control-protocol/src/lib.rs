@@ -824,7 +824,18 @@ pub fn encode_agent_request(
 }
 
 pub fn decode_incoming(message: WireMessage) -> Result<IncomingRequest, DebugProtocolError> {
-    let JsonRpcMessage::Request(request) = decode_rpc(message)? else {
+    decode_incoming_value(decode_wire_value(message)?)
+}
+
+/// Decode an incoming request from a JSON value that the transport already parsed.
+///
+/// Server loops need the request id even when the typed payload is malformed. Keeping
+/// the parsed value lets them recover that id and then consume the same allocation for
+/// typed decoding instead of parsing the complete frame twice.
+pub fn decode_incoming_value(
+    value: serde_json::Value,
+) -> Result<IncomingRequest, DebugProtocolError> {
+    let JsonRpcMessage::Request(request) = decode_rpc_value(value)? else {
         return Err(DebugProtocolError::UnexpectedMessage);
     };
     match request.method.as_str() {
@@ -919,24 +930,39 @@ pub fn encode_response(
     id: JsonRpcId,
     response: &DebugResponse,
 ) -> Result<WireMessage, DebugProtocolError> {
-    let structured_content = serde_json::to_value(response)?;
-    let result = ToolCallResult {
-        content: vec![TextContent {
-            content_type: "text".into(),
-            // structuredContent is the typed payload consumed by the local
-            // client. Repeating a full DOM snapshot as text doubled the frame
-            // and could cross endpoint-libs' 16 MiB safety limit, which closed
-            // an otherwise healthy socket. Keep the required human-readable
-            // MCP content concise and send the snapshot exactly once.
-            text: response_summary(response),
-        }],
-        structured_content,
-        is_error: matches!(response, DebugResponse::Error(_)),
-    };
-    let message = encode_rpc(JsonRpcMessage::Response(JsonRpcResponse::result(
-        Some(id),
-        serde_json::to_value(result)?,
-    )))?;
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct BorrowedToolCallResult<'a> {
+        content: [TextContent; 1],
+        structured_content: &'a DebugResponse,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
+    }
+
+    #[derive(Serialize)]
+    struct RpcResponse<'a> {
+        jsonrpc: &'static str,
+        id: JsonRpcId,
+        result: BorrowedToolCallResult<'a>,
+    }
+
+    let message = WireMessage::Text(serde_json::to_string(&RpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: BorrowedToolCallResult {
+            content: [TextContent {
+                content_type: "text".into(),
+                // structuredContent is the typed payload consumed by the local
+                // client. Repeating a full DOM snapshot as text doubled the frame
+                // and could cross endpoint-libs' 16 MiB safety limit, which closed
+                // an otherwise healthy socket. Keep the required human-readable
+                // MCP content concise and send the snapshot exactly once.
+                text: response_summary(response),
+            }],
+            structured_content: response,
+            is_error: matches!(response, DebugResponse::Error(_)),
+        },
+    })?);
     if matches!(&message, WireMessage::Text(text) if text.len() > MAX_DEBUG_FRAME_BYTES) {
         let WireMessage::Text(text) = &message else {
             unreachable!("text encoding checked above")
@@ -966,7 +992,13 @@ fn response_summary(response: &DebugResponse) -> String {
 pub fn decode_response(
     message: WireMessage,
 ) -> Result<(JsonRpcId, DebugResponse), DebugProtocolError> {
-    let JsonRpcMessage::Response(response) = decode_rpc(message)? else {
+    decode_response_value(decode_wire_value(message)?)
+}
+
+pub fn decode_response_value(
+    value: serde_json::Value,
+) -> Result<(JsonRpcId, DebugResponse), DebugProtocolError> {
+    let JsonRpcMessage::Response(response) = decode_rpc_value(value)? else {
         return Err(DebugProtocolError::UnexpectedMessage);
     };
     let id = response.id.ok_or(DebugProtocolError::RequestIdRequired)?;
@@ -995,6 +1027,12 @@ pub fn encode_diagnostics_event(event: &DebugEvent) -> Result<WireMessage, Debug
 
 pub fn decode_diagnostics_event(message: WireMessage) -> Result<DebugEvent, DebugProtocolError> {
     decode_notification(message, DIAGNOSTICS_EVENT_NOTIFICATION)
+}
+
+pub fn decode_diagnostics_event_value(
+    value: serde_json::Value,
+) -> Result<DebugEvent, DebugProtocolError> {
+    decode_notification_value(value, DIAGNOSTICS_EVENT_NOTIFICATION)
 }
 
 fn encode_tool_request<T: Serialize>(
@@ -1073,7 +1111,14 @@ fn decode_notification<T: DeserializeOwned>(
     message: WireMessage,
     expected_method: &str,
 ) -> Result<T, DebugProtocolError> {
-    let JsonRpcMessage::Request(request) = decode_rpc(message)? else {
+    decode_notification_value(decode_wire_value(message)?, expected_method)
+}
+
+fn decode_notification_value<T: DeserializeOwned>(
+    value: serde_json::Value,
+    expected_method: &str,
+) -> Result<T, DebugProtocolError> {
+    let JsonRpcMessage::Request(request) = decode_rpc_value(value)? else {
         return Err(DebugProtocolError::UnexpectedMessage);
     };
     if !request.is_notification() {
@@ -1113,6 +1158,22 @@ pub fn peek_request_id(message: &WireMessage) -> Option<JsonRpcId> {
         Ok(JsonRpcMessage::Request(request)) => request.id,
         _ => None,
     }
+}
+
+/// Recover a request id from an already parsed JSON value.
+pub fn peek_value_request_id(value: &serde_json::Value) -> Option<JsonRpcId> {
+    serde_json::from_value(value.get("id")?.clone()).ok()
+}
+
+pub fn decode_wire_value(message: WireMessage) -> Result<serde_json::Value, DebugProtocolError> {
+    let WireMessage::Text(text) = message else {
+        return Err(DebugProtocolError::NonTextFrame);
+    };
+    serde_json::from_str(&text).map_err(Into::into)
+}
+
+pub fn decode_rpc_value(value: serde_json::Value) -> Result<JsonRpcMessage, DebugProtocolError> {
+    serde_json::from_value(value).map_err(Into::into)
 }
 
 pub fn decode_rpc(message: WireMessage) -> Result<JsonRpcMessage, DebugProtocolError> {

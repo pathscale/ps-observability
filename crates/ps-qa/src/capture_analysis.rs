@@ -102,7 +102,7 @@ pub(crate) fn pixels_hold(
             before.width, before.height, after.width, after.height
         ));
     }
-    if pixels_hold_with_tolerance(before, after, CHANNEL_TOLERANCE)? {
+    if before.rgba_base64 == after.rgba_base64 {
         return Ok(());
     }
 
@@ -120,9 +120,13 @@ pub(crate) fn pixels_hold(
                 .any(|(left, right)| left.abs_diff(*right) > CHANNEL_TOLERANCE)
         })
         .count();
-    Err(format!(
-        "{changed} rendered pixel(s) changed after the pointer returned to the same state"
-    ))
+    if changed == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{changed} rendered pixel(s) changed after the pointer returned to the same state"
+        ))
+    }
 }
 
 /// Compare visible RGB placement while ignoring alpha-only edge coverage.

@@ -1,7 +1,7 @@
 [package]
 name = "ps-qa"
 description = "Drive a running Blitz app through its MCP control socket and assert what the renderer did"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"

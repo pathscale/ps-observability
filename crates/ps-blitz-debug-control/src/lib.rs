@@ -18,8 +18,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -30,6 +30,8 @@ use serde_json::{Value, json};
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PENDING_COMMANDS: usize = 64;
+const MAX_CONNECTIONS: usize = 64;
 
 #[derive(Default)]
 struct ActiveSession(AtomicU64);
@@ -182,11 +184,9 @@ impl DebugServer {
         let listener = TcpListener::bind(config.bind_address)?;
         let address = listener.local_addr()?;
         let token = random_hex(32)?;
-        // Unbounded, where this was `sync_channel(1)` serviced by a poll. A
-        // request that arrives before the embedder can service it (no document
-        // yet, say) used to occupy the only slot, and the next one was refused
-        // outright with "renderer command queue is full".
-        let (command_tx, command_rx) = mpsc::channel();
+        // Enough room for a driver burst, but never an unbounded owner of parsed
+        // request bodies while the renderer is unavailable.
+        let (command_tx, command_rx) = mpsc::sync_channel(MAX_PENDING_COMMANDS);
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = ServiceWaker::default();
 
@@ -308,11 +308,12 @@ fn write_descriptor(config: &ServerConfig, address: SocketAddr, token: &str) -> 
 fn server_loop(
     listener: TcpListener,
     token: &str,
-    command_tx: Sender<ControlRequest>,
+    command_tx: SyncSender<ControlRequest>,
     waker: &ServiceWaker,
     shutdown: Arc<AtomicBool>,
 ) {
     let active_session = Arc::new(ActiveSession::default());
+    let active_connections = Arc::new(AtomicUsize::new(0));
     let token: Arc<str> = Arc::from(token);
     for connection in listener.incoming() {
         if shutdown.load(Ordering::Acquire) {
@@ -320,13 +321,23 @@ fn server_loop(
         }
         match connection {
             Ok(mut stream) => {
+                if active_connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+                    active_connections.fetch_sub(1, Ordering::AcqRel);
+                    let _ = write_response(
+                        &mut stream,
+                        webdriver_error("unknown error", "debug-control connection limit reached"),
+                    );
+                    continue;
+                }
                 let token = Arc::clone(&token);
                 let active_session = Arc::clone(&active_session);
+                let thread_connections = Arc::clone(&active_connections);
                 let command_tx = command_tx.clone();
                 let waker = waker.clone();
-                let _ = thread::Builder::new()
+                let spawned = thread::Builder::new()
                     .name("blitz-debug-connection".into())
                     .spawn(move || {
+                        let _permit = ConnectionPermit(thread_connections);
                         let _ = stream.set_write_timeout(Some(COMMAND_TIMEOUT));
                         let response = match read_request(&mut stream) {
                             Ok(request) => {
@@ -336,10 +347,21 @@ fn server_loop(
                         };
                         let _ = write_response(&mut stream, response);
                     });
+                if spawned.is_err() {
+                    active_connections.fetch_sub(1, Ordering::AcqRel);
+                }
             }
             Err(_) if shutdown.load(Ordering::Acquire) => break,
             Err(_) => continue,
         }
+    }
+}
+
+struct ConnectionPermit(Arc<AtomicUsize>);
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -460,7 +482,7 @@ fn route(
     request: HttpRequest,
     token: &str,
     active_session: &ActiveSession,
-    command_tx: &Sender<ControlRequest>,
+    command_tx: &SyncSender<ControlRequest>,
     waker: &ServiceWaker,
 ) -> Value {
     if request.method == "GET" && request.path == "/status" {
@@ -513,8 +535,14 @@ fn route(
         body: request.body,
         reply: reply_tx,
     };
-    if command_tx.send(control_request).is_err() {
-        return webdriver_error("unknown error", "renderer command channel is closed");
+    match command_tx.try_send(control_request) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            return webdriver_error("unknown error", "renderer command queue is full");
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            return webdriver_error("unknown error", "renderer command channel is closed");
+        }
     }
     // Queue first, then wake: the embedder must find the request already there
     // when it comes round, or the wake is spent on an empty queue.
@@ -822,7 +850,7 @@ mod tests {
      */
     #[test]
     fn wakes_the_servicer_with_the_request_already_queued() {
-        let (command_tx, command_rx) = mpsc::channel::<ControlRequest>();
+        let (command_tx, command_rx) = mpsc::sync_channel::<ControlRequest>(4);
         let waker = ServiceWaker::default();
         let queue = Mutex::new(command_rx);
         waker.set(move || {
@@ -852,7 +880,7 @@ mod tests {
      */
     #[test]
     fn a_second_request_queues_behind_an_unserviced_one() {
-        let (command_tx, command_rx) = mpsc::channel::<ControlRequest>();
+        let (command_tx, command_rx) = mpsc::sync_channel::<ControlRequest>(4);
         let (reply_tx, _reply_rx) = mpsc::sync_channel(1);
         command_tx
             .send(ControlRequest {
@@ -887,11 +915,39 @@ mod tests {
         assert_eq!(response["value"]["serviced"], true);
     }
 
+    #[test]
+    fn a_saturated_renderer_queue_fails_without_growing() {
+        let (command_tx, _command_rx) = mpsc::sync_channel::<ControlRequest>(1);
+        let (reply_tx, _reply_rx) = mpsc::sync_channel(1);
+        command_tx
+            .send(ControlRequest {
+                method: "GET".into(),
+                path: "occupied".into(),
+                body: Value::Null,
+                reply: reply_tx,
+            })
+            .unwrap();
+
+        let response = route(
+            snapshot_request(),
+            "token",
+            &ActiveSession(AtomicU64::new(1)),
+            &command_tx,
+            &ServiceWaker::default(),
+        );
+
+        assert_eq!(response["value"]["error"], "unknown error");
+        assert_eq!(
+            response["value"]["message"],
+            "renderer command queue is full"
+        );
+    }
+
     /// Nothing installs a waker until the embedder is up, and requests that
     /// arrive in that window must still be queued rather than dropped.
     #[test]
     fn queues_requests_while_no_waker_is_installed() {
-        let (command_tx, command_rx) = mpsc::channel::<ControlRequest>();
+        let (command_tx, command_rx) = mpsc::sync_channel::<ControlRequest>(4);
         let waker = ServiceWaker::default();
         let active_session = ActiveSession(AtomicU64::new(1));
 
