@@ -73,7 +73,7 @@ ps-qa qa dialog                  # one group
 ps-qa qa dialog-cancel-dismisses # one check, by id
 ps-qa inventory                  # fast reachability counts on every surface
 ps-qa inventory --require-outcomes # fail every reachable control with no named verdict
-ps-qa reconcile cover.txt        # map a saved CI inventory to current checks, no GUI
+ps-qa reconcile inventory.toon   # map a saved CI inventory to current checks, no GUI
 ```
 
 `list` needs no running app. Everything else does. Exit code is 1 if any check
@@ -146,14 +146,32 @@ tabs, then activates the exact semantic node id.
 | `Disabled` | a painted subject refuses input after the action |
 | `Vanishes` | nothing matching is on screen (it may remain in the tree) |
 | `PaintsMore` | more matching nodes are on screen than before |
+| `FamilyChanges` | a rendered repeated family replaces or recycles its members |
 | `Grows` | more matching nodes are in the tree than before |
 | `Holds` | the count did not change |
+| `Count` | the matching family has exactly `expect_count` members |
 | `Absent` | no matching node at all |
+| `PaintsNamed` | every node matching the shared selector language paints |
+| `DistinctPositions` | every painted family member has a distinct center |
+| `ContainedBy` | every painted subject stays inside `compare` |
 | `TargetPaints` | the exact accessible name selected for the click still paints |
 | `Above` | the subject's painted box is above `compare` |
+| `RightOf` | every subject paints completely right of a comparison member |
+| `CenterAlignedY` | every subject shares a vertical center with a comparison member |
+| `Measures` | every subject meets the `expect_size` width/height contract |
+| `PixelsHold` | rendered pixels survive repeated pointer abuse unchanged |
+| `PixelsHoldAfterHover` | the initial neutral frame already equals the post-hover neutral frame |
+| `PixelsChange` | hover visibly changes the declared capture region |
+| `VisibleInk` | the capture contains visible pixels distinct from its backdrop |
+| `InteriorInk` | visible content exists away from the control's border |
+| `OpaqueBackground` | computed background alpha is fully opaque |
+| `TransparentBackground` | computed background alpha is zero |
+| `FullOpacity` | the whole subject paints at opacity 1 |
+| `TransparentWindowTint` | native surface is transparent and its glass tint alpha is zero |
+| `Contrast` | every matching painted subject meets its semantic contrast floor |
+| `FontSizeGrows` | the same subject's computed font size increases |
 | `ValueChanges` | the same semantic node exposes a different value after activation |
 | `SelectionChanges` | the same semantic node changes selected/pressed state |
-| `DistinctPositions` | every painted member of a semantic family has a distinct center |
 | `NameChanges` | the same semantic node exposes a different accessible name after the action |
 
 Outcome checks can continue past activation with literal semantic input:
@@ -260,8 +278,10 @@ file, line and column rather than degrading to empty in silence.
 **`tests/ps-qa/*.ron`** — the checks. A check is a precondition, an action and
 an assertion with no behaviour of its own, so it is data: editing a selector is
 an edit and a re-run, not a recompile. Found by `--checks`, or
-`tests/ps-qa/`. Files are read in name order, so the group order is the filename
-order.
+`tests/ps-qa/`. Files are read in name order for manifests and focused runs.
+A full execution groups non-destructive checks by surface to avoid repeated
+navigation, then runs destructive checks last. The report retains each check's
+stable id, so optimized run order cannot be mistaken for source order.
 
 `reconcile` decodes the emitted TOON directly, including nested control rows
 with per-control check arrays. Do not flatten or scrape that report before

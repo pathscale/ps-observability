@@ -29,6 +29,7 @@
 //!     permanent_surfaces: ["Dashboard", "Preferences"],
 //!     navigation_controls: ["Open Preferences"],
 //!     sections: ["Records", "Activity"],
+//!     expand_prefixes: ["Expand "],
 //!     document_row_markers: [" open \u{b7} "],
 //!     document_openers: ["QA document"],
 //!     pagination_controls: [" more records"],
@@ -114,6 +115,11 @@ pub struct AppProfile {
     /// controls before the sweep reaches its rows makes every one of them read
     /// as vanished.
     pub sections: Vec<String>,
+    /// Prefixes of controls that reveal a collapsed section.
+    ///
+    /// Kept in application data so localized interfaces do not depend on the
+    /// English word `Expand` merely to become reachable to QA.
+    pub expand_prefixes: Vec<String>,
     /// The scrollable region a transcript lives in, if the application has one.
     pub transcript_region: Option<String>,
     /// The control that returns to the application's root surface.
@@ -324,6 +330,7 @@ mod tests {
             permanent_surfaces: vec!["Dashboard".to_owned()],
             navigation_controls: vec!["Open Preferences".to_owned()],
             sections: vec!["Records".to_owned()],
+            expand_prefixes: vec!["Expand ".to_owned()],
             transcript_region: Some("Message history".to_owned()),
             home_opener: Some("Dashboard".to_owned()),
             deferred_controls: vec!["Create document".to_owned()],

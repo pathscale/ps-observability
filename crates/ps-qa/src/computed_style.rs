@@ -163,7 +163,7 @@ pub(crate) fn require_transparent_background(color: &str) -> Result<(), String> 
     }
 }
 
-pub(crate) fn require_full_opacity(resolved: &str) -> Result<(), String> {
+fn require_full_opacity(resolved: &str) -> Result<(), String> {
     let opacity = resolved
         .parse::<f64>()
         .map_err(|_| format!("resolved opacity {resolved:?} is not numeric"))?;

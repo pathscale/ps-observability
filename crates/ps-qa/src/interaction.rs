@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use blitz_control_protocol::{
-    AgentAction, AgentControlRequest, DebugResponse, InputCommand, KeyPhase, Modifiers,
-    PointerPhase, SemanticNode, WheelPhase,
+    AgentAction, AgentControlRequest, InputCommand, KeyPhase, Modifiers, PointerPhase,
+    SemanticNode, WheelPhase,
 };
 use eyre::{Result, bail, eyre};
 
@@ -355,15 +355,12 @@ pub(crate) async fn type_text(client: &mut Client, want: &str, text: &str) -> Re
     if cli::trace() {
         println!("        setting {want:?} (id {})", field.id);
     }
-    let answer = client
+    client
         .agent(&AgentControlRequest::Act(AgentAction::SetValue {
             node_id: field.id,
             value: text.to_owned(),
         }))
         .await?;
-    if let DebugResponse::Error(error) = answer.response {
-        bail!("{} ({})", error.message, error.code);
-    }
     tokio::time::sleep(Duration::from_millis(25)).await;
     Ok(field.id)
 }

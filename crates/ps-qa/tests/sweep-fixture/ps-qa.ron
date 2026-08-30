@@ -1,6 +1,0 @@
-AppProfile(
-    surfaces: [ (name: "page", opener: "\u{0}dynamic-document", marker: Some("Alpha")) ],
-    permanent_surfaces: [],
-    navigation_controls: [],
-    sections: [],
-)

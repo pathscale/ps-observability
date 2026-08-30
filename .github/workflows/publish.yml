@@ -41,14 +41,15 @@ jobs:
 
           publish_if_new() {
             local package="$1"
-            local manifest="crates/$2/Cargo.toml"
             local version
-            version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$manifest" | head -1)"
+            version="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg package "$package" \
+                '.packages[] | select(.name == $package) | .version')"
             local published
-            published="$(curl -fsS -H 'User-Agent: pathscale-ci' \
+            published="$(curl -sS -H 'User-Agent: pathscale-ci' \
               "https://crates.io/api/v1/crates/$package/versions" \
               | jq -r --arg version "$version" \
-                '.versions[]? | select(.num == $version) | .num')"
+                '.versions[]? | select(.num == $version) | .num' 2>/dev/null || true)"
 
             if [[ -n "$published" ]]; then
               print "$package $version is already published"
@@ -60,13 +61,22 @@ jobs:
               print "dry run: $package $version packaged"
             else
               cargo publish -p "$package"
+              for attempt in {1..60}; do
+                if cargo info "$package@$version" >/dev/null 2>&1; then
+                  print "$package $version is available from the registry"
+                  return
+                fi
+                sleep 2
+              done
+              print -u2 "$package $version did not reach the registry within 120 seconds"
+              return 1
             fi
           }
 
-          publish_if_new blitz-control-protocol blitz-control-protocol
-          publish_if_new ps-blitz-debug-control ps-blitz-debug-control
-          publish_if_new ps-qa ps-qa
+          publish_if_new blitz-control-protocol
+          publish_if_new ps-blitz-debug-control
+          publish_if_new ps-qa
           # The host embeds tauri-runtime-blitz, which in turn consumes the
           # protocol above. Keep it last so a new protocol and driver can ship
           # before the corresponding runtime release reaches crates.io.
-          publish_if_new qa-inspect-host qa-inspect-host
+          publish_if_new qa-inspect-host
