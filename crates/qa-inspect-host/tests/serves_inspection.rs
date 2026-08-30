@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use blitz_control_protocol::{JsonRpcId, MessageStream, TransportStream, framed_json};
 use tauri_runtime_blitz::control_protocol::{
-    AgentAction, AgentControlRequest, DebugEvent, DebugResponse, DebugStream, DiagnosticsRequest,
+    AgentAction, AgentControlRequest, CaptureRequest, DebugEvent, DebugResponse, DebugStream,
+    DiagnosticsRequest, InputCommand, KeyPhase, Modifiers, PointerPhase, WheelPhase,
     decode_diagnostics_event, decode_response, encode_agent_request, encode_diagnostics_request,
 };
 
@@ -34,9 +35,9 @@ async fn request(
         .await
         .expect("send agent request");
     loop {
-        let message = stream
-            .recv()
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.recv())
             .await
+            .unwrap_or_else(|_| panic!("host did not answer {request:?}"))
             .expect("the host keeps serving")
             .expect("read agent response");
         if let Ok((response_id, response)) = decode_response(message)
@@ -63,15 +64,40 @@ async fn observe_paint(stream: &mut dyn MessageStream, next_id: &mut i64) {
         .await
         .expect("send observe request");
     loop {
-        let message = stream
-            .recv()
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.recv())
             .await
+            .expect("host did not answer paint observation")
             .expect("the host keeps serving")
             .expect("read observe response");
         if let Ok((response_id, DebugResponse::Ack)) = decode_response(message)
             && response_id == id
         {
             return;
+        }
+    }
+}
+
+async fn diagnostics(
+    stream: &mut dyn MessageStream,
+    next_id: &mut i64,
+    request: &DiagnosticsRequest,
+) -> DebugResponse {
+    *next_id += 1;
+    let id = JsonRpcId::Number(*next_id);
+    stream
+        .send(encode_diagnostics_request(id.clone(), request).expect("encode diagnostic request"))
+        .await
+        .expect("send diagnostic request");
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+            .await
+            .unwrap_or_else(|_| panic!("host did not answer {request:?}"))
+            .expect("the host keeps serving")
+            .expect("read diagnostic response");
+        if let Ok((response_id, response)) = decode_response(message)
+            && response_id == id
+        {
+            return response;
         }
     }
 }
@@ -178,6 +204,40 @@ fn serves_a_page_over_the_inspection_socket() {
             .id;
 
         assert!(matches!(
+            diagnostics(
+                &mut stream,
+                &mut next_id,
+                &DiagnosticsRequest::WindowComposition,
+            )
+            .await,
+            DebugResponse::WindowComposition(composition) if !composition.supported
+        ));
+        assert!(matches!(
+            diagnostics(
+                &mut stream,
+                &mut next_id,
+                &DiagnosticsRequest::Capture(CaptureRequest {
+                    node_id: Some(button),
+                    scale: 0.0,
+                }),
+            )
+            .await,
+            DebugResponse::Error(error) if error.code == "invalidArgument"
+        ));
+        assert!(matches!(
+            request(
+                &mut stream,
+                &mut next_id,
+                &AgentControlRequest::Act(AgentAction::SetValue {
+                    node_id: button,
+                    value: "not editable".into(),
+                }),
+            )
+            .await,
+            DebugResponse::Error(error) if error.code == "notEditable"
+        ));
+
+        assert!(matches!(
             request(
                 &mut stream,
                 &mut next_id,
@@ -189,6 +249,70 @@ fn serves_a_page_over_the_inspection_socket() {
             .await,
             DebugResponse::Ack
         ));
+        assert!(matches!(
+            request(
+                &mut stream,
+                &mut next_id,
+                &AgentControlRequest::Act(AgentAction::Focus { node_id: input }),
+            )
+            .await,
+            DebugResponse::Ack
+        ));
+        for phase in [KeyPhase::Down, KeyPhase::Up] {
+            assert!(matches!(
+                request(
+                    &mut stream,
+                    &mut next_id,
+                    &AgentControlRequest::Act(AgentAction::Input(InputCommand::Key {
+                        phase,
+                        key: "ArrowLeft".into(),
+                        code: "ArrowLeft".into(),
+                        modifiers: Modifiers::default(),
+                    })),
+                )
+                .await,
+                DebugResponse::Ack
+            ));
+        }
+
+        assert!(matches!(
+            request(
+                &mut stream,
+                &mut next_id,
+                &AgentControlRequest::Act(AgentAction::Click { node_id: button }),
+            )
+            .await,
+            DebugResponse::Ack
+        ));
+        assert!(matches!(
+            request(
+                &mut stream,
+                &mut next_id,
+                &AgentControlRequest::Act(AgentAction::DoubleClick { node_id: button }),
+            )
+            .await,
+            DebugResponse::Ack
+        ));
+        let clicked = request(
+            &mut stream,
+            &mut next_id,
+            &AgentControlRequest::Inspect {
+                root: Some(button),
+                max_depth: 1,
+            },
+        )
+        .await;
+        let DebugResponse::AgentSnapshot(clicked) = clicked else {
+            panic!("inspect should return the clicked button");
+        };
+        assert!(
+            clicked
+                .nodes
+                .iter()
+                .any(|node| node.id == button && node.name.starts_with("Pressed ")),
+            "click actions must expose their authored outcome: {:?}",
+            clicked.nodes
+        );
         let changed = request(
             &mut stream,
             &mut next_id,
@@ -250,7 +374,7 @@ fn serves_a_page_over_the_inspection_socket() {
             .await,
             DebugResponse::Ack
         ));
-        let event = tokio::time::timeout(Duration::from_millis(250), stream.recv())
+        let event = tokio::time::timeout(Duration::from_millis(50), stream.recv())
             .await
             .expect("a real hover repaint should emit an event")
             .expect("the host keeps serving")
@@ -259,5 +383,28 @@ fn serves_a_page_over_the_inspection_socket() {
             decode_diagnostics_event(event),
             Ok(DebugEvent::PaintCommitted { .. })
         ));
+
+        for unsupported in [
+            AgentControlRequest::Act(AgentAction::Input(InputCommand::Pointer {
+                phase: PointerPhase::Move,
+                x: 1.0,
+                y: 1.0,
+                button: 0,
+                modifiers: Modifiers::default(),
+            })),
+            AgentControlRequest::Act(AgentAction::Input(InputCommand::Wheel {
+                delta_x: 0.0,
+                delta_y: 1.0,
+                phase: WheelPhase::Moved,
+                modifiers: Modifiers::default(),
+            })),
+            AgentControlRequest::Relaunch,
+            AgentControlRequest::Quit,
+        ] {
+            assert!(matches!(
+                request(&mut stream, &mut next_id, &unsupported).await,
+                DebugResponse::Error(error) if error.code == "unsupported"
+            ));
+        }
     });
 }
