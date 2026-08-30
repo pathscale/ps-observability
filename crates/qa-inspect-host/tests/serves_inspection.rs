@@ -16,11 +16,11 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use blitz_control_protocol::{JsonRpcId, MessageStream, TransportStream, framed_json};
 use tauri_runtime_blitz::control_protocol::{
     AgentAction, AgentControlRequest, CaptureRequest, DebugEvent, DebugResponse, DebugStream,
-    DiagnosticsRequest, InputCommand, KeyPhase, Modifiers, PointerPhase, WheelPhase,
-    decode_diagnostics_event, decode_response, encode_agent_request, encode_diagnostics_request,
+    DiagnosticsRequest, InputCommand, JsonRpcId, KeyPhase, MessageStream, Modifiers, PointerPhase,
+    TransportStream, WheelPhase, decode_diagnostics_event, decode_response, encode_agent_request,
+    encode_diagnostics_request, framed_json,
 };
 
 async fn request(

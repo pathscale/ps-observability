@@ -35,5 +35,4 @@ default = ["diagnostics"]
 diagnostics = ["tauri-runtime-blitz/diagnostics"]
 
 [dev-dependencies]
-blitz-control-protocol.workspace = true
 tokio = { version = "1", features = ["io-util", "net", "rt", "time"] }
