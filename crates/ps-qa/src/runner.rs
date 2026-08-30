@@ -335,6 +335,51 @@ async fn repeat_hover(
     Ok(())
 }
 
+type HoverSignature = (String, String, Option<String>, Option<String>);
+
+/// Count stable semantic identities on the active surface.
+///
+/// A later hover may legitimately mount one new status node. Accumulation is
+/// narrower: a semantic identity that was already present gains additional
+/// retained copies on every entry. Comparing these counts avoids treating an
+/// unrelated whole-document update as a component leak.
+fn hover_signature_counts(
+    nodes: &[SemanticNode],
+) -> std::collections::BTreeMap<HoverSignature, usize> {
+    let scope = outcome_poll_scope(nodes).map(|scope| scope.baseline_ids);
+    let mut counts = std::collections::BTreeMap::new();
+    for node in nodes.iter().filter(|node| {
+        scope
+            .as_ref()
+            .is_none_or(|surface_ids| surface_ids.contains(&node.id))
+    }) {
+        if node.name.is_empty() && node.slot.is_none() && node.dom_id.is_none() {
+            continue;
+        }
+        let signature = (
+            node.role.to_ascii_lowercase(),
+            node.name.clone(),
+            node.slot.clone(),
+            node.dom_id.clone(),
+        );
+        *counts.entry(signature).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn accumulated_hover_signatures(
+    baseline: &std::collections::BTreeMap<HoverSignature, usize>,
+    after: &std::collections::BTreeMap<HoverSignature, usize>,
+) -> Vec<(HoverSignature, usize)> {
+    after
+        .iter()
+        .filter_map(|(signature, count)| {
+            let before = baseline.get(signature).copied().unwrap_or_default();
+            (before > 0 && *count > before).then(|| (signature.clone(), count - before))
+        })
+        .collect()
+}
+
 /// Put a future hover target in its final viewport position without entering it.
 ///
 /// Pixel checks must do this before their baseline capture. Letting the hover
@@ -453,12 +498,6 @@ async fn transparent_window_tint(client: &mut Client) -> std::result::Result<(),
         .map_err(|error| format!("could not inspect native window composition: {error}"))?;
     let composition = match answer.response {
         DebugResponse::WindowComposition(composition) => composition,
-        DebugResponse::Error(error) => {
-            return Err(format!(
-                "native window composition refused: {} ({})",
-                error.message, error.code
-            ));
-        }
         other => {
             return Err(format!(
                 "asked for native window composition, got {other:?}"
@@ -527,16 +566,12 @@ async fn capture_node_region(
         }))
         .await;
     client.set_request_timeout(previous_timeout);
-    if std::env::var_os("PS_QA_TRACE_CAPTURE").is_some() {
+    if cli::trace_capture() {
         eprintln!("capture {selector:?}: request took {:?}", started.elapsed());
     }
     let answer = answer.map_err(|error| format!("could not capture {selector:?}: {error}"))?;
     match answer.response {
         DebugResponse::Captured(image) => Ok(image),
-        DebugResponse::Error(error) => Err(format!(
-            "frame capture refused: {} ({})",
-            error.message, error.code
-        )),
         other => Err(format!("asked for a rendered frame, got {other:?}")),
     }
 }
@@ -571,7 +606,7 @@ async fn capture_stable_region(
         deadline += tokio::time::Instant::now().duration_since(capture_started);
         let held =
             captured_pixels_hold(&previous, &current, CAPTURE_CHANNEL_TOLERANCE).unwrap_or(false);
-        if std::env::var_os("PS_QA_TRACE_CAPTURE").is_some() {
+        if cli::trace_capture() {
             let delta = captured_pixel_delta(&previous, &current)
                 .map(|(pixels, max)| format!("{pixels} pixel(s), max {max}"))
                 .unwrap_or_else(|error| error);
@@ -620,8 +655,9 @@ async fn wait_for_pixels_change(
     client: &mut Client,
     selector: &str,
     before: &CapturedImage,
+    timeout: Duration,
 ) -> std::result::Result<(), String> {
-    let deadline = tokio::time::Instant::now() + check_timeout(100);
+    let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
         let after = capture_region(client, selector).await?;
@@ -672,6 +708,15 @@ fn start_host(
         let mut line = String::new();
         let _ = reader.read_line(&mut line);
         let _ = tx.send(line);
+
+        // Keep consuming stdout for the lifetime of the host. Closing the
+        // pipe after the descriptor line would deliver EPIPE if a host emits
+        // later diagnostics and could terminate an otherwise healthy sweep.
+        let mut diagnostic = String::new();
+        while reader.read_line(&mut diagnostic).unwrap_or_default() > 0 {
+            eprint!("host: {diagnostic}");
+            diagnostic.clear();
+        }
     });
 
     match rx.recv_timeout(startup_timeout) {
@@ -822,7 +867,7 @@ async fn sweep_components(
             };
             let (child, descriptor_path) = started;
 
-            let outcome = run_component(&descriptor_path, check_id, checks_dir).await;
+            let outcome = run_component(&descriptor_path, Some(check_id), checks_dir).await;
 
             // Dropped here, which kills this check's host before the next
             // one starts.
@@ -869,13 +914,13 @@ async fn sweep_components(
 /// Attach to one component's host and judge its checks.
 async fn run_component(
     descriptor_path: &std::path::Path,
-    id: &str,
+    selector: Option<&str>,
     checks_dir: Option<&std::path::Path>,
 ) -> Result<usize> {
     let descriptor = inspector::discover(descriptor_path.to_str())?;
     let mut client = Client::connect(&descriptor.socket_path()).await?;
     client.initialize().await?;
-    run_qa(&mut client, Some(id), checks_dir).await
+    run_qa(&mut client, selector, checks_dir).await
 }
 
 async fn run_qa(
@@ -1133,16 +1178,25 @@ async fn run_qa(
         }
 
         let (expanded, _) = inspect(client).await?;
-        if !painted_named(&expanded.nodes, setup_target)
+        if open_error.is_none()
+            && !painted_named(&expanded.nodes, setup_target)
             && let Some(surface) = reach::surfaces()
                 .iter()
                 .find(|surface| reach::on_surface(&expanded.nodes, surface))
         {
-            let reveals = reveal_deferred_content(client, surface, setup_target).await?;
-            if cli::trace() && reveals > 0 {
-                println!(
-                    "        revealed deferred content for {setup_target:?} in {reveals} step(s)"
-                );
+            match reveal_deferred_content(client, surface, setup_target).await {
+                Ok(reveals) => {
+                    if cli::trace() && reveals > 0 {
+                        println!(
+                            "        revealed deferred content for {setup_target:?} in {reveals} step(s)"
+                        );
+                    }
+                }
+                Err(error) => {
+                    open_error = Some(format!(
+                        "could not materialize pagination for {setup_target:?}: {error}"
+                    ));
+                }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1191,7 +1245,8 @@ async fn run_qa(
                         Err(error) => Err(error),
                         Ok(()) => {
                             tokio::time::sleep(Duration::from_millis(30)).await;
-                            nodes_after_first_hover = Some(inspect(client).await?.0.nodes.len());
+                            let snapshot = inspect(client).await?.0;
+                            nodes_after_first_hover = Some(hover_signature_counts(&snapshot.nodes));
                             match park_pointer(client).await {
                                 Err(error) => Err(error),
                                 Ok(()) => {
@@ -1423,7 +1478,7 @@ async fn run_qa(
                         .arm_paint_events()
                         .await
                         .map_err(|error| error.to_string())?;
-                    let require_events = std::env::var_os("PS_QA_REQUIRE_PAINT_EVENTS").is_some();
+                    let require_events = cli::require_paint_events();
                     if require_events && !event_driven {
                         return Err("the inspector does not provide paint events".to_owned());
                     }
@@ -1434,7 +1489,7 @@ async fn run_qa(
 
                     let paint_committed = if event_driven {
                         client
-                            .wait_for_paint(check_timeout(100))
+                            .wait_for_paint(declared_outcome_timeout(check))
                             .await
                             .map_err(|error| error.to_string())?
                     } else {
@@ -1457,7 +1512,13 @@ async fn run_qa(
                         // Compatibility with runtimes and headless hosts that
                         // predate paint notifications. Bounded to 100 ms and
                         // removed once the fleet has adopted the stream.
-                        wait_for_pixels_change(client, &check.subject, &before).await
+                        wait_for_pixels_change(
+                            client,
+                            &check.subject,
+                            &before,
+                            declared_outcome_timeout(check),
+                        )
+                        .await
                     }
                 }
                 .await;
@@ -1482,12 +1543,20 @@ async fn run_qa(
         if let Some(after_first) = nodes_after_first_hover
             && open_error.is_none()
         {
-            let after_repeats = inspect(client).await?.0.nodes.len();
-            let retained = after_repeats as i64 - after_first as i64;
-            if retained > 0 {
+            let snapshot = inspect(client).await?.0;
+            let after_repeats = hover_signature_counts(&snapshot.nodes);
+            let retained = accumulated_hover_signatures(&after_first, &after_repeats);
+            if !retained.is_empty() {
+                let details = retained
+                    .iter()
+                    .take(3)
+                    .map(|((role, name, slot, dom_id), extra)| {
+                        format!("{role}:{name:?} slot={slot:?} id={dom_id:?} +{extra}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 open_error = Some(format!(
-                    "repeated hover left {retained} more node(s) behind \
-                     ({after_first} -> {after_repeats}); something later entries add is never removed"
+                    "repeated hover retained extra copies of existing semantic nodes: {details}"
                 ));
             }
         }
@@ -1604,7 +1673,12 @@ async fn run_qa(
                 .filter(|node| !node.bounds.is_some_and(|b| b[2] > 0.0 && b[3] > 0.0))
                 .count();
             let live = before.nodes.len().saturating_sub(dead);
-            if live > 0 && dead > 5_000 && dead > live * 5 {
+            const MIN_SUSPICIOUS_DEAD_NODES: usize = 5_000;
+            const MAX_DEAD_TO_LIVE_RATIO: usize = 5;
+            if live > 0
+                && dead > MIN_SUSPICIOUS_DEAD_NODES
+                && dead > live.saturating_mul(MAX_DEAD_TO_LIVE_RATIO)
+            {
                 open_error = Some(format!(
                     "the document holds {dead} node(s) with no box against {live} with one, \
                      out of {}; something is retaining subtrees rather than reusing them",
@@ -1718,7 +1792,7 @@ async fn run_qa(
             // A real committed frame is the cheapest happens-after boundary.
             // Some valid actions change no pixels, so absence is a bounded
             // compatibility fallback rather than a verdict by itself.
-            let _ = client.wait_for_paint(check_timeout(100)).await;
+            let _ = client.wait_for_paint(declared_outcome_timeout(check)).await;
         }
         let transport_timed_out = action_error
             .as_deref()
@@ -2075,7 +2149,7 @@ fn subject_belongs_to_scope(
         subject_seen = true;
         subject_in_surface |= scope_ids.contains(&node.id);
     }
-    !subject_seen || subject_in_surface
+    subject_seen && subject_in_surface
 }
 
 /// Reconstruct a complete comparison snapshot from one freshly inspected pane.
@@ -2318,12 +2392,9 @@ async fn click_opener_quiet(client: &mut Client, want: &str, named_document: boo
 }
 
 async fn click_by_id(client: &mut Client, node_id: u64) -> Result<()> {
-    let answer = client
+    client
         .agent(&AgentControlRequest::Act(AgentAction::Click { node_id }))
         .await?;
-    if let DebugResponse::Error(error) = answer.response {
-        bail!("{} ({})", error.message, error.code);
-    }
     Ok(())
 }
 
@@ -2437,7 +2508,12 @@ async fn find(
     let rows: Vec<FoundRow> = snapshot
         .nodes
         .iter()
-        .filter(|node| roles.is_empty() || roles.iter().any(|role| role == &node.role))
+        .filter(|node| {
+            roles.is_empty()
+                || roles
+                    .iter()
+                    .any(|role| role.eq_ignore_ascii_case(&node.role))
+        })
         // `@slot` addresses the part the library named rather than the text it
         // carries, so a trigger and the thing it opens are distinguishable even
         // though they share an accessible name.
@@ -2586,7 +2662,7 @@ async fn press_named(client: &mut Client, want: &str) -> Result<()> {
         println!("        pressing {want:?} (id {id}) at {x:.0},{y:.0}");
     }
     for phase in [PointerPhase::Move, PointerPhase::Down, PointerPhase::Up] {
-        let answer = client
+        client
             .agent(&AgentControlRequest::Act(AgentAction::Input(
                 InputCommand::Pointer {
                     phase,
@@ -2597,9 +2673,6 @@ async fn press_named(client: &mut Client, want: &str) -> Result<()> {
                 },
             )))
             .await?;
-        if let DebugResponse::Error(error) = answer.response {
-            bail!("{} ({})", error.message, error.code);
-        }
     }
     Ok(())
 }
@@ -2694,7 +2767,6 @@ async fn capture(
         .await?;
     let image = match answer.response {
         DebugResponse::Captured(image) => image,
-        DebugResponse::Error(error) => bail!("capture refused: {} ({})", error.message, error.code),
         other => bail!("asked for a capture, got {other:?}"),
     };
 
@@ -3000,11 +3072,12 @@ async fn expand_everything(client: &mut Client, surface: &reach::Surface) -> Res
         let mine: std::collections::HashSet<u64> = reach::on_surface_subtree(&tree.nodes, surface)
             .into_iter()
             .collect();
-        let mut todo: Vec<String> = reach::expanders(&tree.nodes)
-            .into_iter()
-            .filter(|(id, _)| mine.contains(id))
-            .map(|(_, name)| name)
-            .collect();
+        let mut todo: Vec<String> =
+            reach::expanders(&tree.nodes, &reach::profile().expand_prefixes)
+                .into_iter()
+                .filter(|(id, _)| mine.contains(id))
+                .map(|(_, name)| name)
+                .collect();
         // Retained panes can expose dozens of identical disclosure names. One
         // semantic activation on the active surface is the user action; driving
         // every retained node toggles unrelated panes and can leave the current
@@ -3391,10 +3464,12 @@ enum InventoryClass {
     Reachable,
 }
 
-fn duplicate_dom_ids(nodes: &[SemanticNode]) -> std::collections::HashSet<String> {
+fn duplicate_dom_ids<'a>(
+    nodes: impl IntoIterator<Item = &'a SemanticNode>,
+) -> std::collections::HashSet<String> {
     let mut counts = std::collections::HashMap::<&str, usize>::new();
     for dom_id in nodes
-        .iter()
+        .into_iter()
         .filter_map(|node| node.dom_id.as_deref())
         .filter(|dom_id| !dom_id.trim().is_empty())
     {
@@ -3715,6 +3790,8 @@ async fn run_inventory(
     struct SurfaceRow {
         surface: String,
         opened: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
         components: usize,
         reachable: usize,
         unreachable: usize,
@@ -3783,14 +3860,19 @@ async fn run_inventory(
         controls: Vec<ControlRow>,
     }
 
-    let default_checks_exist = std::path::Path::new("tests/ps-qa").is_dir();
-    let checks = if checks_path.is_some() || default_checks_exist {
+    let default_checks_exist = qa::default_checks_path().is_dir();
+    let checks = if checks_path.is_some() || default_checks_exist || require_outcomes {
         qa::checks(checks_path).map_err(eyre::Report::msg)?
     } else {
+        eprintln!(
+            "warning: no --checks directory and {} does not exist; outcome coverage will be reported as zero",
+            qa::default_checks_path().display()
+        );
         Vec::new()
     };
     let mut rows = Vec::new();
     let mut controls = Vec::new();
+    let mut surface_failures = 0_usize;
     let mut role_counts: std::collections::BTreeMap<String, [usize; 13]> =
         std::collections::BTreeMap::new();
     for surface in reach::surfaces() {
@@ -3801,6 +3883,7 @@ async fn run_inventory(
             rows.push(SurfaceRow {
                 surface: surface.name.clone(),
                 opened: false,
+                error: None,
                 components: 0,
                 reachable: 0,
                 unreachable: 0,
@@ -3825,6 +3908,7 @@ async fn run_inventory(
             rows.push(SurfaceRow {
                 surface: surface.name.clone(),
                 opened: false,
+                error: None,
                 components: 0,
                 reachable: 0,
                 unreachable: 0,
@@ -3864,10 +3948,46 @@ async fn run_inventory(
         } else {
             None
         };
-        materialize_scrolled_content(client, surface).await?;
-        materialize_paginated_content(client, surface).await?;
-        let rows_hovered = hover_all_rows(client).await?;
-        let (tree, _) = inspect(client).await?;
+        let inspected = async {
+            materialize_scrolled_content(client, surface).await?;
+            materialize_paginated_content(client, surface).await?;
+            let rows_hovered = hover_all_rows(client).await?;
+            let (tree, _) = inspect(client).await?;
+            Ok::<_, eyre::Report>((rows_hovered, tree))
+        }
+        .await;
+        if let Some((field, previous)) = &held_filter
+            && !previous.is_empty()
+        {
+            type_text(client, field, previous).await?;
+        }
+        let (rows_hovered, tree) = match inspected {
+            Ok(inspected) => inspected,
+            Err(error) => {
+                rows.push(SurfaceRow {
+                    surface: surface.name.clone(),
+                    opened: true,
+                    error: Some(error.to_string()),
+                    components: 0,
+                    reachable: 0,
+                    unreachable: 0,
+                    state_hidden: 0,
+                    anonymous: 0,
+                    missing_id: 0,
+                    unstable_id: 0,
+                    duplicate_id: 0,
+                    disabled: 0,
+                    manual: 0,
+                    isolated: 0,
+                    outcome_declared: 0,
+                    unverified: 0,
+                    sections_opened,
+                    rows_hovered: 0,
+                });
+                surface_failures += 1;
+                continue;
+            }
+        };
         let mine: std::collections::HashSet<u64> = reach::on_surface_subtree(&tree.nodes, surface)
             .into_iter()
             .collect();
@@ -3876,7 +3996,8 @@ async fn run_inventory(
             .iter()
             .filter(|node| reach::interactive(node) && mine.contains(&node.id))
             .collect();
-        let duplicate_ids = duplicate_dom_ids(&tree.nodes);
+        let duplicate_ids =
+            duplicate_dom_ids(tree.nodes.iter().filter(|node| mine.contains(&node.id)));
         let classes: Vec<_> = components
             .iter()
             .map(|node| {
@@ -4024,6 +4145,7 @@ async fn run_inventory(
         rows.push(SurfaceRow {
             surface: surface.name.clone(),
             opened: true,
+            error: None,
             components: components.len(),
             reachable,
             unreachable,
@@ -4040,11 +4162,6 @@ async fn run_inventory(
             sections_opened,
             rows_hovered,
         });
-        if let Some((field, previous)) = held_filter
-            && !previous.is_empty()
-        {
-            type_text(client, &field, &previous).await?;
-        }
     }
 
     let report = InventoryReport {
@@ -4088,7 +4205,8 @@ async fn run_inventory(
         + report.missing_id
         + report.unstable_id
         + report.duplicate_id
-        + inventory_outcome_failures(report.unverified, report.isolated, require_outcomes);
+        + inventory_outcome_failures(report.unverified, report.isolated, require_outcomes)
+        + surface_failures;
     println!(
         "{}",
         toon_format::encode_default(&report).map_err(|error| eyre!(error.to_string()))?
@@ -4426,7 +4544,14 @@ async fn run_cover(
             continue;
         }
         materialize_deferred_content(client, surface, "").await?;
-        materialize_paginated_content(client, surface).await?;
+        if let Err(error) = materialize_paginated_content(client, surface).await {
+            failures.push((
+                surface.name.clone(),
+                "pagination".to_owned(),
+                error.to_string(),
+            ));
+            continue;
+        }
         let hovered = hover_all_rows(client).await?;
 
         /*
@@ -4473,7 +4598,6 @@ async fn run_cover(
             .count();
         let mut here = reach::Coverage {
             in_tree: buttons.len(),
-            hidden: 0,
             ..Default::default()
         };
         /*
@@ -4758,7 +4882,6 @@ async fn run_cover(
         total.swept += here.swept;
         total.outcome_declared += here.outcome_declared;
         total.unreachable += here.unreachable;
-        total.hidden += here.hidden;
         total.vanished += here.vanished;
         total.navigation += here.navigation;
         total.manual += here.manual;
@@ -4834,6 +4957,11 @@ pub async fn run() -> Result<()> {
     cli::set_trace(cli.trace);
     cli::set_pace(cli.pace);
     cli::set_timeout_scale(cli.timeout_scale);
+    cli::set_capture_options(
+        cli.trace_capture,
+        cli.require_paint_events,
+        cli.pixel_artifact_dir.clone(),
+    );
     cli::set_app_profile(cli.app.clone());
 
     // The inventory reads the check list, not the application, so it answers
@@ -4887,6 +5015,29 @@ pub async fn run() -> Result<()> {
             *mode,
         )
         .await?;
+        if failures > 0 {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // A hosted QA run owns one temporary renderer process. It uses the same
+    // descriptor announcement and deadline as component sweeps, so callers do
+    // not need to poll a file or guess how long first paint takes.
+    if let cli::Command::QaHosted {
+        selector,
+        host,
+        page,
+        checks,
+        startup_timeout,
+    } = &cli.command
+    {
+        let (child, descriptor_path) =
+            start_host(host, page, std::time::Duration::from_secs(*startup_timeout))
+                .map_err(|error| eyre!(error))?;
+        let result = run_component(&descriptor_path, selector.as_deref(), checks.as_deref()).await;
+        drop(child);
+        let failures = result?;
         if failures > 0 {
             std::process::exit(1);
         }
@@ -5277,7 +5428,7 @@ pub async fn run() -> Result<()> {
             let Some(node) = snapshot
                 .nodes
                 .iter()
-                .filter(|n| role.is_empty() || n.role == role)
+                .filter(|n| role.is_empty() || n.role.eq_ignore_ascii_case(role))
                 .filter(|n| n.name.to_lowercase().contains(&wanted))
                 .filter(|n| n.visible && n.enabled)
                 .find(|n| n.bounds.is_some_and(|b| b[2] > 0.0 && b[3] > 0.0))
@@ -5455,7 +5606,8 @@ pub async fn run() -> Result<()> {
         // Dispatched before the descriptor lookup, because they launch their
         // own hosts or read only files. Listed here so the match stays
         // exhaustive and a new command cannot be forgotten.
-        cli::Command::SweepComponents { .. }
+        cli::Command::QaHosted { .. }
+        | cli::Command::SweepComponents { .. }
         | cli::Command::List { .. }
         | cli::Command::Reconcile { .. } => {
             unreachable!("handled before the client connects")
@@ -5467,15 +5619,15 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InventoryClass, OutcomeStability, arrival_sample_matches, arrived_without_navigation,
-        capture_node_id, declared_outcome_timeout, duplicate_dom_ids, generated_dom_id,
-        inventory_class, is_pagination_control, measure_ink, name_matches,
-        named_document_is_active, named_document_is_active_with_permanent,
-        named_document_opener_for, outcome_check_ids, outcome_verdict, pagination_advanced,
-        painted_bounds, painted_named, pixels_change, pixels_hold, require_transparent_window_tint,
-        resolved_action_target, rgb_pixels_hold, saved_control_node, saved_controls,
-        selector_matches_node, stable_arrival, subject_belongs_to_scope,
-        validate_surface_filter_against,
+        InventoryClass, OutcomeStability, accumulated_hover_signatures, arrival_sample_matches,
+        arrived_without_navigation, capture_node_id, declared_outcome_timeout, duplicate_dom_ids,
+        generated_dom_id, hover_signature_counts, inventory_class, is_pagination_control,
+        measure_ink, name_matches, named_document_is_active,
+        named_document_is_active_with_permanent, named_document_opener_for, outcome_check_ids,
+        outcome_verdict, pagination_advanced, painted_bounds, painted_named, pixels_change,
+        pixels_hold, require_transparent_window_tint, resolved_action_target, rgb_pixels_hold,
+        saved_control_node, saved_controls, selector_matches_node, stable_arrival,
+        subject_belongs_to_scope, validate_surface_filter_against,
     };
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
@@ -5549,7 +5701,7 @@ mod tests {
             "dialog:Welcome",
             &analytics
         ));
-        assert!(subject_belongs_to_scope(
+        assert!(!subject_belongs_to_scope(
             &nodes,
             "generic:Already vanished",
             &analytics
@@ -5855,6 +6007,43 @@ mod tests {
         assert_eq!(
             duplicate_dom_ids(&[first.clone(), second]),
             HashSet::from([first.dom_id.unwrap()])
+        );
+    }
+
+    #[test]
+    fn duplicate_dom_ids_are_scoped_to_the_active_surface() {
+        let first = component("Save", true, true);
+        let mut retained = component("Save retained", true, true);
+        retained.id = first.id + 1;
+        retained.dom_id.clone_from(&first.dom_id);
+        let mine = HashSet::from([first.id]);
+
+        assert!(
+            duplicate_dom_ids(
+                [&first, &retained]
+                    .into_iter()
+                    .filter(|node| mine.contains(&node.id))
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn hover_accumulation_ignores_one_new_identity_but_rejects_extra_copies() {
+        let existing = component("Hover action", true, true);
+        let baseline = hover_signature_counts(std::slice::from_ref(&existing));
+
+        let mut legitimate = component("Status mounted later", true, true);
+        legitimate.id = existing.id + 1;
+        let after_unique = hover_signature_counts(&[existing.clone(), legitimate]);
+        assert!(accumulated_hover_signatures(&baseline, &after_unique).is_empty());
+
+        let mut leaked = existing.clone();
+        leaked.id = existing.id + 2;
+        let after_leak = hover_signature_counts(&[existing, leaked]);
+        assert_eq!(
+            accumulated_hover_signatures(&baseline, &after_leak).len(),
+            1
         );
     }
 

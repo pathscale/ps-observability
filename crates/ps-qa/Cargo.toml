@@ -3,16 +3,18 @@ name = "ps-qa"
 description = "Drive a running Blitz app through its MCP control socket and assert what the renderer did"
 version = "0.5.5"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pathscale/ps-observability"
 homepage = "https://github.com/pathscale/ps-observability"
+documentation = "https://docs.rs/ps-qa"
+readme = "README.md"
 keywords = ["qa", "testing", "blitz", "mcp", "ui"]
 categories = ["development-tools::testing"]
 publish = true
-# Product check data stays below `tests/sweep-fixture/`, where Cargo does not
-# auto-discover it as Rust. Real CLI integration tests live directly in
-# `tests/`; keeping those two kinds separate prevents RON manifests from being
-# mistaken for test crates while still exercising the shipped binary.
+# Application check manifests belong to the application being tested. This
+# crate's own Rust integration tests live directly in `tests/` and exercise the
+# shipped binary against purpose-built fixtures.
 
 # Nothing here may pull in tauri, winit, wgpu or blitz. The protocol types come
 # from `blitz-control-protocol` precisely so this binary can speak the wire

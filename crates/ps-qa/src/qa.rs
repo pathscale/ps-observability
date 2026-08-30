@@ -527,10 +527,14 @@ pub struct Check {
 /// Read from `<dir>/*.ron`, where `<dir>` is `--checks <path>` or `tests/ps-qa/`
 /// under the working directory. Files are read in name order and concatenated,
 /// so the group order is the filename order.
+pub fn default_checks_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("tests/ps-qa")
+}
+
 pub fn checks(dir: Option<&std::path::Path>) -> Result<Vec<Check>, String> {
     let dir = dir
         .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("tests/ps-qa"));
+        .unwrap_or_else(default_checks_path);
     if !dir.is_dir() {
         return Err(format!(
             "no checks at {}. Point --checks at the application's check \
@@ -693,7 +697,8 @@ pub fn verdict(
             if found.is_empty() {
                 return Err(format!("no node matching {:?} exists", check.subject));
             }
-            if !found.iter().any(|node| paints(node)) {
+            let broken: Vec<_> = found.iter().copied().filter(|node| !paints(node)).collect();
+            if !broken.is_empty() {
                 /*
                  * Say which half of "paints" failed.
                  *
@@ -703,14 +708,14 @@ pub fn verdict(
                  * and cannot. Reporting them as one message sent me looking at
                  * the wrong one.
                  */
-                let hidden = found.iter().filter(|node| !node.visible).count();
-                let zero = found
+                let hidden = broken.iter().filter(|node| !node.visible).count();
+                let zero = broken
                     .iter()
                     .filter(|node| {
                         node.visible && !node.bounds.is_some_and(|b| b[2] > 0.0 && b[3] > 0.0)
                     })
                     .count();
-                let boxes: Vec<String> = found
+                let boxes: Vec<String> = broken
                     .iter()
                     .take(3)
                     .map(|node| {
@@ -722,8 +727,9 @@ pub fn verdict(
                     })
                     .collect();
                 return Err(format!(
-                    "{} node(s) matching {:?} exist but none paints: \
+                    "{} of {} node(s) matching {:?} do not paint: \
                      {hidden} hidden, {zero} visible with no area ({})",
+                    broken.len(),
                     found.len(),
                     check.subject,
                     boxes.join(", ")
@@ -950,21 +956,33 @@ pub fn verdict(
                 .compare
                 .as_deref()
                 .ok_or_else(|| "Above requires compare".to_owned())?;
-            let subject_node = found
-                .iter()
-                .find(|node| paints(node))
-                .ok_or_else(|| format!("no painted node matching {:?}", check.subject))?;
-            let subject = subject_node.bounds.expect("painted nodes have bounds");
-            let other = matching(after, compare)
+            if found.is_empty() {
+                return Err(format!("no node matching {:?}", check.subject));
+            }
+            let others: Vec<_> = matching(after, compare)
                 .into_iter()
-                .filter(|node| node.id != subject_node.id)
-                .find_map(|node| paints(node).then_some(node.bounds).flatten())
-                .ok_or_else(|| format!("no painted comparison node matching {compare:?}"))?;
-            if subject[1] >= other[1] {
-                return Err(format!(
-                    "{:?} is at y={:.0}, not above {compare:?} at y={:.0}",
-                    check.subject, subject[1], other[1]
-                ));
+                .filter(|node| paints(node))
+                .collect();
+            if others.is_empty() {
+                return Err(format!("no painted comparison node matching {compare:?}"));
+            }
+            for subject_node in &found {
+                if !paints(subject_node) {
+                    return Err(format!(
+                        "{:?} id={} does not paint",
+                        check.subject, subject_node.id
+                    ));
+                }
+                let subject = subject_node.bounds.expect("painted nodes have bounds");
+                if !others.iter().any(|other| {
+                    other.id != subject_node.id
+                        && other.bounds.is_some_and(|bounds| subject[1] < bounds[1])
+                }) {
+                    return Err(format!(
+                        "{:?} id={} is at y={:.0}, not above any {compare:?}",
+                        check.subject, subject_node.id, subject[1]
+                    ));
+                }
             }
         }
         Expect::RightOf => {
@@ -972,23 +990,36 @@ pub fn verdict(
                 .compare
                 .as_deref()
                 .ok_or_else(|| "RightOf requires compare".to_owned())?;
-            let subject_node = found
-                .iter()
-                .find(|node| paints(node))
-                .ok_or_else(|| format!("no painted node matching {:?}", check.subject))?;
-            let subject = subject_node.bounds.expect("painted nodes have bounds");
-            let other = matching(after, compare)
+            if found.is_empty() {
+                return Err(format!("no node matching {:?}", check.subject));
+            }
+            let others: Vec<_> = matching(after, compare)
                 .into_iter()
-                .filter(|node| node.id != subject_node.id)
-                .find_map(|node| paints(node).then_some(node.bounds).flatten())
-                .ok_or_else(|| format!("no painted comparison node matching {compare:?}"))?;
+                .filter(|node| paints(node))
+                .collect();
+            if others.is_empty() {
+                return Err(format!("no painted comparison node matching {compare:?}"));
+            }
             const SLACK: f64 = 1.0;
-            let other_right = other[0] + other[2];
-            if subject[0] < other_right - SLACK {
-                return Err(format!(
-                    "{:?} starts at x={:.0}, not right of {compare:?} ending at x={other_right:.0}",
-                    check.subject, subject[0]
-                ));
+            for subject_node in &found {
+                if !paints(subject_node) {
+                    return Err(format!(
+                        "{:?} id={} does not paint",
+                        check.subject, subject_node.id
+                    ));
+                }
+                let subject = subject_node.bounds.expect("painted nodes have bounds");
+                if !others.iter().any(|other| {
+                    other.id != subject_node.id
+                        && other
+                            .bounds
+                            .is_some_and(|bounds| subject[0] >= bounds[0] + bounds[2] - SLACK)
+                }) {
+                    return Err(format!(
+                        "{:?} id={} starts at x={:.0}, not right of any {compare:?}",
+                        check.subject, subject_node.id, subject[0]
+                    ));
+                }
             }
         }
         Expect::CenterAlignedY => {
@@ -996,24 +1027,38 @@ pub fn verdict(
                 .compare
                 .as_deref()
                 .ok_or_else(|| "CenterAlignedY requires compare".to_owned())?;
-            let subject_node = found
-                .iter()
-                .find(|node| paints(node))
-                .ok_or_else(|| format!("no painted node matching {:?}", check.subject))?;
-            let subject = subject_node.bounds.expect("painted nodes have bounds");
-            let other = matching(after, compare)
+            if found.is_empty() {
+                return Err(format!("no node matching {:?}", check.subject));
+            }
+            let others: Vec<_> = matching(after, compare)
                 .into_iter()
-                .filter(|node| node.id != subject_node.id)
-                .find_map(|node| paints(node).then_some(node.bounds).flatten())
-                .ok_or_else(|| format!("no painted comparison node matching {compare:?}"))?;
-            let subject_center = subject[1] + subject[3] / 2.0;
-            let other_center = other[1] + other[3] / 2.0;
+                .filter(|node| paints(node))
+                .collect();
+            if others.is_empty() {
+                return Err(format!("no painted comparison node matching {compare:?}"));
+            }
             const SLACK: f64 = 2.0;
-            if (subject_center - other_center).abs() > SLACK {
-                return Err(format!(
-                    "{:?} is centered at y={subject_center:.0}, not aligned with {compare:?} at y={other_center:.0}",
-                    check.subject
-                ));
+            for subject_node in &found {
+                if !paints(subject_node) {
+                    return Err(format!(
+                        "{:?} id={} does not paint",
+                        check.subject, subject_node.id
+                    ));
+                }
+                let subject = subject_node.bounds.expect("painted nodes have bounds");
+                let subject_center = subject[1] + subject[3] / 2.0;
+                if !others.iter().any(|other| {
+                    other.id != subject_node.id
+                        && other.bounds.is_some_and(|bounds| {
+                            let other_center = bounds[1] + bounds[3] / 2.0;
+                            (subject_center - other_center).abs() <= SLACK
+                        })
+                }) {
+                    return Err(format!(
+                        "{:?} id={} is centered at y={subject_center:.0}, not aligned with any {compare:?}",
+                        check.subject, subject_node.id
+                    ));
+                }
             }
         }
         Expect::PixelsHold
@@ -1353,6 +1398,63 @@ mod tests {
         assert!(error.contains("52px height"));
 
         assert!(verdict(&check, &[], &[compact.clone(), compact]).is_ok());
+    }
+
+    #[test]
+    fn family_verdicts_reject_a_broken_sibling() {
+        let good = painted_node(1, "Saved", 20.0, 20.0);
+        let mut hidden = painted_node(2, "Saved", 20.0, 20.0);
+        hidden.visible = false;
+        hidden.bounds = Some([0.0, 0.0, 0.0, 0.0]);
+        let mut check = parse("");
+        check.click = None;
+        check.expect = Expect::Paints;
+        assert!(
+            verdict(&check, &[], &[good.clone(), hidden]).is_err(),
+            "one painted representative must not hide a broken sibling"
+        );
+
+        let comparison = SemanticNode {
+            id: 9,
+            name: "Anchor".into(),
+            bounds: Some([100.0, 100.0, 20.0, 20.0]),
+            ..painted_node(9, "Anchor", 20.0, 20.0)
+        };
+        check.compare = Some("Anchor".into());
+
+        for (expect, valid_bounds, broken_bounds) in [
+            (
+                Expect::Above,
+                [100.0, 70.0, 20.0, 20.0],
+                [100.0, 130.0, 20.0, 20.0],
+            ),
+            (
+                Expect::RightOf,
+                [130.0, 100.0, 20.0, 20.0],
+                [90.0, 100.0, 20.0, 20.0],
+            ),
+            (
+                Expect::CenterAlignedY,
+                [130.0, 100.0, 20.0, 20.0],
+                [130.0, 130.0, 20.0, 20.0],
+            ),
+        ] {
+            let mut valid = good.clone();
+            valid.bounds = Some(valid_bounds);
+            let mut broken = good.clone();
+            broken.id = 2;
+            broken.bounds = Some(broken_bounds);
+            check.expect = expect;
+            assert!(
+                verdict(
+                    &check,
+                    &[],
+                    &[valid.clone(), broken.clone(), comparison.clone()]
+                )
+                .is_err(),
+                "{expect:?} must validate every matching subject"
+            );
+        }
     }
 
     #[test]

@@ -1,9 +1,8 @@
 //! Output formatting.
 //!
-//! Every line here is load-bearing: `docs/performance.md` quotes these numbers,
-//! and two runs of this tool are meant to be diffed against each other
-//! directly. Widths and field order match the Python this replaced, so a
-//! measurement taken before the port is still comparable with one taken after.
+//! Every line here is load-bearing: `docs/performance.md` defines what these
+//! numbers mean, and two runs of this tool are meant to be diffed against each
+//! other directly. Field order remains stable so reports are reviewable.
 
 use std::collections::HashMap;
 
@@ -211,18 +210,30 @@ pub fn show_nodes(nodes: &[SemanticNode], inspect_ms: f64) {
 
 /// Ack latency for a burst of driven events.
 pub fn show_latencies(what: &str, count: usize, latencies: &mut [f64]) {
-    if latencies.is_empty() {
+    let finite_count = latencies.iter().filter(|sample| sample.is_finite()).count();
+    if finite_count != latencies.len() {
+        eprintln!(
+            "ignored {} non-finite {what} latency sample(s)",
+            latencies.len() - finite_count
+        );
+    }
+    let mut finite: Vec<f64> = latencies
+        .iter()
+        .copied()
+        .filter(|sample| sample.is_finite())
+        .collect();
+    if finite.is_empty() {
         println!("drove {count} {what}: no acknowledgements recorded");
         return;
     }
-    latencies.sort_by(|a, b| a.partial_cmp(b).expect("latencies are finite"));
-    let mean = latencies.iter().sum::<f64>() / latencies.len() as f64;
-    let p95 = p95(latencies).expect("non-empty latency slice");
+    finite.sort_by(f64::total_cmp);
+    let mean = finite.iter().sum::<f64>() / finite.len() as f64;
+    let p95 = p95(&finite).expect("non-empty latency slice");
     println!(
         "drove {count} {what}: ack mean={:.2}ms p95={:.2}ms max={:.2}ms",
         mean,
         p95,
-        latencies.last().copied().unwrap_or_default()
+        finite.last().copied().unwrap_or_default()
     );
 }
 
@@ -318,12 +329,18 @@ pub fn show_delta(before: &RendererMetrics, after: &RendererMetrics, events: usi
 
 #[cfg(test)]
 mod tests {
-    use super::p95;
+    use super::{p95, show_latencies};
 
     #[test]
     fn p95_is_empty_safe_and_uses_the_nearest_rank() {
         assert_eq!(p95(&[]), None);
         let samples: Vec<_> = (1..=21).map(f64::from).collect();
         assert_eq!(p95(&samples), Some(20.0));
+    }
+
+    #[test]
+    fn latency_reporting_ignores_non_finite_samples() {
+        show_latencies("fixture", 2, &mut [f64::NAN, 4.0]);
+        show_latencies("fixture", 1, &mut [f64::INFINITY]);
     }
 }

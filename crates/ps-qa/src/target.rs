@@ -334,8 +334,10 @@ pub(crate) fn exact_selector_matches_node(node: &SemanticNode, selector: &str) -
     if let Some(slot) = selector_slot(selector) {
         return node.slot.as_deref() == Some(slot);
     }
-    if let Some((role, name)) = selector.split_once(':') {
-        return role.eq_ignore_ascii_case(&node.role) && node.name.eq_ignore_ascii_case(name);
+    if let Some((role, name)) = selector.split_once(':')
+        && role.eq_ignore_ascii_case(&node.role)
+    {
+        return node.name.eq_ignore_ascii_case(name);
     }
     node.name.eq_ignore_ascii_case(selector)
 }
@@ -401,5 +403,18 @@ mod tests {
         let save = node(None, "Save settings");
         assert!(!selector_matches_node(&save, "button"));
         assert!(selector_matches_node(&save, "save"));
+    }
+
+    #[test]
+    fn a_colon_in_a_bare_name_is_not_misread_as_a_role() {
+        let permission = node(None, "Default permission: Auto");
+        assert!(selector_matches_node(
+            &permission,
+            "Default permission: Auto"
+        ));
+        assert!(exact_selector_matches_node(
+            &permission,
+            "Default permission: Auto"
+        ));
     }
 }

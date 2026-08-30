@@ -287,10 +287,12 @@ fn opens_document_row_for(
 /// `"ee"` -> `"e"`, `"DashboardDashboard"` -> `"Dashboard"`. An odd length or a mismatched
 /// half is not a tab.
 fn doubled(name: &str) -> Option<&str> {
-    if name.is_empty() || !name.len().is_multiple_of(2) {
+    let characters = name.chars().count();
+    if characters == 0 || !characters.is_multiple_of(2) {
         return None;
     }
-    let (left, right) = name.split_at(name.len() / 2);
+    let midpoint = name.char_indices().nth(characters / 2)?.0;
+    let (left, right) = name.split_at(midpoint);
     (left == right && !left.trim().is_empty()).then_some(left)
 }
 
@@ -587,6 +589,7 @@ pub fn requires_isolated_outcome(name: &str) -> bool {
 /// contained box next to a large surface, so the first ancestor holding more
 /// than a handful of controls is already too big.
 pub fn enclosing_dialog(nodes: &[SemanticNode], dismiss_id: u64) -> Vec<u64> {
+    const MAX_PLAUSIBLE_DIALOG_BUTTONS: usize = 12;
     let by_id: HashMap<u64, &SemanticNode> = nodes.iter().map(|n| (n.id, n)).collect();
     let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
     for node in nodes {
@@ -616,14 +619,18 @@ pub fn enclosing_dialog(nodes: &[SemanticNode], dismiss_id: u64) -> Vec<u64> {
         let kept = subtree_of(cursor);
         let buttons = kept
             .iter()
-            .filter(|id| by_id.get(id).is_some_and(|n| n.role == "button"))
+            .filter(|id| {
+                by_id
+                    .get(id)
+                    .is_some_and(|n| n.role.eq_ignore_ascii_case("button"))
+            })
             .count();
         /*
          * A dialog holds a handful of controls. Past that this is the pane
          * behind it, and taking that would sweep the whole surface again from
          * inside the modal.
          */
-        if buttons > 12 {
+        if buttons > MAX_PLAUSIBLE_DIALOG_BUTTONS {
             break;
         }
         best = kept;
@@ -661,39 +668,29 @@ pub fn folds_a_section(name: &str) -> bool {
 /// dominate the sweep.
 pub fn profile() -> &'static crate::app::AppProfile {
     static PROFILE: std::sync::OnceLock<crate::app::AppProfile> = std::sync::OnceLock::new();
-    PROFILE.get_or_init(|| match crate::app::AppProfile::load(None) {
-        Ok(profile) => profile,
-        // No fallback profile, and no continuing without one.
-        //
-        // A missing or unparseable profile is a typo or a wrong working
-        // directory, never a decision to run against a description of some
-        // other application. Substituting an empty one is how a sweep reports
-        // "0 sections opened" against an application with six of them, and
-        // nobody notices for an afternoon: every number after that point is
-        // measured against something that does not exist, which is worse than
-        // no number at all.
-        //
-        // `main` validates the profile before it drives anything, so reaching
-        // here means a unit test asked for the profile without one on disk.
-        // Those tests cover the half of this module that is about how a tab
-        // strip renders rather than about any one application, so an empty
-        // profile is the honest answer for them and unreachable outside them.
-        #[cfg(test)]
-        Err(_) => crate::app::AppProfile::default(),
-        #[cfg(not(test))]
-        Err(error) => panic!("no application profile: {error}"),
-    })
+    // Broad driving commands validate their required profile before this
+    // cache is reached. Targeted diagnostics deliberately do not require
+    // product navigation rules; an empty profile makes their explicit
+    // selector the whole policy instead of panicking inside lookup.
+    PROFILE.get_or_init(|| crate::app::AppProfile::load(None).unwrap_or_default())
 }
 
 /// The disclosure controls that must be opened before a sweep of this surface.
 ///
 /// Collapsed sections are the second-largest source of unreached controls after
 /// the wrong surface: one section alone may hide a row of controls per record.
-pub fn expanders(nodes: &[SemanticNode]) -> Vec<(u64, String)> {
+pub fn expanders(nodes: &[SemanticNode], expand_prefixes: &[String]) -> Vec<(u64, String)> {
+    let prefixes: Vec<_> = expand_prefixes
+        .iter()
+        .map(|prefix| prefix.to_lowercase())
+        .collect();
     nodes
         .iter()
-        .filter(|node| node.role == "button" && onscreen(node))
-        .filter(|node| node.name.to_lowercase().starts_with("expand "))
+        .filter(|node| node.role.eq_ignore_ascii_case("button") && onscreen(node))
+        .filter(|node| {
+            let name = node.name.to_lowercase();
+            prefixes.iter().any(|prefix| name.starts_with(prefix))
+        })
         .map(|node| (node.id, node.name.clone()))
         .collect()
 }
@@ -712,7 +709,7 @@ pub fn expanders(nodes: &[SemanticNode]) -> Vec<(u64, String)> {
 pub fn hover_row_ids(nodes: &[SemanticNode], row_role: &str, window: (f64, f64)) -> Vec<u64> {
     nodes
         .iter()
-        .filter(|node| node.role == row_role && onscreen(node))
+        .filter(|node| node.role.eq_ignore_ascii_case(row_role) && onscreen(node))
         .filter_map(|node| {
             let b = node.bounds?;
             let (x, y) = (b[0] + b[2] / 2.0, b[1] + b[3] / 2.0);
@@ -737,7 +734,6 @@ pub struct Coverage {
     /// passed in the ordered outcome suite.
     pub outcome_declared: usize,
     pub unreachable: usize,
-    pub hidden: usize,
     /// Planned, then gone by the time its turn came.
     ///
     /// Not a fault and not a skip: closing one tab removes its neighbours'
@@ -789,7 +785,6 @@ impl Coverage {
         self.swept
             + self.outcome_declared
             + self.unreachable
-            + self.hidden
             + self.vanished
             + self.navigation
             + self.manual
@@ -800,7 +795,7 @@ impl Coverage {
 
     pub fn line(&self) -> String {
         format!(
-            "{} buttons{}: {} swept, {} outcome-declared, {} unreachable, {} hidden, {} vanished, {} nav, {} manual, {} isolated, {} blocked{}",
+            "{} buttons{}: {} swept, {} outcome-declared, {} unreachable, {} vanished, {} nav, {} manual, {} isolated, {} blocked{}",
             self.total(),
             if self.revealed > 0 {
                 format!(" ({} on open, {} revealed)", self.in_tree, self.revealed)
@@ -810,7 +805,6 @@ impl Coverage {
             self.swept,
             self.outcome_declared,
             self.unreachable,
-            self.hidden,
             self.vanished,
             self.navigation,
             self.manual,
@@ -1022,7 +1016,7 @@ mod tests {
                 Some([0.0, 0.0, 20.0, 20.0]),
             ),
         ];
-        let found = expanders(&nodes);
+        let found = expanders(&nodes, &["Expand ".to_owned()]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].1, "Expand Records");
     }
@@ -1042,6 +1036,8 @@ mod tests {
         // Document tabs are doubled, and clicking one leaves the surface.
         assert!(navigates("ee"));
         assert!(navigates("delta/east/cobaltdelta/east/cobalt"));
+        assert!(navigates("éé"));
+        assert!(navigates("設定設定"));
         // A `contains` would catch these, and dropping a Close from the sweep
         // is the silent skip this module exists to end.
         assert!(!navigates("Close Dashboard"));
@@ -1211,11 +1207,10 @@ mod tests {
         // on a zero that proves nothing. One dialog put real controls in
         // `blocked`, which is why it counts.
         let full = Coverage {
-            in_tree: 11,
+            in_tree: 10,
             swept: 3,
             outcome_declared: 0,
             unreachable: 2,
-            hidden: 1,
             vanished: 1,
             navigation: 1,
             manual: 1,

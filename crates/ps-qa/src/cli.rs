@@ -100,6 +100,18 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub trace: bool,
 
+    /// Report the duration of each renderer capture request.
+    #[arg(long, global = true)]
+    pub trace_capture: bool,
+
+    /// Fail pixel checks when the runtime cannot provide committed-paint events.
+    #[arg(long, global = true)]
+    pub require_paint_events: bool,
+
+    /// Save before/after PPM captures for failed pixel checks.
+    #[arg(long, global = true)]
+    pub pixel_artifact_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -445,6 +457,28 @@ pub enum Command {
         checks: Option<PathBuf>,
     },
 
+    /// Launch one headless page, run its checks, and stop the host.
+    ///
+    /// This is the single-page counterpart to `sweep-components`. The host
+    /// announces its descriptor on stdout; ps-qa waits for that line with the
+    /// startup deadline instead of making callers poll a file.
+    QaHosted {
+        /// A group, or a single check's id. Defaults to every check.
+        selector: Option<String>,
+        /// The headless host binary.
+        #[arg(long)]
+        host: PathBuf,
+        /// The built page or page directory for the host to load.
+        #[arg(long)]
+        page: PathBuf,
+        /// Where the checks live.
+        #[arg(long)]
+        checks: Option<PathBuf>,
+        /// How long to wait for the host to announce its descriptor.
+        #[arg(long, default_value_t = 30)]
+        startup_timeout: u64,
+    },
+
     /// Every check the harness can see, without a running application.
     List {
         /// Where the checks live.
@@ -509,6 +543,10 @@ pub enum Command {
 /// argument that means "how to talk about the work" into the signature of every
 /// function that does the work. It is written once, before anything runs.
 static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRACE_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REQUIRE_PAINT_EVENTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static PIXEL_ARTIFACT_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
 /// The inter-event delay, in seconds. Set once, from `main`, for the same
 /// reason as `TRACE`.
@@ -522,6 +560,16 @@ static TIMEOUT_SCALE: std::sync::atomic::AtomicU64 =
 /// Record whether tracing was asked for. Called once, from `main`.
 pub fn set_trace(on: bool) {
     TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_capture_options(
+    trace_capture: bool,
+    require_paint_events: bool,
+    pixel_artifact_dir: Option<PathBuf>,
+) {
+    TRACE_CAPTURE.store(trace_capture, std::sync::atomic::Ordering::Relaxed);
+    REQUIRE_PAINT_EVENTS.store(require_paint_events, std::sync::atomic::Ordering::Relaxed);
+    let _ = PIXEL_ARTIFACT_DIR.set(pixel_artifact_dir);
 }
 
 /// Record the inter-event delay. Called once, from `main`.
@@ -564,6 +612,18 @@ pub fn trace() -> bool {
     TRACE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+pub fn trace_capture() -> bool {
+    TRACE_CAPTURE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn require_paint_events() -> bool {
+    REQUIRE_PAINT_EVENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn pixel_artifact_dir() -> Option<PathBuf> {
+    PIXEL_ARTIFACT_DIR.get().cloned().flatten()
+}
+
 impl Command {
     /// Whether this mode needs product-owned navigation and safety rules.
     ///
@@ -578,6 +638,7 @@ impl Command {
                 | Command::Cover { .. }
                 | Command::Inventory { .. }
                 | Command::Qa { .. }
+                | Command::QaHosted { .. }
                 | Command::SweepComponents { .. }
         )
     }
@@ -599,7 +660,9 @@ impl Command {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{CheckMode, Command, parse_timeout_scale};
+    use clap::Parser;
+
+    use super::{CheckMode, Cli, Command, parse_timeout_scale};
 
     #[test]
     fn timeout_scale_is_explicit_and_bounded() {
@@ -617,6 +680,16 @@ mod tests {
             Command::Qa {
                 selector: None,
                 checks: None,
+            }
+            .requires_app_profile()
+        );
+        assert!(
+            Command::QaHosted {
+                selector: None,
+                host: PathBuf::from("host"),
+                page: PathBuf::from("page.html"),
+                checks: None,
+                startup_timeout: 30,
             }
             .requires_app_profile()
         );
@@ -639,5 +712,39 @@ mod tests {
             }
             .requires_app_profile()
         );
+    }
+
+    #[test]
+    fn hosted_qa_arguments_are_typed_by_clap() {
+        let cli = Cli::try_parse_from([
+            "ps-qa",
+            "--app",
+            "fixture.ron",
+            "qa-hosted",
+            "fixture-text-entry",
+            "--host",
+            "qa-inspect-host",
+            "--page",
+            "page.html",
+            "--checks",
+            "checks",
+        ])
+        .unwrap();
+
+        let Command::QaHosted {
+            selector,
+            host,
+            page,
+            checks,
+            startup_timeout,
+        } = cli.command
+        else {
+            panic!("qa-hosted did not parse as the hosted QA command");
+        };
+        assert_eq!(selector.as_deref(), Some("fixture-text-entry"));
+        assert_eq!(host, PathBuf::from("qa-inspect-host"));
+        assert_eq!(page, PathBuf::from("page.html"));
+        assert_eq!(checks, Some(PathBuf::from("checks")));
+        assert_eq!(startup_timeout, 30);
     }
 }

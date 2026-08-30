@@ -10,11 +10,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use blitz_control_protocol::{
-    AgentControlRequest, AgentSnapshot, DebugDescriptor, DebugEvent, DebugProtocolError,
-    DebugResponse, DebugStream, DiagnosticsRequest, JsonRpcId, JsonRpcMessage, JsonRpcRequest,
-    MCP_PROTOCOL_VERSION, MessageStream, TransportStream, WireMessage, decode_diagnostics_event,
-    decode_response, decode_rpc, encode_agent_request, encode_diagnostics_request, encode_rpc,
-    framed_json,
+    AgentControlRequest, AgentSnapshot, DEBUG_PROTOCOL_VERSION, DebugDescriptor, DebugEvent,
+    DebugProtocolError, DebugResponse, DebugStream, DiagnosticsRequest, JsonRpcId, JsonRpcMessage,
+    JsonRpcRequest, MCP_PROTOCOL_VERSION, MessageStream, TransportStream, WireMessage,
+    decode_diagnostics_event, decode_response, decode_rpc, encode_agent_request,
+    encode_diagnostics_request, encode_rpc, framed_json,
 };
 use eyre::{Context, Result, bail, eyre};
 use tokio::net::UnixStream;
@@ -23,8 +23,10 @@ use tokio::time::timeout;
 /// Matches the Python client's bench timeout. Long because a driven
 /// interaction can leave the app resolving for a while before it answers.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_QUEUED_EVENTS: usize = 256;
 
 /// Where an inspector announced itself, and what it said.
+#[derive(Debug)]
 pub struct Descriptor {
     pub path: PathBuf,
     pub descriptor: DebugDescriptor,
@@ -137,6 +139,14 @@ fn read_descriptor(path: &Path) -> Result<Descriptor> {
         .with_context(|| format!("parsing descriptor {}", path.display()))?;
     let descriptor: DebugDescriptor = serde_json::from_value(raw.clone())
         .with_context(|| format!("descriptor {} is not a DebugDescriptor", path.display()))?;
+    if descriptor.protocol_version != DEBUG_PROTOCOL_VERSION {
+        bail!(
+            "descriptor {} uses debug protocol {}, but ps-qa requires {}",
+            path.display(),
+            descriptor.protocol_version,
+            DEBUG_PROTOCOL_VERSION
+        );
+    }
     Ok(Descriptor {
         path: path.to_path_buf(),
         descriptor,
@@ -156,7 +166,32 @@ pub struct Client {
     events: VecDeque<DebugEvent>,
 }
 
+#[derive(Debug)]
+struct InspectorResponseError {
+    code: String,
+    message: String,
+}
+
+impl std::fmt::Display for InspectorResponseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "inspector returned {}: {}",
+            self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for InspectorResponseError {}
+
 impl Client {
+    fn queue_event(&mut self, event: DebugEvent) {
+        if self.events.len() == MAX_QUEUED_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
     pub async fn connect(socket: &Path) -> Result<Self> {
         const CONNECT_DEADLINE: Duration = Duration::from_millis(500);
         const RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -225,7 +260,7 @@ impl Client {
                 return Ok(message);
             }
             if let Ok(event) = decode_diagnostics_event(message) {
-                self.events.push_back(event);
+                self.queue_event(event);
             }
         }
     }
@@ -295,7 +330,13 @@ impl Client {
             .await
         {
             Ok(_) => Ok(true),
-            Err(error) if error.to_string().contains("streamingUnavailable") => Ok(false),
+            Err(error)
+                if error
+                    .downcast_ref::<InspectorResponseError>()
+                    .is_some_and(|error| error.code == "streamingUnavailable") =>
+            {
+                Ok(false)
+            }
             Err(error) => Err(error),
         }
     }
@@ -325,7 +366,7 @@ impl Client {
                 .map_err(|error| eyre!("reading paint event from inspector failed: {error}"))?;
             match decode_diagnostics_event(message) {
                 Ok(DebugEvent::PaintCommitted { .. }) => return Ok(true),
-                Ok(event) => self.events.push_back(event),
+                Ok(event) => self.queue_event(event),
                 Err(_) => {}
             }
         }
@@ -415,7 +456,10 @@ impl Answer {
         let envelope = envelope(&message)?;
         let (_, response) = decode_response(message).map_err(protocol_error)?;
         if let DebugResponse::Error(error) = &response {
-            bail!("inspector returned {}: {}", error.code, error.message);
+            return Err(eyre::Report::new(InspectorResponseError {
+                code: error.code.clone(),
+                message: error.message.clone(),
+            }));
         }
         Ok(Self { envelope, response })
     }
@@ -506,5 +550,33 @@ mod tests {
 
         tokio::join!(server, client);
         let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn descriptor_protocol_mismatch_is_rejected_before_connecting() {
+        let path = std::env::temp_dir().join(format!(
+            "ps-qa-descriptor-version-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "protocolVersion": DEBUG_PROTOCOL_VERSION + 1,
+                "pid": 1,
+                "instanceId": "fixture",
+                "address": "unix:///tmp/fixture.sock",
+                "renderer": "fixture",
+                "rendererRevision": "test"
+            })
+            .to_string(),
+        )
+        .expect("write descriptor fixture");
+        let error = read_descriptor(&path).expect_err("newer protocol must not be guessed");
+        assert!(error.to_string().contains("requires"));
+        let _ = std::fs::remove_file(path);
     }
 }

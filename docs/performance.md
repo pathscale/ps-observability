@@ -54,3 +54,14 @@ labelled as observer cost rather than silently removed.
 Record the app build, renderer dependency tree, viewport, profile, check id,
 and `--pace` value. Compare medians across repeated fresh-profile runs; use p95
 and max to investigate tail stalls, not as substitutes for the raw samples.
+
+## Guard thresholds
+
+The dead-node warning requires both more than 5,000 detached nodes and more
+than five detached nodes per live node. The absolute floor avoids noise from a
+normal retained document; the ratio prevents a legitimately large live page
+from failing merely because its history is also large. Modal detection rejects
+containers with more than 12 buttons because those are application surfaces,
+not plausible blocking confirmations. The `ghost` command's 400-event default
+is a CLI value and can be changed explicitly when profiling a different
+retention horizon.

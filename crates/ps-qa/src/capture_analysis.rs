@@ -12,6 +12,8 @@ use base64::Engine as _;
 use blitz_control_protocol::CapturedImage;
 use eyre::{Context, Result};
 
+use crate::cli;
+
 /// Subpixel edge coverage can vary by a few 8-bit levels between equivalent
 /// GPU captures. Four levels is the first difference treated as authored ink.
 pub(crate) const CHANNEL_TOLERANCE: u8 = 3;
@@ -279,8 +281,15 @@ pub(crate) fn measure_ink(image: &CapturedImage) -> Result<Ink> {
 
 /// Discover visible ink inside the control, excluding its border and focus ring.
 pub(crate) fn measure_interior_ink(image: &CapturedImage) -> Result<Ink> {
-    let inset_x = image.width / 5;
-    let inset_y = image.height / 5;
+    if image.width < 3 || image.height < 3 {
+        return Err(eyre::eyre!(
+            "captured {}x{} region is too small to exclude its border",
+            image.width,
+            image.height
+        ));
+    }
+    let inset_x = (image.width / 5).max(1);
+    let inset_y = (image.height / 5).max(1);
     let right = image.width.saturating_sub(inset_x);
     let bottom = image.height.saturating_sub(inset_y);
     if right <= inset_x || bottom <= inset_y {
@@ -310,10 +319,9 @@ pub(crate) fn save_artifacts(
     before: &CapturedImage,
     after: &CapturedImage,
 ) -> Result<()> {
-    let Some(directory) = std::env::var_os("PS_QA_PIXEL_ARTIFACT_DIR") else {
+    let Some(directory) = cli::pixel_artifact_dir() else {
         return Ok(());
     };
-    let directory = std::path::PathBuf::from(directory);
     std::fs::create_dir_all(&directory)
         .wrap_err_with(|| format!("could not create {}", directory.display()))?;
     let safe_id: String = check_id
@@ -407,5 +415,22 @@ mod tests {
             ..bordered
         };
         assert_eq!(measure_interior_ink(&labeled).unwrap().visible, 1);
+
+        let mut tiny_border = background.repeat(16);
+        for y in 0..4 {
+            for x in 0..4 {
+                if x == 0 || x == 3 || y == 0 || y == 3 {
+                    let start = (y * 4 + x) * 4;
+                    tiny_border[start..start + 4].copy_from_slice(&border);
+                }
+            }
+        }
+        let tiny = CapturedImage {
+            width: 4,
+            height: 4,
+            rgba_base64: base64::engine::general_purpose::STANDARD.encode(tiny_border),
+            node_id: Some(8),
+        };
+        assert_eq!(measure_interior_ink(&tiny).unwrap().visible, 0);
     }
 }
