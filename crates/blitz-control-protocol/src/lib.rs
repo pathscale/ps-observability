@@ -101,6 +101,13 @@ pub enum DiagnosticsRequest {
     Snapshot(SnapshotRequest),
     Metrics,
     WaitForIdle,
+    /// The native window layers which sit outside the renderer's document.
+    ///
+    /// A renderer capture cannot see whether an opaque platform window or a
+    /// tinted native glass view was placed behind its transparent root. This
+    /// response makes that compositor boundary observable without pretending
+    /// pixels from an unknown desktop prove which native layer produced them.
+    WindowComposition,
     /// Render the current document to an RGBA8 image and return the pixels.
     ///
     /// The one question the rest of this protocol cannot answer. A snapshot
@@ -171,8 +178,28 @@ pub enum DebugResponse {
     Snapshot(DebugSnapshot),
     Metrics(RendererMetrics),
     Idle(RevisionSet),
+    WindowComposition(WindowComposition),
     Captured(CapturedImage),
     Error(DebugError),
+}
+
+/// Effective native composition selected for the application window.
+///
+/// `supported` is false for a headless host or a runtime which has no native
+/// window integration. The remaining fields describe the path the runtime
+/// actually installed, not merely values requested by application CSS.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowComposition {
+    pub supported: bool,
+    pub surface_transparent: bool,
+    pub glass_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glass_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tint_rgba: Option<[u8; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -896,6 +923,7 @@ fn response_summary(response: &DebugResponse) -> String {
         DebugResponse::Snapshot(_) => "diagnostic snapshot".into(),
         DebugResponse::Metrics(_) => "renderer metrics".into(),
         DebugResponse::Idle(_) => "renderer idle".into(),
+        DebugResponse::WindowComposition(_) => "native window composition".into(),
         DebugResponse::Captured(image) => {
             format!("captured {}x{} image", image.width, image.height)
         }
@@ -1173,6 +1201,32 @@ mod tests {
         let response = DebugResponse::Metrics(RendererMetrics {
             resident_bytes: Some(4096),
             ..Default::default()
+        });
+        assert_eq!(
+            decode_response(encode_response(id.clone(), &response).unwrap()).unwrap(),
+            (id, response)
+        );
+    }
+
+    #[test]
+    fn native_window_composition_round_trips_without_pixel_inference() {
+        let id = JsonRpcId::Number(24);
+        assert_eq!(
+            decode_diagnostics_request(
+                encode_diagnostics_request(id.clone(), &DiagnosticsRequest::WindowComposition)
+                    .unwrap()
+            )
+            .unwrap(),
+            (id.clone(), DiagnosticsRequest::WindowComposition)
+        );
+
+        let response = DebugResponse::WindowComposition(WindowComposition {
+            supported: true,
+            surface_transparent: true,
+            glass_enabled: true,
+            glass_backend: Some("nativeGlass".into()),
+            tint_rgba: Some([174, 50, 112, 0]),
+            radius: Some(12.0),
         });
         assert_eq!(
             decode_response(encode_response(id.clone(), &response).unwrap()).unwrap(),
