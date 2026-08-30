@@ -26,7 +26,7 @@ use blitz_control_protocol::{
 use eyre::{Context, Result, bail, eyre};
 
 use crate::capture_analysis::{
-    CHANNEL_TOLERANCE as CAPTURE_CHANNEL_TOLERANCE, measure_ink,
+    CHANNEL_TOLERANCE as CAPTURE_CHANNEL_TOLERANCE, measure_ink, measure_interior_ink,
     pixel_delta as captured_pixel_delta, pixels_change, pixels_hold,
     pixels_hold_with_tolerance as captured_pixels_hold, rgb_pixels_hold,
     save_artifacts as save_pixel_artifacts, write_ppm as write_capture_ppm,
@@ -420,6 +420,20 @@ async fn visible_ink(client: &mut Client, selector: &str) -> std::result::Result
     if ink.visible == 0 {
         Err(format!(
             "{selector:?} occupies {}x{} but draws no pixels distinguishable from its background",
+            image.width, image.height
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Require visible content inside a control, rather than counting its border.
+async fn interior_ink(client: &mut Client, selector: &str) -> std::result::Result<(), String> {
+    let image = capture_region(client, selector).await?;
+    let ink = measure_interior_ink(&image).map_err(|error| error.to_string())?;
+    if ink.visible == 0 {
+        Err(format!(
+            "{selector:?} occupies {}x{} but its interior contains no pixels distinguishable from its background",
             image.width, image.height
         ))
     } else {
@@ -1504,6 +1518,8 @@ async fn run_qa(
             pixel_outcome = Some(transparent_window_tint(client).await);
         } else if open_error.is_none() && check.expect == qa::Expect::VisibleInk {
             pixel_outcome = Some(visible_ink(client, &check.subject).await);
+        } else if open_error.is_none() && check.expect == qa::Expect::InteriorInk {
+            pixel_outcome = Some(interior_ink(client, &check.subject).await);
         } else if open_error.is_none() && check.expect == qa::Expect::Contrast {
             pixel_outcome = Some(
                 paint_audit::contrast(client, &check.subject, 4.5, 3.0)
@@ -1588,6 +1604,7 @@ async fn run_qa(
                 | qa::Expect::PixelsHoldAfterHover
                 | qa::Expect::PixelsChange
                 | qa::Expect::VisibleInk
+                | qa::Expect::InteriorInk
                 | qa::Expect::OpaqueBackground
                 | qa::Expect::TransparentBackground
                 | qa::Expect::TransparentWindowTint

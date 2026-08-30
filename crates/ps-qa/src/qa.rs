@@ -246,6 +246,12 @@ pub enum Expect {
     /// references a missing sprite symbol. Raster ink is the observable that
     /// distinguishes a real icon from an empty box.
     VisibleInk,
+    /// The captured control contains visible pixels away from its border.
+    ///
+    /// Use this for closed selectors and labeled fields: their border makes a
+    /// whole-region ink check pass even when the value a person needs to read
+    /// is blank. The center inset excludes that chrome and proves content.
+    InteriorInk,
     /// The subject's resolved background colour is fully opaque.
     ///
     /// A translucent child over an animated gradient cannot have a flat fill,
@@ -884,44 +890,52 @@ pub fn verdict(
                 .expect_size
                 .as_deref()
                 .ok_or_else(|| "Measures requires expect_size".to_owned())?;
-            let node = found
+            let painted = found
                 .iter()
-                .find(|node| paints(node))
-                .ok_or_else(|| format!("no painted node matching {:?}", check.subject))?;
-            let box_ = node.bounds.expect("painted nodes have bounds");
+                .copied()
+                .filter(|node| paints(node))
+                .collect::<Vec<_>>();
+            if painted.is_empty() {
+                return Err(format!("no painted node matching {:?}", check.subject));
+            }
             let (want_w, want_h) = want.split_once('x').ok_or_else(|| {
                 format!("expect_size {want:?} is not WxH; use `190x24`, `x24` or `190x`")
             })?;
 
-            for (axis, spec, actual) in [("width", want_w, box_[2]), ("height", want_h, box_[3])] {
-                let spec = spec.trim();
-                if spec.is_empty() {
-                    continue;
-                }
-                // A pixel of slack, because layout rounds and a control that
-                // asks for 24 can legitimately resolve to 23.6.
-                const SLACK: f64 = 1.0;
-                let (compare, number) = match spec.strip_prefix("<=") {
-                    Some(rest) => ("at most", rest),
-                    None => match spec.strip_prefix('=') {
-                        Some(rest) => ("exactly", rest),
-                        None => ("at least", spec),
-                    },
-                };
-                let target: f64 = number
-                    .trim()
-                    .parse()
-                    .map_err(|_| format!("expect_size {axis} {number:?} is not a number"))?;
-                let ok = match compare {
-                    "at most" => actual <= target + SLACK,
-                    "exactly" => (actual - target).abs() <= SLACK,
-                    _ => actual >= target - SLACK,
-                };
-                if !ok {
-                    return Err(format!(
-                        "{:?} is {actual:.0}px {axis}, expected {compare} {target:.0}",
-                        check.subject
-                    ));
+            for node in painted {
+                let box_ = node.bounds.expect("painted nodes have bounds");
+                for (axis, spec, actual) in
+                    [("width", want_w, box_[2]), ("height", want_h, box_[3])]
+                {
+                    let spec = spec.trim();
+                    if spec.is_empty() {
+                        continue;
+                    }
+                    // A pixel of slack, because layout rounds and a control that
+                    // asks for 24 can legitimately resolve to 23.6.
+                    const SLACK: f64 = 1.0;
+                    let (compare, number) = match spec.strip_prefix("<=") {
+                        Some(rest) => ("at most", rest),
+                        None => match spec.strip_prefix('=') {
+                            Some(rest) => ("exactly", rest),
+                            None => ("at least", spec),
+                        },
+                    };
+                    let target: f64 = number
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("expect_size {axis} {number:?} is not a number"))?;
+                    let ok = match compare {
+                        "at most" => actual <= target + SLACK,
+                        "exactly" => (actual - target).abs() <= SLACK,
+                        _ => actual >= target - SLACK,
+                    };
+                    if !ok {
+                        return Err(format!(
+                            "{:?} id={} is {actual:.0}px {axis}, expected {compare} {target:.0}",
+                            check.subject, node.id
+                        ));
+                    }
                 }
             }
         }
@@ -1000,6 +1014,7 @@ pub fn verdict(
         | Expect::PixelsHoldAfterHover
         | Expect::PixelsChange
         | Expect::VisibleInk
+        | Expect::InteriorInk
         | Expect::OpaqueBackground
         | Expect::TransparentBackground
         | Expect::TransparentWindowTint
@@ -1298,6 +1313,39 @@ mod tests {
              click:Some(\"Save\"),{extra}subject:\"Saved\",expect:Paints)"
         );
         ron::from_str(&ron).expect("check parses")
+    }
+
+    fn painted_node(id: u64, name: &str, width: f64, height: f64) -> SemanticNode {
+        SemanticNode {
+            dom_id: None,
+            id,
+            parent: None,
+            role: "generic".into(),
+            name: name.into(),
+            value: None,
+            enabled: true,
+            visible: true,
+            selected: false,
+            bounds: Some([0.0, 0.0, width, height]),
+            slot: None,
+        }
+    }
+
+    #[test]
+    fn measures_rejects_any_matching_node_that_breaks_the_contract() {
+        let mut check = parse("");
+        check.click = None;
+        check.expect = Expect::Measures;
+        check.expect_size = Some("x<=24".into());
+
+        let compact = painted_node(1, "Saved", 80.0, 24.0);
+        let wrapped = painted_node(2, "Saved", 80.0, 52.0);
+        let error = verdict(&check, &[], &[compact.clone(), wrapped])
+            .expect_err("one valid representative cannot hide a wrapped sibling");
+        assert!(error.contains("id=2"));
+        assert!(error.contains("52px height"));
+
+        assert!(verdict(&check, &[], &[compact.clone(), compact]).is_ok());
     }
 
     #[test]

@@ -219,11 +219,24 @@ impl Ink {
 }
 
 /// Discover the modal background and count pixels with visible contrast.
-pub(crate) fn measure_ink(image: &CapturedImage) -> Result<Ink> {
+fn measure_ink_bounds(
+    image: &CapturedImage,
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+) -> Result<Ink> {
     let rgba = decode(image).map_err(eyre::Report::msg)?;
     let mut histogram: HashMap<(u8, u8, u8), usize> = HashMap::new();
-    for pixel in rgba.as_chunks::<4>().0 {
-        *histogram.entry((pixel[0], pixel[1], pixel[2])).or_default() += 1;
+    let pixel = |x: u32, y: u32| {
+        let start = ((y * image.width + x) * 4) as usize;
+        [rgba[start], rgba[start + 1], rgba[start + 2], rgba[start + 3]]
+    };
+    for y in top..bottom {
+        for x in left..right {
+            let pixel = pixel(x, y);
+            *histogram.entry((pixel[0], pixel[1], pixel[2])).or_default() += 1;
+        }
     }
     let background = histogram
         .iter()
@@ -235,21 +248,44 @@ pub(crate) fn measure_ink(image: &CapturedImage) -> Result<Ink> {
         0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b)
     };
     let background_luminance = luminance(background);
-    let visible = rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .filter(|pixel| {
-            pixel[3] >= 32
+    let mut visible = 0;
+    for y in top..bottom {
+        for x in left..right {
+            let pixel = pixel(x, y);
+            if pixel[3] >= 32
                 && (luminance((pixel[0], pixel[1], pixel[2])) - background_luminance).abs() > 24.0
-        })
-        .count();
+            {
+                visible += 1;
+            }
+        }
+    }
 
     Ok(Ink {
         visible,
-        total: (image.width as usize) * (image.height as usize),
+        total: ((right - left) as usize) * ((bottom - top) as usize),
         background,
     })
+}
+
+/// Discover visible ink anywhere in the captured region.
+pub(crate) fn measure_ink(image: &CapturedImage) -> Result<Ink> {
+    measure_ink_bounds(image, 0, 0, image.width, image.height)
+}
+
+/// Discover visible ink inside the control, excluding its border and focus ring.
+pub(crate) fn measure_interior_ink(image: &CapturedImage) -> Result<Ink> {
+    let inset_x = image.width / 5;
+    let inset_y = image.height / 5;
+    let right = image.width.saturating_sub(inset_x);
+    let bottom = image.height.saturating_sub(inset_y);
+    if right <= inset_x || bottom <= inset_y {
+        return Err(eyre::eyre!(
+            "captured {}x{} region has no measurable interior",
+            image.width,
+            image.height
+        ));
+    }
+    measure_ink_bounds(image, inset_x, inset_y, right, bottom)
 }
 
 pub(crate) fn write_ppm(image: &CapturedImage, output: &std::path::Path) -> Result<()> {
@@ -336,5 +372,35 @@ mod tests {
             ..empty
         };
         assert_eq!(measure_ink(&marked).unwrap().visible, 1);
+    }
+
+    #[test]
+    fn interior_ink_ignores_a_control_border() {
+        let background = [20, 20, 20, 255];
+        let border = [240, 240, 240, 255];
+        let mut pixels = background.repeat(25);
+        for y in 0..5 {
+            for x in 0..5 {
+                if x == 0 || x == 4 || y == 0 || y == 4 {
+                    let start = (y * 5 + x) * 4;
+                    pixels[start..start + 4].copy_from_slice(&border);
+                }
+            }
+        }
+        let bordered = CapturedImage {
+            width: 5,
+            height: 5,
+            rgba_base64: base64::engine::general_purpose::STANDARD.encode(&pixels),
+            node_id: Some(7),
+        };
+        assert!(measure_ink(&bordered).unwrap().visible > 0);
+        assert_eq!(measure_interior_ink(&bordered).unwrap().visible, 0);
+
+        pixels[(2 * 5 + 2) * 4..(2 * 5 + 2) * 4 + 4].copy_from_slice(&border);
+        let labeled = CapturedImage {
+            rgba_base64: base64::engine::general_purpose::STANDARD.encode(pixels),
+            ..bordered
+        };
+        assert_eq!(measure_interior_ink(&labeled).unwrap().visible, 1);
     }
 }
