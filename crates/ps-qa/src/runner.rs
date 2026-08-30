@@ -391,6 +391,28 @@ async fn capture_region(
     capture_node_region(client, node_id, selector).await
 }
 
+/// Put the complete pixel subject at the start of each enclosing scrollport.
+///
+/// Action targeting only needs some clickable portion on screen, whereas a
+/// region comparison needs every compared pixel to come from the document.
+/// `locate_control` deliberately accepts partial visibility, so capture setup
+/// must issue ScrollIntoView unconditionally.
+async fn reveal_capture_region(
+    client: &mut Client,
+    selector: &str,
+) -> std::result::Result<u64, String> {
+    let (tree, _) = inspect(client).await.map_err(|error| error.to_string())?;
+    let node_id = capture_node_id(&tree.nodes, selector)?;
+    client
+        .agent(&AgentControlRequest::Act(AgentAction::ScrollIntoView {
+            node_id,
+        }))
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    Ok(node_id)
+}
+
 /// Require a captured component to contain visible raster output.
 async fn visible_ink(client: &mut Client, selector: &str) -> std::result::Result<(), String> {
     let image = capture_region(client, selector).await?;
@@ -1293,6 +1315,12 @@ async fn run_qa(
                 pixel_outcome = Some(measured);
             } else if check.expect == qa::Expect::PixelsChange {
                 let measured = async {
+                    // The hover target can be a child on the subject's edge.
+                    // Revealing only that child may leave most of the region
+                    // outside the viewport, where both captures are clipped to
+                    // identical black pixels. Place the persistent comparison
+                    // subject first; its descendant is then already visible.
+                    reveal_capture_region(client, &check.subject).await?;
                     let node_id = scroll_hover_target_into_view(client, hover.target()).await?;
                     park_pointer(client).await?;
                     let before = capture_region(client, &check.subject).await?;
@@ -1323,7 +1351,13 @@ async fn run_qa(
 
                     if paint_committed {
                         let after = capture_region(client, &check.subject).await?;
-                        pixels_change(&before, &after)
+                        let comparison = pixels_change(&before, &after);
+                        if comparison.is_err()
+                            && let Err(error) = save_pixel_artifacts(&check.id, &before, &after)
+                        {
+                            eprintln!("could not save pixel artifacts for {}: {error}", check.id);
+                        }
+                        comparison
                     } else {
                         // Compatibility with runtimes and headless hosts that
                         // predate paint notifications. Bounded to 100 ms and
