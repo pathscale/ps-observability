@@ -946,7 +946,7 @@ pub fn encode_response(
         result: BorrowedToolCallResult<'a>,
     }
 
-    let message = WireMessage::Text(serde_json::to_string(&RpcResponse {
+    let message = WireMessage::text(serde_json::to_string(&RpcResponse {
         jsonrpc: "2.0",
         id,
         result: BorrowedToolCallResult {
@@ -1140,7 +1140,7 @@ fn decode_notification_value<T: DeserializeOwned>(
 }
 
 pub fn encode_rpc(message: JsonRpcMessage) -> Result<WireMessage, DebugProtocolError> {
-    Ok(WireMessage::Text(serde_json::to_string(&message)?))
+    Ok(WireMessage::text(serde_json::to_string(&message)?))
 }
 
 /// The request id of an incoming frame, recovered without consuming it.
