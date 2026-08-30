@@ -57,13 +57,30 @@ jobs:
     name: Package boundaries
     runs-on: macos-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: zsh {0}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Package independently versioned crates
         run: |
+          set -euo pipefail
+
           cargo package -p blitz-control-protocol
           cargo package -p ps-blitz-debug-control
-          cargo package -p qa-inspect-host --no-verify
-          cargo package -p ps-qa --no-verify
+
+          protocol_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' \
+            crates/blitz-control-protocol/Cargo.toml | head -1)"
+          published="$(curl -fsS -H 'User-Agent: pathscale-ci' \
+            'https://crates.io/api/v1/crates/blitz-control-protocol/versions' \
+            | jq -r --arg version "$protocol_version" \
+              '.versions[]? | select(.num == $version) | .num')"
+          if [[ -z "$published" ]]; then
+            print "dependent package verification waits for protocol $protocol_version publication"
+            exit 0
+          fi
+
+          cargo package -p qa-inspect-host
+          cargo package -p ps-qa
