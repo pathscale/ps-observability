@@ -18,11 +18,11 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -30,6 +30,39 @@ use serde_json::{Value, json};
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct ActiveSession(AtomicU64);
+
+impl ActiveSession {
+    fn create(&self) -> io::Result<Option<String>> {
+        let value = loop {
+            let mut bytes = [0_u8; 8];
+            getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+            let value = u64::from_ne_bytes(bytes);
+            if value != 0 {
+                break value;
+            }
+        };
+        match self
+            .0
+            .compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(Some(format!("{value:016x}"))),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn matches(&self, supplied: &str) -> bool {
+        u64::from_str_radix(supplied, 16)
+            .ok()
+            .is_some_and(|value| value != 0 && self.0.load(Ordering::Acquire) == value)
+    }
+
+    fn clear(&self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
 
 /// Configuration for a loopback debug-control server.
 #[derive(Debug, Clone)]
@@ -279,20 +312,30 @@ fn server_loop(
     waker: &ServiceWaker,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut active_session: Option<String> = None;
+    let active_session = Arc::new(ActiveSession::default());
+    let token: Arc<str> = Arc::from(token);
     for connection in listener.incoming() {
         if shutdown.load(Ordering::Acquire) {
             break;
         }
         match connection {
             Ok(mut stream) => {
-                let _ = stream.set_read_timeout(Some(COMMAND_TIMEOUT));
-                let _ = stream.set_write_timeout(Some(COMMAND_TIMEOUT));
-                let response = match read_request(&mut stream) {
-                    Ok(request) => route(request, token, &mut active_session, &command_tx, waker),
-                    Err(error) => webdriver_error("invalid argument", error.to_string()),
-                };
-                let _ = write_response(&mut stream, response);
+                let token = Arc::clone(&token);
+                let active_session = Arc::clone(&active_session);
+                let command_tx = command_tx.clone();
+                let waker = waker.clone();
+                let _ = thread::Builder::new()
+                    .name("blitz-debug-connection".into())
+                    .spawn(move || {
+                        let _ = stream.set_write_timeout(Some(COMMAND_TIMEOUT));
+                        let response = match read_request(&mut stream) {
+                            Ok(request) => {
+                                route(request, &token, &active_session, &command_tx, &waker)
+                            }
+                            Err(error) => webdriver_error("invalid argument", error.to_string()),
+                        };
+                        let _ = write_response(&mut stream, response);
+                    });
             }
             Err(_) if shutdown.load(Ordering::Acquire) => break,
             Err(_) => continue,
@@ -308,7 +351,13 @@ struct HttpRequest {
 }
 
 fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
+    read_request_within(stream, COMMAND_TIMEOUT)
+}
+
+fn read_request_within(stream: &mut TcpStream, within: Duration) -> io::Result<HttpRequest> {
+    let deadline = Instant::now() + within;
     let mut bytes = Vec::with_capacity(4096);
+    let mut scan_from = 0;
     let header_end = loop {
         if bytes.len() >= MAX_REQUEST_BYTES {
             return Err(io::Error::new(
@@ -316,18 +365,30 @@ fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
                 "request is too large",
             ));
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "request timed out"));
+        }
+        stream.set_read_timeout(Some(remaining))?;
         let mut chunk = [0; 4096];
-        let count = stream.read(&mut chunk)?;
+        let allowed = (MAX_REQUEST_BYTES - bytes.len()).min(chunk.len());
+        let count = stream.read(&mut chunk[..allowed])?;
         if count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "connection closed before headers",
             ));
         }
+        let prior_len = bytes.len();
         bytes.extend_from_slice(&chunk[..count]);
-        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            break index + 4;
+        scan_from = scan_from.min(prior_len.saturating_sub(3));
+        if let Some(index) = bytes[scan_from..]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+        {
+            break scan_from + index + 4;
         }
+        scan_from = bytes.len().saturating_sub(3);
     };
 
     let headers = std::str::from_utf8(&bytes[..header_end])
@@ -342,21 +403,40 @@ fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
             "invalid request line",
         ));
     }
-    let content_length = lines
-        .filter_map(|line| line.split_once(':'))
+    let header_fields: Vec<_> = lines.filter_map(|line| line.split_once(':')).collect();
+    let content_length = header_fields
+        .iter()
+        .copied()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
         .map(|(_, value)| value.trim().parse::<usize>())
         .transpose()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
         .unwrap_or(0);
-    if header_end + content_length > MAX_REQUEST_BYTES {
+    if header_fields.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("transfer-encoding")
+            && !value.trim().eq_ignore_ascii_case("identity")
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transfer-encoding is unsupported; send Content-Length",
+        ));
+    }
+    let body_end = header_end
+        .checked_add(content_length)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "request size overflow"))?;
+    if body_end > MAX_REQUEST_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "request is too large",
         ));
     }
-    while bytes.len() < header_end + content_length {
-        let remaining = header_end + content_length - bytes.len();
+    while bytes.len() < body_end {
+        let deadline_remaining = deadline.saturating_duration_since(Instant::now());
+        if deadline_remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "request timed out"));
+        }
+        stream.set_read_timeout(Some(deadline_remaining))?;
+        let remaining = body_end - bytes.len();
         let mut chunk = vec![0; remaining.min(4096)];
         let count = stream.read(&mut chunk)?;
         if count == 0 {
@@ -370,7 +450,7 @@ fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     let body = if content_length == 0 {
         Value::Null
     } else {
-        serde_json::from_slice(&bytes[header_end..header_end + content_length])
+        serde_json::from_slice(&bytes[header_end..body_end])
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
     };
     Ok(HttpRequest { method, path, body })
@@ -379,7 +459,7 @@ fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
 fn route(
     request: HttpRequest,
     token: &str,
-    active_session: &mut Option<String>,
+    active_session: &ActiveSession,
     command_tx: &Sender<ControlRequest>,
     waker: &ServiceWaker,
 ) -> Value {
@@ -392,9 +472,6 @@ fn route(
     }
 
     if request.method == "POST" && request.path == "/session" {
-        if active_session.is_some() {
-            return webdriver_error("session not created", "only one session is supported");
-        }
         let supplied_token = request
             .body
             .pointer("/capabilities/alwaysMatch/blitz:token")
@@ -402,11 +479,13 @@ fn route(
         if !token_matches(supplied_token, token) {
             return webdriver_error("invalid argument", "invalid blitz:token capability");
         }
-        let session_id = match random_hex(16) {
-            Ok(value) => value,
+        let session_id = match active_session.create() {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return webdriver_error("session not created", "only one session is supported");
+            }
             Err(error) => return webdriver_error("unknown error", error.to_string()),
         };
-        *active_session = Some(session_id.clone());
         return json!({"value": {
             "sessionId": session_id,
             "capabilities": {
@@ -419,11 +498,11 @@ fn route(
     let Some((session_id, command_path)) = session_path(&request.path) else {
         return webdriver_error("unknown command", "unknown debug-control route");
     };
-    if active_session.as_deref() != Some(session_id) {
+    if !active_session.matches(session_id) {
         return webdriver_error("invalid session id", "session is not active");
     }
     if request.method == "DELETE" && command_path.is_empty() {
-        *active_session = None;
+        active_session.clear();
         return json!({"value": null});
     }
 
@@ -486,9 +565,15 @@ fn webdriver_error(error: &str, message: impl Into<String>) -> Value {
 
 fn write_response(stream: &mut TcpStream, body: Value) -> io::Result<()> {
     let bytes = serde_json::to_vec(&body).map_err(io::Error::other)?;
+    let status = match body.pointer("/value/error").and_then(Value::as_str) {
+        None => "200 OK",
+        Some("unknown command" | "invalid session id") => "404 Not Found",
+        Some("timeout" | "unknown error") => "500 Internal Server Error",
+        Some(_) => "400 Bad Request",
+    };
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         bytes.len()
     )?;
     stream.write_all(&bytes)
@@ -531,6 +616,19 @@ mod tests {
         )
         .unwrap();
         stream.write_all(&body).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let body_start = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        serde_json::from_slice(&response[body_start..]).unwrap()
+    }
+
+    fn raw_request(address: SocketAddr, request: &str) -> Value {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
         let mut response = Vec::new();
         stream.read_to_end(&mut response).unwrap();
         let body_start = response
@@ -584,6 +682,26 @@ mod tests {
         assert_eq!(rejected["value"]["error"], "invalid argument");
 
         let session = create_session(server.address(), server.token());
+        let duplicate = request(
+            server.address(),
+            "POST",
+            "/session",
+            json!({"capabilities": {"alwaysMatch": {"blitz:token": server.token()}}}),
+        );
+        assert_eq!(duplicate["value"]["error"], "session not created");
+        assert_eq!(
+            request(
+                server.address(),
+                "GET",
+                "/session/not-the-session/blitz/getDomSnapshot",
+                Value::Null,
+            )["value"]["error"],
+            "invalid session id"
+        );
+        assert_eq!(
+            request(server.address(), "GET", "/not-a-route", Value::Null)["value"]["error"],
+            "unknown command"
+        );
         let address = server.address();
         let command_path = format!("/session/{session}/blitz/getDomSnapshot");
         let client = thread::spawn(move || request(address, "GET", &command_path, Value::Null));
@@ -620,10 +738,77 @@ mod tests {
         assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidInput));
     }
 
+    #[test]
+    fn overflowing_content_length_is_rejected_without_killing_the_server() {
+        let (server, _commands) = DebugServer::start(ServerConfig {
+            bind_address: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            descriptor_path: descriptor_path(),
+            renderer_revision: "test-revision".into(),
+        })
+        .unwrap();
+
+        let rejected = raw_request(
+            server.address(),
+            &format!(
+                "POST /session HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                usize::MAX
+            ),
+        );
+        assert_eq!(rejected["value"]["error"], "invalid argument");
+        let malformed_length = raw_request(
+            server.address(),
+            "POST /session HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(malformed_length["value"]["error"], "invalid argument");
+        let malformed_json = raw_request(
+            server.address(),
+            "POST /session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{",
+        );
+        assert_eq!(malformed_json["value"]["error"], "invalid argument");
+        assert_eq!(
+            request(server.address(), "GET", "/status", Value::Null)["value"]["ready"],
+            true
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn a_slow_client_does_not_block_other_connections_and_has_an_absolute_deadline() {
+        let (server, _commands) = DebugServer::start(ServerConfig {
+            bind_address: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            descriptor_path: descriptor_path(),
+            renderer_revision: "test-revision".into(),
+        })
+        .unwrap();
+        let mut slow = TcpStream::connect(server.address()).unwrap();
+        slow.write_all(b"G").unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            request(server.address(), "GET", "/status", Value::Null)["value"]["ready"],
+            true
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let reader = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request_within(&mut stream, Duration::from_millis(40)).unwrap_err()
+        });
+        let mut drip = TcpStream::connect(address).unwrap();
+        drip.write_all(b"G").unwrap();
+        let error = reader.join().unwrap();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
+        server.shutdown();
+    }
+
     fn snapshot_request() -> HttpRequest {
         HttpRequest {
             method: "GET".into(),
-            path: "/session/test-session/blitz/getDomSnapshot".into(),
+            path: "/session/0000000000000001/blitz/getDomSnapshot".into(),
             body: Value::Null,
         }
     }
@@ -648,11 +833,11 @@ mod tests {
                 .unwrap();
         });
 
-        let mut active_session = Some("test-session".to_string());
+        let active_session = ActiveSession(AtomicU64::new(1));
         let response = route(
             snapshot_request(),
             "token",
-            &mut active_session,
+            &active_session,
             &command_tx,
             &waker,
         );
@@ -690,11 +875,11 @@ mod tests {
                 .unwrap();
         });
 
-        let mut active_session = Some("test-session".to_string());
+        let active_session = ActiveSession(AtomicU64::new(1));
         let response = route(
             snapshot_request(),
             "token",
-            &mut active_session,
+            &active_session,
             &command_tx,
             &waker,
         );
@@ -708,7 +893,7 @@ mod tests {
     fn queues_requests_while_no_waker_is_installed() {
         let (command_tx, command_rx) = mpsc::channel::<ControlRequest>();
         let waker = ServiceWaker::default();
-        let mut active_session = Some("test-session".to_string());
+        let active_session = ActiveSession(AtomicU64::new(1));
 
         let sender = command_tx.clone();
         let servicer = thread::spawn(move || {
@@ -722,7 +907,7 @@ mod tests {
         let response = route(
             snapshot_request(),
             "token",
-            &mut active_session,
+            &active_session,
             &command_tx,
             &waker,
         );

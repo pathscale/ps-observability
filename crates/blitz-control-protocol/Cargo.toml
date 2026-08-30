@@ -1,11 +1,16 @@
 [package]
 name = "blitz-control-protocol"
 description = "Wire types for the Blitz agent-control and diagnostics protocol"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/pathscale/ps-observability"
+documentation = "https://docs.rs/blitz-control-protocol"
+readme = "README.md"
+keywords = ["observability", "testing", "blitz", "mcp", "ui"]
+categories = ["development-tools::testing", "development-tools::debugging"]
 publish = true
 
 # Deliberately tiny. This crate exists so a client can speak the protocol
