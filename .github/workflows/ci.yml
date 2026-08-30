@@ -70,17 +70,7 @@ jobs:
 
           cargo package -p blitz-control-protocol
           cargo package -p ps-blitz-debug-control
-
-          protocol_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' \
-            crates/blitz-control-protocol/Cargo.toml | head -1)"
-          published="$(curl -fsS -H 'User-Agent: pathscale-ci' \
-            'https://crates.io/api/v1/crates/blitz-control-protocol/versions' \
-            | jq -r --arg version "$protocol_version" \
-              '.versions[]? | select(.num == $version) | .num')"
-          if [[ -z "$published" ]]; then
-            print "dependent package verification waits for protocol $protocol_version publication"
-            exit 0
-          fi
-
-          cargo package -p qa-inspect-host
-          cargo package -p ps-qa
+          cargo package -p qa-inspect-host \
+            --config 'patch.crates-io.blitz-control-protocol.path="crates/blitz-control-protocol"'
+          cargo package -p ps-qa \
+            --config 'patch.crates-io.blitz-control-protocol.path="crates/blitz-control-protocol"'
