@@ -3675,12 +3675,39 @@ fn inventory_outcome_failures(unverified: usize, isolated: usize, required: bool
     }
 }
 
+fn validate_surface_filter_against(only: Option<&str>, surfaces: &[reach::Surface]) -> Result<()> {
+    let Some(want) = only else {
+        return Ok(());
+    };
+    if surfaces
+        .iter()
+        .any(|surface| surface.name.eq_ignore_ascii_case(want))
+    {
+        return Ok(());
+    }
+    let available = surfaces
+        .iter()
+        .map(|surface| surface.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("unknown surface {want:?}; choose one of: {available}")
+}
+
+fn validate_surface_filter(only: Option<&str>) -> Result<()> {
+    validate_surface_filter_against(only, reach::surfaces())
+}
+
+fn surface_selected(surface: &reach::Surface, only: Option<&str>) -> bool {
+    only.is_none_or(|want| surface.name.eq_ignore_ascii_case(want))
+}
+
 async fn run_inventory(
     client: &mut Client,
     only: Option<&str>,
     require_outcomes: bool,
     checks_path: Option<&std::path::Path>,
 ) -> Result<usize> {
+    validate_surface_filter(only)?;
     #[derive(serde::Serialize)]
     struct SurfaceRow {
         surface: String,
@@ -3764,7 +3791,7 @@ async fn run_inventory(
     let mut role_counts: std::collections::BTreeMap<String, [usize; 13]> =
         std::collections::BTreeMap::new();
     for surface in reach::surfaces() {
-        if only.is_some_and(|want| want != surface.name) {
+        if !surface_selected(surface, only) {
             continue;
         }
         if !open_surface(client, surface).await? {
@@ -4360,6 +4387,7 @@ async fn run_cover(
     unmapped_only: bool,
     checks_dir: Option<&std::path::Path>,
 ) -> Result<usize> {
+    validate_surface_filter(only)?;
     let mut total = reach::Coverage::default();
     let mut failures: Vec<(String, String, String)> = Vec::new();
     // Named, so the manual worklist at the end is what this run actually met.
@@ -4373,7 +4401,7 @@ async fn run_cover(
     };
 
     for surface in reach::surfaces() {
-        if only.is_some_and(|want| want != surface.name) {
+        if !surface_selected(surface, only) {
             continue;
         }
         if !open_surface(client, surface).await? {
@@ -5438,6 +5466,7 @@ mod tests {
         painted_bounds, painted_named, pixels_change, pixels_hold, require_transparent_window_tint,
         resolved_action_target, rgb_pixels_hold, saved_control_node, saved_controls,
         selector_matches_node, stable_arrival, subject_belongs_to_scope,
+        validate_surface_filter_against,
     };
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
@@ -5926,6 +5955,21 @@ mod tests {
             declared_outcome_timeout(&check),
             Duration::from_millis(1_700)
         );
+    }
+
+    #[test]
+    fn a_surface_filter_is_case_insensitive_and_never_succeeds_empty() {
+        let surfaces = [SurfaceSpec {
+            name: "settings".into(),
+            opener: "Settings".into(),
+            marker: Some("Search settings".into()),
+            reveal_with: None,
+        }];
+        assert!(validate_surface_filter_against(Some("Settings"), &surfaces).is_ok());
+        let error = validate_surface_filter_against(Some("missing"), &surfaces)
+            .expect_err("an unknown surface must not produce a zero-row success");
+        assert!(error.to_string().contains("unknown surface \"missing\""));
+        assert!(error.to_string().contains("settings"));
     }
 
     #[test]
