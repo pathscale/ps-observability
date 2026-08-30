@@ -1945,6 +1945,35 @@ fn outcome_poll_scope(nodes: &[SemanticNode]) -> Option<OutcomePollScope> {
     })
 }
 
+/// Adopt a newly activated surface after a full-document outcome probe.
+///
+/// Navigation legitimately moves the declared subject out of the old pane.
+/// Once it appears in the new active pane, continuing to fingerprint the full
+/// document makes unrelated background updates reset its stability window.
+/// A subject that exists only outside the active pane is portal-owned, so that
+/// outcome deliberately retains document scope.
+fn scope_for_passing_snapshot(nodes: &[SemanticNode], subject: &str) -> Option<OutcomePollScope> {
+    let candidate = outcome_poll_scope(nodes)?;
+    subject_belongs_to_scope(nodes, subject, &candidate.baseline_ids).then_some(candidate)
+}
+
+fn subject_belongs_to_scope(
+    nodes: &[SemanticNode],
+    subject: &str,
+    scope_ids: &HashSet<u64>,
+) -> bool {
+    let mut subject_seen = false;
+    let mut subject_in_surface = false;
+    for node in nodes
+        .iter()
+        .filter(|node| selector_matches_node(node, subject))
+    {
+        subject_seen = true;
+        subject_in_surface |= scope_ids.contains(&node.id);
+    }
+    !subject_seen || subject_in_surface
+}
+
 /// Reconstruct a complete comparison snapshot from one freshly inspected pane.
 ///
 /// Count/family verdicts must still see nodes outside the pane. They are
@@ -2021,11 +2050,10 @@ async fn settle_for_outcome(
             passing =
                 outcome_verdict(check, before, &after.nodes, action_target, action_node_id).is_ok();
             scope = if passing {
-                // The outcome lives outside the active pane (typically a
-                // portal-owned dialog or toast). Keep polling the document for
-                // its stability window; returning to the pane would make that
-                // successful global outcome disappear on the next sample.
-                None
+                // Navigation can replace the active pane. Adopt that new
+                // subtree when it owns the declared subject; a portal-owned
+                // dialog or toast stays on document scope.
+                scope_for_passing_snapshot(&after.nodes, &check.subject)
             } else {
                 outcome_poll_scope(&after.nodes)
             };
@@ -5257,7 +5285,7 @@ mod tests {
         named_document_is_active_with_permanent, named_document_opener_for, outcome_check_ids,
         outcome_verdict, pagination_advanced, painted_bounds, painted_named, pixels_change,
         pixels_hold, resolved_action_target, rgb_pixels_hold, saved_control_node, saved_controls,
-        selector_matches_node, stable_arrival,
+        selector_matches_node, stable_arrival, subject_belongs_to_scope,
     };
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
@@ -5308,6 +5336,34 @@ mod tests {
             stability.remaining(start + Duration::from_millis(150), required),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn a_new_surface_owns_its_declared_outcome_but_not_a_portal() {
+        let mut heading = component("Outcome per dollar", true, true);
+        heading.id = 20;
+        heading.role = "heading".into();
+        let mut dialog = component("Welcome", true, true);
+        dialog.id = 30;
+        dialog.role = "dialog".into();
+        let nodes = [heading, dialog];
+        let analytics = HashSet::from([20]);
+
+        assert!(subject_belongs_to_scope(
+            &nodes,
+            "heading:Outcome per dollar",
+            &analytics
+        ));
+        assert!(!subject_belongs_to_scope(
+            &nodes,
+            "dialog:Welcome",
+            &analytics
+        ));
+        assert!(subject_belongs_to_scope(
+            &nodes,
+            "generic:Already vanished",
+            &analytics
+        ));
     }
 
     fn component(name: &str, enabled: bool, visible: bool) -> SemanticNode {
