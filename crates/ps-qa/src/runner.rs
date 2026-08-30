@@ -5376,12 +5376,18 @@ pub async fn run() -> Result<()> {
             }
         }
         cli::Command::Key { name, count, over } => {
-            // An empty `over` falls back to whatever the profile calls the
-            // main scrolling region, so the common case needs no argument.
-            let fallback = reach::profile()
-                .transcript_region
-                .clone()
-                .unwrap_or_default();
+            // A profile may name the application's default scroller, but a
+            // bare key command is also a useful protocol diagnostic. Without
+            // a profile, leave the target empty and send to current focus
+            // instead of panicking before the command reaches the app.
+            let fallback = if over.is_empty() {
+                app::AppProfile::load(None)
+                    .ok()
+                    .and_then(|profile| profile.transcript_region)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let over = if over.is_empty() { &fallback } else { &over };
             press_key(&mut client, &name, count as usize, over, false).await?;
         }
