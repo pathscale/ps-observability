@@ -41,8 +41,8 @@ use crate::interaction::{
 };
 use crate::layout_report::layout;
 use crate::target::{
-    locate_control, name_matches, offscreen, painted_bounds, painted_named, resolved_action_target,
-    selector_matches_node, viewport_of,
+    exact_selector_matches_node, locate_control, name_matches, offscreen, painted_bounds,
+    painted_named, resolved_action_target, selector_matches_node, viewport_of,
 };
 use crate::timing::{check_timeout, sleep_pace};
 use crate::{app, audit, cli, inspector, paint_audit, qa, reach, report, sweep};
@@ -3353,24 +3353,63 @@ fn outcome_check_ids(node: &SemanticNode, checks: &[qa::Check]) -> Vec<String> {
     checks
         .iter()
         .filter(|check| {
+            /*
+             * Navigation is not coverage for a control on the destination.
+             *
+             * `open: "Settings"` used to participate in this match. Because
+             * live selector semantics intentionally accept substrings, that
+             * credited controls such as "Allow agents to update app settings"
+             * for every check which merely navigated to Settings. The search
+             * field was similarly credited by every check that used it only as
+             * the surface's reveal mechanism. Neither control was driven by
+             * those checks.
+             *
+             * Credit only explicit interaction fields. `prepare` belongs here:
+             * opening a dropdown trigger is an indispensable driven step in a
+             * menu-selection outcome, even though the measured action is the
+             * option click. `covers` remains the deliberate escape hatch for a
+             * repeated component family proven by one representative outcome.
+             */
             let driven = [
-                check.open.as_deref(),
+                check.prepare.as_deref(),
                 check.hover.as_ref().map(qa::Hover::target),
+                check.after_prepare_hover.as_ref().map(qa::Hover::target),
                 check.click.as_deref(),
                 check.type_into.as_deref(),
                 check.key_on.as_deref(),
+                check.scroll_over.as_deref(),
             ]
             .into_iter()
             .flatten()
-            .chain(check.covers.iter().map(String::as_str))
-            .any(|selector| selector_matches_node(node, selector));
+            .any(|selector| coverage_action_matches_node(node, selector));
+            let family = check
+                .covers
+                .iter()
+                .any(|selector| selector_matches_node(node, selector));
             let disabled_outcome = !node.enabled
                 && matches!(check.expect, qa::Expect::Disabled)
-                && selector_matches_node(node, &check.subject);
-            driven || disabled_outcome
+                && coverage_action_matches_node(node, &check.subject);
+            driven || family || disabled_outcome
         })
         .map(|check| check.id.clone())
         .collect()
+}
+
+/// Coverage attribution is deliberately stricter than interactive lookup.
+///
+/// The live driver accepts a bare substring as a convenience, then narrows to
+/// an exact candidate when one exists in the complete tree. Inventory examines
+/// one node at a time and cannot perform that global narrowing. Reusing the
+/// broad predicate here credited `click: "Settings"` to every control whose
+/// label happened to contain “settings”. Require an exact name/id/slot unless
+/// the application explicitly writes a glob. Repeated families use `covers`,
+/// whose whole purpose is deliberate broad attribution.
+fn coverage_action_matches_node(node: &SemanticNode, selector: &str) -> bool {
+    if selector.contains('*') {
+        selector_matches_node(node, selector)
+    } else {
+        exact_selector_matches_node(node, selector)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -5892,7 +5931,11 @@ mod tests {
     #[test]
     fn outcome_coverage_names_only_checks_that_drive_an_enabled_control() {
         let checks = [
-            check("rename", Some("button:Rename"), "textbox:Rename project"),
+            check(
+                "rename",
+                Some("button:Rename project"),
+                "textbox:Rename project",
+            ),
             check("save", Some("Save"), "Saved"),
         ];
         assert_eq!(
@@ -5903,6 +5946,45 @@ mod tests {
         let mut editor = component("Rename project", true, true);
         editor.role = "textbox".into();
         assert!(outcome_check_ids(&editor, &checks).is_empty());
+    }
+
+    #[test]
+    fn navigation_never_credits_a_destination_control_but_prepare_does() {
+        let mut navigation = check("visit-settings", None, "heading:Settings");
+        navigation.open = Some("Settings".into());
+        assert!(
+            outcome_check_ids(
+                &component("Allow agents to update app settings", true, true),
+                &[navigation]
+            )
+            .is_empty(),
+            "opening Settings is not an outcome for an unrelated Settings control",
+        );
+
+        let mut selection = check(
+            "select-permission",
+            Some("menuitem:Edit"),
+            "Default permission",
+        );
+        selection.prepare = Some("button:Default permission: Auto".into());
+        assert_eq!(
+            outcome_check_ids(
+                &component("Default permission: Auto", true, true),
+                &[selection]
+            ),
+            vec!["select-permission"],
+            "a dropdown trigger is genuinely driven by the check that selects one of its options",
+        );
+
+        let broad = check("click-settings", Some("Settings"), "heading:Settings");
+        assert!(
+            outcome_check_ids(
+                &component("Allow agents to update app settings", true, true),
+                &[broad]
+            )
+            .is_empty(),
+            "a convenient live substring must not become broad coverage credit",
+        );
     }
 
     #[test]
