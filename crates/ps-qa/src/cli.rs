@@ -73,7 +73,8 @@ pub struct Cli {
 
     /// The application profile: which surfaces exist, what they are called, and
     /// which controls must not be pressed. Defaults to `ps-qa.ron` in the
-    /// working directory, and to a built-in profile when there is none.
+    /// working directory. Application-driving sweeps fail clearly when neither
+    /// path exists; the harness does not guess a built-in application.
     #[arg(long, global = true)]
     pub app: Option<PathBuf>,
 
@@ -414,6 +415,9 @@ pub enum Command {
         /// Fail when a reachable control has no named outcome check.
         #[arg(long)]
         require_outcomes: bool,
+        /// Where the named outcome checks live. Defaults to `tests/ps-qa`.
+        #[arg(long)]
+        checks: Option<PathBuf>,
     },
 
     /// Reconcile a saved `inventory` report against named outcome checks.
@@ -561,6 +565,22 @@ pub fn trace() -> bool {
 }
 
 impl Command {
+    /// Whether this mode needs product-owned navigation and safety rules.
+    ///
+    /// Renderer diagnostics deliberately work against any inspectable Blitz
+    /// document. Broad application driving does not: guessing which controls
+    /// are manual, destructive, or surface openers makes a missing profile a
+    /// safety bug rather than a useful default.
+    pub fn requires_app_profile(&self) -> bool {
+        matches!(
+            self,
+            Command::Sweep { .. }
+                | Command::Cover { .. }
+                | Command::Inventory { .. }
+                | Command::Qa { .. }
+        )
+    }
+
     /// Whether this mode should announce the descriptor it attached to.
     ///
     /// The answer to "why is this number wrong" is usually "a different
@@ -576,7 +596,7 @@ impl Command {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_timeout_scale;
+    use super::{Command, parse_timeout_scale};
 
     #[test]
     fn timeout_scale_is_explicit_and_bounded() {
@@ -585,5 +605,25 @@ mod tests {
         assert!(parse_timeout_scale("0.5").is_err());
         assert!(parse_timeout_scale("11").is_err());
         assert!(parse_timeout_scale("not-a-number").is_err());
+    }
+
+    #[test]
+    fn only_application_driving_modes_require_a_profile() {
+        assert!(Command::Sweep { family: None }.requires_app_profile());
+        assert!(
+            Command::Qa {
+                selector: None,
+                checks: None,
+            }
+            .requires_app_profile()
+        );
+        assert!(!Command::Metrics.requires_app_profile());
+        assert!(
+            !Command::Click {
+                name: None,
+                id: Some(7)
+            }
+            .requires_app_profile()
+        );
     }
 }

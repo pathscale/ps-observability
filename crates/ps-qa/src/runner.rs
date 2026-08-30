@@ -25,6 +25,12 @@ use blitz_control_protocol::{
 };
 use eyre::{Context, Result, bail, eyre};
 
+use crate::capture_analysis::{
+    CHANNEL_TOLERANCE as CAPTURE_CHANNEL_TOLERANCE, measure_ink,
+    pixel_delta as captured_pixel_delta, pixels_change, pixels_hold,
+    pixels_hold_with_tolerance as captured_pixels_hold, rgb_pixels_hold,
+    save_artifacts as save_pixel_artifacts, write_ppm as write_capture_ppm,
+};
 use crate::computed_style::{
     font_size, opaque_background, transparent_background, wait_for_larger_font,
 };
@@ -40,10 +46,6 @@ use crate::target::{
 };
 use crate::timing::{check_timeout, sleep_pace};
 use crate::{app, audit, cli, inspector, paint_audit, qa, reach, report, sweep};
-
-/// Subpixel edge coverage can vary by a few 8-bit levels between equivalent
-/// GPU captures. Four levels is the first difference treated as authored ink.
-const CAPTURE_CHANNEL_TOLERANCE: u8 = 3;
 
 /// Wait only for the destination a navigation check declared.
 ///
@@ -278,6 +280,9 @@ async fn repeat_hover(
 ) -> std::result::Result<(), String> {
     let want = hover.target();
     let node_id = scroll_hover_target_into_view(client, want).await?;
+    if cli::trace() {
+        println!("        hovering {want:?} (id {node_id})");
+    }
 
     // A previous check may have left the pointer on this exact node. Sending
     // Hover to it again is then a move within the same target, not a new enter,
@@ -351,11 +356,18 @@ async fn scroll_hover_target_into_view(
 
 /// Capture one declared rendered region through the renderer's own paint path.
 fn capture_node_id(nodes: &[SemanticNode], selector: &str) -> std::result::Result<u64, String> {
+    // Decorative SVGs are intentionally aria-hidden and therefore semantic
+    // `visible=false` even while the renderer gives them a real box. Only an
+    // explicit presentation-role selector opts into capturing that artwork;
+    // hidden controls and retained overlays keep the ordinary visibility gate.
+    let captures_decorative_art = selector
+        .split_once(':')
+        .is_some_and(|(role, _)| role.eq_ignore_ascii_case("presentation"));
     nodes
         .iter()
         .filter(|node| {
             selector_matches_node(node, selector)
-                && node.visible
+                && (node.visible || captures_decorative_art && node.role == "presentation")
                 && node.bounds.is_some_and(|b| b[2] > 0.0 && b[3] > 0.0)
         })
         .max_by(|a, b| {
@@ -379,6 +391,20 @@ async fn capture_region(
     capture_node_region(client, node_id, selector).await
 }
 
+/// Require a captured component to contain visible raster output.
+async fn visible_ink(client: &mut Client, selector: &str) -> std::result::Result<(), String> {
+    let image = capture_region(client, selector).await?;
+    let ink = measure_ink(&image).map_err(|error| error.to_string())?;
+    if ink.visible == 0 {
+        Err(format!(
+            "{selector:?} occupies {}x{} but draws no pixels distinguishable from its background",
+            image.width, image.height
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Capture a node whose identity has already been resolved.
 ///
 /// Stability checks take several frames of the same region. Re-inspecting the
@@ -392,6 +418,7 @@ async fn capture_node_region(
     // CPU rendering is diagnostic work, not a control interaction. Keep the
     // sub-second action contract for clicks and keys, but do not kill a valid
     // capture merely because shaping/rasterising its first frame is slower.
+    let previous_timeout = client.request_timeout();
     client.set_request_timeout(Duration::from_secs(15));
     let started = std::time::Instant::now();
     let answer = client
@@ -400,7 +427,7 @@ async fn capture_node_region(
             scale: 1.0,
         }))
         .await;
-    client.set_request_timeout(check_timeout(900));
+    client.set_request_timeout(previous_timeout);
     if std::env::var_os("PS_QA_TRACE_CAPTURE").is_some() {
         eprintln!("capture {selector:?}: request took {:?}", started.elapsed());
     }
@@ -479,191 +506,6 @@ async fn capture_stable_region(
             ));
         }
         previous = current;
-    }
-}
-
-fn captured_pixel_delta(
-    before: &CapturedImage,
-    after: &CapturedImage,
-) -> std::result::Result<(usize, u8), String> {
-    use base64::Engine as _;
-
-    let decode = |encoded: &str| {
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|error| format!("captured frame is not valid base64: {error}"))
-    };
-    let before_rgba = decode(&before.rgba_base64)?;
-    let after_rgba = decode(&after.rgba_base64)?;
-    if before_rgba.len() != after_rgba.len() {
-        return Err(format!(
-            "last frame buffer changed length from {} to {} bytes",
-            before_rgba.len(),
-            after_rgba.len()
-        ));
-    }
-    let expected_len = before.width as usize * before.height as usize * 4;
-    if before_rgba.len() != expected_len {
-        return Err(format!(
-            "captured {}x{} frame has {} bytes instead of {expected_len}",
-            before.width,
-            before.height,
-            before_rgba.len()
-        ));
-    }
-    let mut changed = 0;
-    let mut max_delta = 0;
-    for (before, after) in before_rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(after_rgba.as_chunks::<4>().0.iter())
-    {
-        let pixel_delta = before
-            .iter()
-            .zip(after.iter())
-            .map(|(left, right)| left.abs_diff(*right))
-            .max()
-            .unwrap_or_default();
-        if pixel_delta > 0 {
-            changed += 1;
-            max_delta = max_delta.max(pixel_delta);
-        }
-    }
-    Ok((changed, max_delta))
-}
-
-/// Whether two same-sized captures differ only by bounded raster rounding.
-///
-/// GPU antialias coverage may move a few least-significant channel values
-/// between otherwise identical captures. That is not visible motion and must
-/// not keep a stability wait alive forever. Size or colour changes beyond the
-/// small shared bound still fail.
-fn captured_pixels_hold(
-    before: &CapturedImage,
-    after: &CapturedImage,
-    channel_tolerance: u8,
-) -> std::result::Result<bool, String> {
-    use base64::Engine as _;
-
-    if before.width != after.width || before.height != after.height {
-        return Ok(false);
-    }
-    if before.rgba_base64 == after.rgba_base64 {
-        return Ok(true);
-    }
-    let decode = |encoded: &str| {
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|error| format!("captured frame is not valid base64: {error}"))
-    };
-    let before_rgba = decode(&before.rgba_base64)?;
-    let after_rgba = decode(&after.rgba_base64)?;
-    Ok(before_rgba.len() == after_rgba.len()
-        && before_rgba
-            .iter()
-            .zip(&after_rgba)
-            .all(|(left, right)| left.abs_diff(*right) <= channel_tolerance))
-}
-
-/// Require two captures of the same authored state to be pixel-identical.
-fn pixels_hold(before: &CapturedImage, after: &CapturedImage) -> std::result::Result<(), String> {
-    use base64::Engine as _;
-
-    if before.width != after.width || before.height != after.height {
-        return Err(format!(
-            "rendered frame changed size from {}x{} to {}x{}",
-            before.width, before.height, after.width, after.height
-        ));
-    }
-    if captured_pixels_hold(before, after, CAPTURE_CHANNEL_TOLERANCE)? {
-        return Ok(());
-    }
-
-    let decode = |encoded: &str| {
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|error| format!("captured frame is not valid base64: {error}"))
-    };
-    let before_rgba = decode(&before.rgba_base64)?;
-    let after_rgba = decode(&after.rgba_base64)?;
-    let changed = before_rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(after_rgba.as_chunks::<4>().0.iter())
-        .filter(|(before, after)| {
-            before
-                .iter()
-                .zip(after.iter())
-                .any(|(left, right)| left.abs_diff(*right) > CAPTURE_CHANNEL_TOLERANCE)
-        })
-        .count();
-    Err(format!(
-        "{changed} rendered pixel(s) changed after the pointer returned to the same state"
-    ))
-}
-
-/// Require the visible colour placement to survive the first invalidation.
-///
-/// A node-scoped capture has a transparent backdrop, so rerasterizing the
-/// exact same antialiased circle can legitimately change edge coverage in the
-/// alpha byte. The first-paint regression this guards moves coloured content;
-/// compare RGB and allow only subpixel rounding in those visible channels.
-fn rgb_pixels_hold(
-    before: &CapturedImage,
-    after: &CapturedImage,
-) -> std::result::Result<(), String> {
-    use base64::Engine as _;
-
-    if before.width != after.width || before.height != after.height {
-        return Err(format!(
-            "rendered frame changed size from {}x{} to {}x{}",
-            before.width, before.height, after.width, after.height
-        ));
-    }
-    let decode = |encoded: &str| {
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|error| format!("captured frame is not valid base64: {error}"))
-    };
-    let before_rgba = decode(&before.rgba_base64)?;
-    let after_rgba = decode(&after.rgba_base64)?;
-    const RGB_TOLERANCE: u8 = 8;
-    let changed = before_rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(after_rgba.as_chunks::<4>().0.iter())
-        .filter(|(before, after)| {
-            before[..3]
-                .iter()
-                .zip(after[..3].iter())
-                .any(|(left, right)| left.abs_diff(*right) > RGB_TOLERANCE)
-        })
-        .count();
-    if changed == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "{changed} visibly coloured pixel(s) changed after the first hover"
-        ))
-    }
-}
-
-/// Require visible feedback in either the region's pixels or its box.
-///
-/// A label change can legitimately resize an auto-width trigger, and a hover
-/// treatment can deliberately grow a petal. Both are stronger evidence of a
-/// visible response than a same-size pixel delta.
-fn pixels_change(before: &CapturedImage, after: &CapturedImage) -> std::result::Result<(), String> {
-    if before.width != after.width || before.height != after.height {
-        return Ok(());
-    }
-    if captured_pixels_hold(before, after, CAPTURE_CHANNEL_TOLERANCE)? {
-        Err("hover left every rendered pixel unchanged".to_owned())
-    } else {
-        Ok(())
     }
 }
 
@@ -1165,20 +1007,12 @@ async fn run_qa(
          * collapse/expand round trips: an `Expand …` action remains available
          * after the preceding check closed its section and is not pre-empted.
          */
-        if open_error.is_none()
-            && let Some(reveal) = check.reveal_before_capture.as_deref()
-        {
-            if let Err(error) = scroll_hover_target_into_view(client, reveal).await {
-                open_error = Some(error);
-            } else {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        }
-
         let setup_target = check
             .hover
             .as_ref()
             .map(qa::Hover::target)
+            .or(check.after_prepare_hover.as_ref().map(qa::Hover::target))
+            .or(check.reveal_before_capture.as_deref())
             .or(check.prepare.as_deref())
             .or(check.click.as_deref())
             .or(check.type_into.as_deref())
@@ -1212,9 +1046,26 @@ async fn run_qa(
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        let mut nodes_after_first_hover = None;
+        // A deferred surface cannot reveal a node it has not mounted yet.
+        // Materialize above, then move the pixel subject into its final
+        // viewport position before any baseline capture.
+        if open_error.is_none()
+            && let Some(reveal) = check.reveal_before_capture.as_deref()
+        {
+            let arrived = wait_for_arrival(client, None, reveal).await?;
+            if !arrived {
+                open_error = Some(format!(
+                    "could not reveal {reveal:?}: it did not paint within {}ms",
+                    check_timeout(900).as_millis()
+                ));
+            } else if let Err(error) = scroll_hover_target_into_view(client, reveal).await {
+                open_error = Some(error);
+            } else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
 
-        client.set_request_timeout(check_timeout(check.outcome_timeout_ms.max(900)));
+        let mut nodes_after_first_hover = None;
 
         // Hover first: the row actions do not exist until `pointerenter`.
         //
@@ -1430,7 +1281,13 @@ async fn run_qa(
                     let after = capture_stable_region(client, &check.subject)
                         .await
                         .map_err(|error| format!("after hover: {error}"))?;
-                    rgb_pixels_hold(&before, &after)
+                    let comparison = rgb_pixels_hold(&before, &after);
+                    if comparison.is_err()
+                        && let Err(error) = save_pixel_artifacts(&check.id, &before, &after)
+                    {
+                        eprintln!("could not save pixel artifacts for {}: {error}", check.id);
+                    }
+                    comparison
                 }
                 .await;
                 pixel_outcome = Some(measured);
@@ -1519,6 +1376,24 @@ async fn run_qa(
             open_error = Some(format!("could not reveal pixel subject: {error}"));
         }
 
+        // Resolve and reveal the ordinary click target before the baseline and
+        // before the outcome clock. Semantic lookup and ScrollIntoView are
+        // harness preparation, not time the application takes to respond to a
+        // click; counting them made latency proportional to tree size and to a
+        // fixed scroll-settle delay.
+        let mut prepared_click = None;
+        if open_error.is_none()
+            && !check.press
+            && let Some(want) = check.click.as_deref()
+        {
+            match locate_control(client, want, &[]).await {
+                Ok((node_id, _)) => prepared_click = Some(node_id),
+                Err(error) => {
+                    open_error = Some(format!("could not locate {want:?}: {error}"));
+                }
+            }
+        }
+
         // Hover can mount the action that the check will drive. Capture the
         // baseline afterward: inspecting before hover both omitted that real
         // pre-action state and paid for an immediately discarded snapshot.
@@ -1528,6 +1403,8 @@ async fn run_qa(
             pixel_outcome = Some(opaque_background(client, &check.subject).await);
         } else if open_error.is_none() && check.expect == qa::Expect::TransparentBackground {
             pixel_outcome = Some(transparent_background(client, &check.subject).await);
+        } else if open_error.is_none() && check.expect == qa::Expect::VisibleInk {
+            pixel_outcome = Some(visible_ink(client, &check.subject).await);
         } else if open_error.is_none() && check.expect == qa::Expect::Contrast {
             pixel_outcome = Some(
                 paint_audit::contrast(client, &check.subject, 4.5, 3.0)
@@ -1606,8 +1483,30 @@ async fn run_qa(
             && check.scroll_over.is_none())
         .then(Instant::now);
 
+        let live_paint_expect = matches!(
+            check.expect,
+            qa::Expect::PixelsHold
+                | qa::Expect::PixelsHoldAfterHover
+                | qa::Expect::PixelsChange
+                | qa::Expect::VisibleInk
+                | qa::Expect::OpaqueBackground
+                | qa::Expect::TransparentBackground
+                | qa::Expect::Contrast
+                | qa::Expect::FontSizeGrows
+        );
+        let drives_action = check.click.is_some()
+            || check.text.is_some()
+            || check.key.is_some()
+            || check.scroll_over.is_some();
+        let action_paint_armed = if drives_action && !live_paint_expect {
+            client.arm_paint_events().await.unwrap_or(false)
+        } else {
+            false
+        };
+
         // Then the action, if this check is about one. A click that cannot be
         // dispatched is itself a failure, not a skip.
+        client.set_request_timeout(check_timeout(check.outcome_timeout_ms.max(900)));
         let mut action_error = open_error;
         let mut action_target = None;
         let mut action_node_id = None;
@@ -1621,7 +1520,7 @@ async fn run_qa(
                 let (tree, _) = inspect(client).await?;
                 action_target = resolved_action_target(&tree.nodes, want);
             }
-            let driven = drive_check_action(client, want, check.press).await;
+            let driven = drive_check_action(client, want, check.press, prepared_click).await;
             action_error = driven.as_ref().err().cloned();
             action_node_id = driven.ok().flatten();
             // The exact declared outcome below polls the renderer. A generic
@@ -1677,6 +1576,12 @@ async fn run_qa(
                 }
             }
         }
+        if action_error.is_none() && action_paint_armed {
+            // A real committed frame is the cheapest happens-after boundary.
+            // Some valid actions change no pixels, so absence is a bounded
+            // compatibility fallback rather than a verdict by itself.
+            let _ = client.wait_for_paint(check_timeout(100)).await;
+        }
         let transport_timed_out = action_error
             .as_deref()
             .is_some_and(|error| error.contains("inspector did not answer within"));
@@ -1712,16 +1617,6 @@ async fn run_qa(
             );
         }
 
-        let live_paint_expect = matches!(
-            check.expect,
-            qa::Expect::PixelsHold
-                | qa::Expect::PixelsHoldAfterHover
-                | qa::Expect::PixelsChange
-                | qa::Expect::OpaqueBackground
-                | qa::Expect::TransparentBackground
-                | qa::Expect::Contrast
-                | qa::Expect::FontSizeGrows
-        );
         let fallback_after = || AgentSnapshot {
             nodes: before.nodes.clone(),
             ..AgentSnapshot::default()
@@ -1964,6 +1859,12 @@ impl OutcomeStability {
         self.since
             .is_some_and(|since| now.duration_since(since) >= required)
     }
+
+    fn remaining(&self, now: tokio::time::Instant, required: Duration) -> Duration {
+        self.since
+            .map(|since| required.saturating_sub(now.saturating_duration_since(since)))
+            .unwrap_or_default()
+    }
 }
 
 fn semantic_fingerprint(nodes: &[SemanticNode]) -> u64 {
@@ -1985,6 +1886,49 @@ fn semantic_fingerprint(nodes: &[SemanticNode]) -> u64 {
         node.slot.hash(&mut fingerprint);
     }
     fingerprint.finish()
+}
+
+struct OutcomePollScope {
+    root: u64,
+    baseline_ids: HashSet<u64>,
+}
+
+/// The active application surface is the largest honest outcome boundary.
+///
+/// Polling from the document root serialized every retained pane and permanent
+/// chrome node every 25ms. The surface helper already identifies the pane by
+/// ancestry for inventory; reuse that exact ownership boundary here.
+fn outcome_poll_scope(nodes: &[SemanticNode]) -> Option<OutcomePollScope> {
+    let surface = reach::surfaces()
+        .iter()
+        .find(|surface| reach::on_surface(nodes, surface))?;
+    let ids = reach::on_surface_subtree(nodes, surface);
+    let root = *ids.first()?;
+    // A markerless surface returns the whole document and buys nothing.
+    (ids.len() < nodes.len()).then(|| OutcomePollScope {
+        root,
+        baseline_ids: ids.into_iter().collect(),
+    })
+}
+
+/// Reconstruct a complete comparison snapshot from one freshly inspected pane.
+///
+/// Count/family verdicts must still see nodes outside the pane. They are
+/// unchanged during this action, so retain them from the baseline and replace
+/// only the scoped descendants with the live result.
+fn merge_outcome_snapshot(
+    before: &[SemanticNode],
+    mut scoped: AgentSnapshot,
+    baseline_ids: &HashSet<u64>,
+) -> AgentSnapshot {
+    let mut nodes: Vec<_> = before
+        .iter()
+        .filter(|node| !baseline_ids.contains(&node.id))
+        .cloned()
+        .collect();
+    nodes.append(&mut scoped.nodes);
+    scoped.nodes = nodes;
+    scoped
 }
 
 /// Wait for the declared result, not merely for a tree that already contains
@@ -2011,12 +1955,47 @@ async fn settle_for_outcome(
     let stable_for = Duration::from_millis(check.stable_for_ms);
     let mut stability = OutcomeStability::default();
     let mut iterations = 0;
+    let mut scope = outcome_poll_scope(before);
+    let mut probed_full_document = false;
+    let event_driven = client.arm_paint_events().await.unwrap_or(false);
     loop {
-        let (after, _) = inspect(client).await?;
+        let mut after = if let Some(scoped) = scope.as_ref() {
+            match inspect_subtree(client, scoped.root).await {
+                Ok((snapshot, _)) => merge_outcome_snapshot(before, snapshot, &scoped.baseline_ids),
+                // Reconciliation can replace the pane root. Reacquire from one
+                // full snapshot instead of treating a stale id as failure.
+                Err(_) => {
+                    let full = inspect(client).await?.0;
+                    scope = outcome_poll_scope(&full.nodes);
+                    full
+                }
+            }
+        } else {
+            inspect(client).await?.0
+        };
         iterations += 1;
         let now = tokio::time::Instant::now();
-        let passing =
+        let mut passing =
             outcome_verdict(check, before, &after.nodes, action_target, action_node_id).is_ok();
+        if !passing && scope.is_some() && !probed_full_document {
+            // Portalled dialogs and global toasts may live outside the active
+            // pane. Probe the full document once when the scoped verdict says
+            // the result is absent; subsequent stability samples remain
+            // scoped if the outcome belongs to the pane after all.
+            after = inspect(client).await?.0;
+            probed_full_document = true;
+            passing =
+                outcome_verdict(check, before, &after.nodes, action_target, action_node_id).is_ok();
+            scope = if passing {
+                // The outcome lives outside the active pane (typically a
+                // portal-owned dialog or toast). Keep polling the document for
+                // its stability window; returning to the pane would make that
+                // successful global outcome disappear on the next sample.
+                None
+            } else {
+                outcome_poll_scope(&after.nodes)
+            };
+        }
         if stability.observe(now, semantic_fingerprint(&after.nodes), passing, stable_for) {
             return Ok((after, None, iterations));
         }
@@ -2030,7 +2009,25 @@ async fn settle_for_outcome(
             });
             return Ok((after, error, iterations));
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        if event_driven {
+            // A rendered outcome cannot change without a committed frame.
+            // Wait on the runtime's event stream instead of serialising even
+            // a scoped tree every 25ms. When the verdict is already passing,
+            // wake at the end of its stability window even if no new frame is
+            // committed; an unchanged tree is exactly what that window asks
+            // us to prove. Older runtimes retain the bounded polling fallback.
+            let until_deadline = deadline.saturating_duration_since(now);
+            let wait = if passing {
+                stability.remaining(now, stable_for).min(until_deadline)
+            } else {
+                until_deadline
+            };
+            if !wait.is_zero() {
+                let _ = client.wait_for_paint(wait).await?;
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }
 
@@ -2459,6 +2456,7 @@ async fn drive_check_action(
     client: &mut Client,
     want: &str,
     coordinate_press: bool,
+    prepared_node_id: Option<u64>,
 ) -> std::result::Result<Option<u64>, String> {
     if coordinate_press {
         press_named(client, want)
@@ -2466,124 +2464,17 @@ async fn drive_check_action(
             .map(|()| None)
             .map_err(|error| format!("could not press {want:?}: {error}"))
     } else {
-        click_named_quiet(client, want)
+        let node_id = prepared_node_id
+            .ok_or_else(|| format!("could not click {want:?}: target was not prepared"))?;
+        if cli::trace() {
+            println!("        activating {want:?} (id {node_id})");
+        }
+        client
+            .agent(&AgentControlRequest::Act(AgentAction::Click { node_id }))
             .await
-            .map(Some)
+            .map(|_| Some(node_id))
             .map_err(|error| format!("could not click {want:?}: {error}"))
     }
-}
-
-/// What a captured frame contains, in the terms a person would use.
-///
-/// "Did it draw" is not answerable from a pixel count alone: an icon filled
-/// black on a near-black surface is fully opaque and completely invisible, and
-/// that exact failure shipped. What separates ink from background is contrast,
-/// so that is what this measures.
-struct Ink {
-    /// Pixels that differ enough from the most common colour to be seen.
-    visible: usize,
-    total: usize,
-    /// The colour occupying the most pixels, taken as the background.
-    background: (u8, u8, u8),
-}
-
-impl Ink {
-    fn fraction(&self) -> f64 {
-        if self.total == 0 {
-            0.0
-        } else {
-            self.visible as f64 / self.total as f64
-        }
-    }
-}
-
-/// Measure the visible ink in a captured frame.
-///
-/// The background is discovered rather than assumed, so this works against any
-/// app's surface colour without being told what it is. Contrast is relative
-/// luminance, because that is what decides whether a person can see the mark:
-/// raw channel distance calls black-on-near-black "different" while being the
-/// one case worth catching.
-fn measure_ink(image: &CapturedImage) -> Result<Ink> {
-    use base64::Engine as _;
-
-    let rgba = base64::engine::general_purpose::STANDARD
-        .decode(&image.rgba_base64)
-        .map_err(|error| eyre::eyre!("the capture was not valid base64: {error}"))?;
-    let expected = (image.width as usize) * (image.height as usize) * 4;
-    if rgba.len() != expected {
-        bail!(
-            "capture is {} bytes, expected {expected} for {}x{}",
-            rgba.len(),
-            image.width,
-            image.height
-        );
-    }
-
-    let mut histogram: HashMap<(u8, u8, u8), usize> = HashMap::new();
-    // `as_chunks::<4>()` rather than `chunks_exact(4)`: the width is a constant,
-    // so this hands back `[u8; 4]` and the indexing below is bounds-checked at
-    // compile time instead of per pixel.
-    for pixel in rgba.as_chunks::<4>().0 {
-        *histogram.entry((pixel[0], pixel[1], pixel[2])).or_default() += 1;
-    }
-    let background = histogram
-        .iter()
-        .max_by_key(|(_, count)| **count)
-        .map(|(colour, _)| *colour)
-        .unwrap_or((0, 0, 0));
-
-    let luminance = |(r, g, b): (u8, u8, u8)| {
-        0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b)
-    };
-    let background_luminance = luminance(background);
-
-    let visible = rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .filter(|pixel| {
-            // Transparent pixels are not ink whatever their colour.
-            if pixel[3] < 32 {
-                return false;
-            }
-            (luminance((pixel[0], pixel[1], pixel[2])) - background_luminance).abs() > 24.0
-        })
-        .count();
-
-    Ok(Ink {
-        visible,
-        total: (image.width as usize) * (image.height as usize),
-        background,
-    })
-}
-
-/// Ask the app for a frame: the whole window, or one named node.
-fn write_capture_ppm(image: &CapturedImage, output: &std::path::Path) -> Result<()> {
-    use base64::Engine as _;
-    use std::io::Write as _;
-
-    let rgba = base64::engine::general_purpose::STANDARD
-        .decode(&image.rgba_base64)
-        .map_err(|error| eyre!("the capture was not valid base64: {error}"))?;
-    let expected = image.width as usize * image.height as usize * 4;
-    if rgba.len() != expected {
-        bail!(
-            "capture is {} bytes, expected {expected} for {}x{}",
-            rgba.len(),
-            image.width,
-            image.height
-        );
-    }
-
-    let mut file = std::fs::File::create(output)
-        .wrap_err_with(|| format!("could not create {}", output.display()))?;
-    write!(file, "P6\n{} {}\n255\n", image.width, image.height)?;
-    for pixel in rgba.as_chunks::<4>().0 {
-        file.write_all(&pixel[..3])?;
-    }
-    println!("saved {}", output.display());
-    Ok(())
 }
 
 async fn capture(
@@ -3016,7 +2907,8 @@ async fn reveal_deferred_content(
 }
 
 /// Ask an application-declared search field to mount the control this check
-/// needs and keep that filtered result alive for the action which follows.
+/// needs, then return the surface to its neutral unfiltered state when the
+/// mounted control survives there.
 async fn materialize_deferred_content(
     client: &mut Client,
     surface: &reach::Surface,
@@ -3027,7 +2919,26 @@ async fn materialize_deferred_content(
     };
     let query = want.split_once(':').map_or(want, |(_, name)| name);
     type_text(client, field, query).await?;
-    let _ = wait_for_arrival(client, None, want).await?;
+    if wait_for_arrival(client, None, want).await? {
+        // The reveal field is a discovery mechanism, not part of the check's
+        // authored state. Leaving it filled hides outcomes whose accessible
+        // name changes (and poisons every later check on the surface). Lazy
+        // settings catalogues normally retain a section once mounted, so clear
+        // the filter and keep the neutral state when the target still paints.
+        // A virtualized catalogue that truly requires its query gets it put
+        // back rather than losing the control before the action.
+        type_text(client, field, "").await?;
+        if !wait_for_arrival(client, None, want).await? {
+            type_text(client, field, query).await?;
+            let _ = wait_for_arrival(client, None, want).await?;
+        }
+    } else {
+        // Absence is itself a valid authored outcome (for example, a setup
+        // action that must disappear after its work is complete). Discovery
+        // still owns the temporary query: a failed lookup must not leave the
+        // whole surface filtered and make the next independent check fail.
+        type_text(client, field, "").await?;
+    }
     Ok(1)
 }
 
@@ -3557,6 +3468,7 @@ async fn run_inventory(
     client: &mut Client,
     only: Option<&str>,
     require_outcomes: bool,
+    checks_path: Option<&std::path::Path>,
 ) -> Result<usize> {
     #[derive(serde::Serialize)]
     struct SurfaceRow {
@@ -3630,8 +3542,9 @@ async fn run_inventory(
         controls: Vec<ControlRow>,
     }
 
-    let checks = if std::path::Path::new("tests/ps-qa").is_dir() {
-        qa::checks(None).map_err(eyre::Report::msg)?
+    let default_checks_exist = std::path::Path::new("tests/ps-qa").is_dir();
+    let checks = if checks_path.is_some() || default_checks_exist {
+        qa::checks(checks_path).map_err(eyre::Report::msg)?
     } else {
         Vec::new()
     };
@@ -4729,10 +4642,12 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Before attaching to anything: a run that drives an application against a
-    // profile it does not have is worse than one that refuses to start, and
-    // failing here names the missing file rather than reporting nothing found.
-    app::AppProfile::load(cli.app.as_deref()).map_err(|error| eyre!(error))?;
+    // Before attaching to anything: a run that broadly drives an application
+    // against a profile it does not have is worse than one that refuses to
+    // start. Renderer diagnostics remain product-neutral and need no profile.
+    if cli.command.requires_app_profile() {
+        app::AppProfile::load(cli.app.as_deref()).map_err(|error| eyre!(error))?;
+    }
 
     let descriptor = inspector::discover(cli.descriptor.as_deref().and_then(|p| p.to_str()))?;
     descriptor.warn_if_stale();
@@ -5171,8 +5086,15 @@ pub async fn run() -> Result<()> {
         cli::Command::Inventory {
             surface,
             require_outcomes,
+            checks,
         } => {
-            let failures = run_inventory(&mut client, surface.as_deref(), require_outcomes).await?;
+            let failures = run_inventory(
+                &mut client,
+                surface.as_deref(),
+                require_outcomes,
+                checks.as_deref(),
+            )
+            .await?;
             if failures > 0 {
                 std::process::exit(1);
             }
@@ -5296,11 +5218,12 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::{
         InventoryClass, OutcomeStability, arrival_sample_matches, arrived_without_navigation,
-        duplicate_dom_ids, generated_dom_id, inventory_class, is_pagination_control, name_matches,
-        named_document_is_active, named_document_is_active_with_permanent,
-        named_document_opener_for, outcome_check_ids, outcome_verdict, pagination_advanced,
-        painted_bounds, painted_named, pixels_change, pixels_hold, resolved_action_target,
-        rgb_pixels_hold, saved_control_node, saved_controls, selector_matches_node, stable_arrival,
+        capture_node_id, duplicate_dom_ids, generated_dom_id, inventory_class,
+        is_pagination_control, measure_ink, name_matches, named_document_is_active,
+        named_document_is_active_with_permanent, named_document_opener_for, outcome_check_ids,
+        outcome_verdict, pagination_advanced, painted_bounds, painted_named, pixels_change,
+        pixels_hold, resolved_action_target, rgb_pixels_hold, saved_control_node, saved_controls,
+        selector_matches_node, stable_arrival,
     };
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
@@ -5333,6 +5256,24 @@ mod tests {
         assert!(!stability.observe(start + Duration::from_millis(75), 3, false, required));
         assert!(!stability.observe(start + Duration::from_millis(100), 3, true, required));
         assert!(stability.observe(start + Duration::from_millis(200), 3, true, required));
+    }
+
+    #[test]
+    fn outcome_stability_waits_only_for_the_unproven_part_of_its_window() {
+        let start = tokio::time::Instant::now();
+        let required = Duration::from_millis(100);
+        let mut stability = OutcomeStability::default();
+
+        assert!(!stability.observe(start, 3, true, required));
+        assert_eq!(stability.remaining(start, required), required);
+        assert_eq!(
+            stability.remaining(start + Duration::from_millis(75), required),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            stability.remaining(start + Duration::from_millis(150), required),
+            Duration::ZERO
+        );
     }
 
     fn component(name: &str, enabled: bool, visible: bool) -> SemanticNode {
@@ -5419,6 +5360,18 @@ mod tests {
         };
         assert!(pixels_change(&before, &resized).is_ok());
 
+        let transparent = capture(&[0, 0, 0, 0]);
+        let resized_transparent = CapturedImage {
+            width: 2,
+            height: 1,
+            rgba_base64: base64::engine::general_purpose::STANDARD.encode([0, 0, 0, 0, 0, 0, 0, 0]),
+            node_id: Some(7),
+        };
+        assert_eq!(
+            pixels_change(&transparent, &resized_transparent).unwrap_err(),
+            "hover left every rendered pixel unchanged"
+        );
+
         let alpha_only = capture(&[20, 20, 20, 80]);
         assert!(rgb_pixels_hold(&before, &alpha_only).is_ok());
         let visible_colour = capture(&[29, 20, 20, 255]);
@@ -5426,6 +5379,39 @@ mod tests {
             rgb_pixels_hold(&before, &visible_colour).unwrap_err(),
             "1 visibly coloured pixel(s) changed after the first hover"
         );
+    }
+
+    #[test]
+    fn raster_ink_rejects_an_empty_box_and_accepts_a_visible_mark() {
+        use base64::Engine as _;
+
+        let capture = |rgba: &[u8]| CapturedImage {
+            width: 2,
+            height: 2,
+            rgba_base64: base64::engine::general_purpose::STANDARD.encode(rgba),
+            node_id: Some(7),
+        };
+        let background = [20, 20, 20, 255];
+        let empty = capture(&background.repeat(4));
+        assert_eq!(measure_ink(&empty).unwrap().visible, 0);
+
+        let mut marked = background.repeat(4);
+        marked[0..4].copy_from_slice(&[240, 240, 240, 255]);
+        assert_eq!(measure_ink(&capture(&marked)).unwrap().visible, 1);
+
+        let transparent = capture(&[255, 255, 255, 0].repeat(4));
+        assert_eq!(measure_ink(&transparent).unwrap().visible, 0);
+    }
+
+    #[test]
+    fn capture_accepts_only_explicitly_requested_decorative_art() {
+        let mut icon = component("", true, false);
+        icon.id = 17;
+        icon.role = "presentation".into();
+        icon.bounds = Some([10.0, 10.0, 16.0, 16.0]);
+
+        assert!(capture_node_id(&[icon.clone()], "*").is_err());
+        assert_eq!(capture_node_id(&[icon], "presentation:*").unwrap(), 17);
     }
 
     #[test]

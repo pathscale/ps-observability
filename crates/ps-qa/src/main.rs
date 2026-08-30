@@ -2,6 +2,7 @@
 
 mod app;
 mod audit;
+mod capture_analysis;
 mod cli;
 mod computed_style;
 mod diagnostics;

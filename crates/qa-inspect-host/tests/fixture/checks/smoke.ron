@@ -1,0 +1,18 @@
+[
+    (
+        id: "fixture-text-entry",
+        group: "fixture",
+        what: "the headless host accepts text input and reports its rendered value",
+        open: None,
+        prepare: None,
+        hover: None,
+        click: None,
+        type_into: Some("Fixture value"),
+        text: Some("after"),
+        key: None,
+        key_on: None,
+        compare: None,
+        subject: "textbox:Fixture value",
+        expect: ValueChanges,
+    ),
+]

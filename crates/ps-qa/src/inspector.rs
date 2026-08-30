@@ -158,9 +158,22 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(socket: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(socket)
-            .await
-            .with_context(|| format!("connecting to {}", socket.display()))?;
+        const CONNECT_DEADLINE: Duration = Duration::from_millis(500);
+        const RETRY_DELAY: Duration = Duration::from_millis(20);
+
+        let started = Instant::now();
+        let stream = loop {
+            match UnixStream::connect(socket).await {
+                Ok(stream) => break stream,
+                Err(_) if started.elapsed() < CONNECT_DEADLINE => {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("connecting to {}", socket.display()));
+                }
+            }
+        };
         Ok(Self {
             stream: Box::new(TransportStream::new(framed_json(stream))),
             next_id: 0,
@@ -176,6 +189,10 @@ impl Client {
     /// minute-long transport wait across a suite.
     pub fn set_request_timeout(&mut self, request_timeout: Duration) {
         self.request_timeout = request_timeout;
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
     }
 
     fn next_id(&mut self) -> JsonRpcId {

@@ -52,6 +52,29 @@ jobs:
         run: cargo clippy -p qa-inspect-host --all-targets -- -D warnings
       - name: Test real host transport
         run: cargo test -p qa-inspect-host --release
+      - name: Test documented renderer-backed QA fixture
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          cargo build -p qa-inspect-host -p ps-qa --release
+          descriptor_file="$RUNNER_TEMP/qa-inspect-descriptor"
+          QA_INSPECT_PAGE="$PWD/crates/qa-inspect-host/tests/fixture/page.html" \
+            target/release/qa-inspect-host > "$descriptor_file" &
+          host_pid=$!
+          trap 'kill "$host_pid" 2>/dev/null || true' EXIT
+
+          for attempt in {1..100}; do
+            [[ -s "$descriptor_file" ]] && break
+            sleep 0.1
+          done
+          descriptor="$(head -1 "$descriptor_file")"
+          [[ -n "$descriptor" ]]
+
+          target/release/ps-qa \
+            --descriptor "$descriptor" \
+            --app crates/qa-inspect-host/tests/fixture/ps-qa.ron \
+            qa fixture-text-entry \
+            --checks crates/qa-inspect-host/tests/fixture/checks
 
   package:
     name: Package boundaries
@@ -70,7 +93,5 @@ jobs:
 
           cargo package -p blitz-control-protocol
           cargo package -p ps-blitz-debug-control
-          cargo package -p qa-inspect-host \
-            --config 'patch.crates-io.blitz-control-protocol.path="crates/blitz-control-protocol"'
-          cargo package -p ps-qa \
-            --config 'patch.crates-io.blitz-control-protocol.path="crates/blitz-control-protocol"'
+          cargo package -p qa-inspect-host
+          cargo package -p ps-qa

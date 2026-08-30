@@ -2,7 +2,7 @@
 
 Host a Blitz document over the inspection socket, with no window.
 
-```sh
+```zsh
 QA_INSPECT_PAGE=/path/to/one/built/page qa-inspect-host
 ```
 
@@ -31,10 +31,13 @@ socket between them.
 
 ## What it answers
 
-`Inspect`, `Click`, `DoubleClick` and `Key`. Anything else returns `unsupported`
-rather than a plausible `Ack`, because a check that silently did nothing reports
-a working component as broken.
+`Inspect`, `Focus`, `Hover`, `Click`, `DoubleClick`, `SetValue` and `Key`.
+`ScrollIntoView` is an acknowledged no-op because a single component page is
+already in view. Anything else returns `unsupported` rather than a plausible
+`Ack`, because a check that silently did nothing reports a working component as
+broken.
 
-Pointer and wheel events are not implemented: those carry pointer position and
-button state on the runtime itself, which a windowless host has nothing to
-attach to.
+Coordinate pointer and wheel streams are not implemented: those carry window
+position and button state on the runtime itself, which a windowless host has
+nothing to attach to. Semantic hover targets an exact inspected node and is
+fully supported.
