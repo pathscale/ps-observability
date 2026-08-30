@@ -95,7 +95,7 @@ fn serves_a_page_over_the_inspection_socket() {
         Command::new(binary)
             .env("QA_INSPECT_PAGE", page)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("the host binary should start"),
     );
@@ -170,6 +170,45 @@ fn serves_a_page_over_the_inspection_socket() {
             .find(|node| node.role.eq_ignore_ascii_case("button"))
             .unwrap_or_else(|| panic!("fixture button missing from {:?}", snapshot.nodes))
             .id;
+        let input = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.role.eq_ignore_ascii_case("textbox"))
+            .unwrap_or_else(|| panic!("fixture input missing from {:?}", snapshot.nodes))
+            .id;
+
+        assert!(matches!(
+            request(
+                &mut stream,
+                &mut next_id,
+                &AgentControlRequest::Act(AgentAction::SetValue {
+                    node_id: input,
+                    value: "after".into(),
+                }),
+            )
+            .await,
+            DebugResponse::Ack
+        ));
+        let changed = request(
+            &mut stream,
+            &mut next_id,
+            &AgentControlRequest::Inspect {
+                root: Some(input),
+                max_depth: 1,
+            },
+        )
+        .await;
+        let DebugResponse::AgentSnapshot(changed) = changed else {
+            panic!("inspect should return the changed input");
+        };
+        assert!(
+            changed
+                .nodes
+                .iter()
+                .any(|node| node.id == input && node.value.as_deref() == Some("after")),
+            "SetValue must be observable before its Ack: {:?}",
+            changed.nodes
+        );
 
         observe_paint(&mut stream, &mut next_id).await;
         assert!(matches!(

@@ -34,21 +34,45 @@ instrumentation hooks but do not own a control server.
 
 ## Quick start
 
+From this workspace, install the driver and build the real headless renderer
+host:
+
 ```zsh
 cargo install ps-qa
-cargo run -p qa-inspect-host
-ps-qa sweep --help
+cargo build -p qa-inspect-host
 ```
 
-The host prints its descriptor path when ready. `ps-qa` discovers that live
-descriptor automatically, or accepts an explicit descriptor path.
+Start the supplied renderer fixture in one terminal:
+
+```zsh
+QA_INSPECT_PAGE="$PWD/crates/qa-inspect-host/tests/fixture/page.html" \
+  target/debug/qa-inspect-host
+```
+
+The host prints its descriptor path when ready. In a second terminal, run the
+fixture's outcome check; `ps-qa` discovers the live descriptor automatically:
+
+```zsh
+ps-qa \
+  --app crates/qa-inspect-host/tests/fixture/ps-qa.ron \
+  qa fixture-text-entry \
+  --checks crates/qa-inspect-host/tests/fixture/checks
+```
+
+This is a renderer-backed check: it enters text through the control protocol
+and verifies that the live semantic value changed. It does not use jsdom or a
+mock tree. Pass `--descriptor <path>` when more than one inspectable process is
+running.
+
+See [docs/performance.md](docs/performance.md) for the measurement contract,
+latency fields, and the difference between harness pacing and app throughput.
 
 ## Security
 
 Observability endpoints are debugger interfaces, not application sandboxes.
 They must bind only to local transports. The WebDriver adapter uses loopback,
 an unpredictable per-process token, and owner-only discovery files on Unix.
-The framed inspection socket has the same same-user trust boundary: any
+The framed inspection socket has the same-user trust boundary: any
 process able to access the socket can inspect the UI and request supported
 actions. Arbitrary script execution, where enabled, has the same posture as a
 browser remote-debugging port and must remain disabled in production builds.

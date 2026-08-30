@@ -81,15 +81,15 @@ pub(crate) async fn scroll(client: &mut Client, ticks: usize, delta: f64) -> Res
     // failing to keep up on a 120Hz display, and the `missed_refreshes` figure
     // beside it appears to confirm it. Both are describing this loop.
     //
-    // `BENCH_PACE=0` sends as fast as the app accepts, which is what measures
+    // `--pace 0` sends as fast as the app accepts, which is what measures
     // the application: it reaches 120fps with no missed refreshes.
     let pace = pace();
     if pace.is_zero() {
-        println!("pace: unpaced (BENCH_PACE=0) - measures app throughput");
+        println!("pace: unpaced (--pace 0) - measures app throughput");
     } else {
         println!(
             "pace: {:.2}ms between events ({:.0} Hz requested); fps and missed_refreshes \
-             below describe this pace, not the app's limit. BENCH_PACE=0 to remove it",
+             below describe this pace, not the app's limit. Pass --pace 0 to remove it",
             pace.as_secs_f64() * 1000.0,
             1.0 / pace.as_secs_f64(),
         );

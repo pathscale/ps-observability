@@ -240,6 +240,12 @@ pub enum Expect {
     /// the pointer event was dispatched does not prove the person received
     /// any feedback from it.
     PixelsChange,
+    /// The captured region contains pixels visibly distinct from its backdrop.
+    ///
+    /// Geometry and resolved stroke properties both stay valid when an SVG
+    /// references a missing sprite symbol. Raster ink is the observable that
+    /// distinguishes a real icon from an empty box.
+    VisibleInk,
     /// The subject's resolved background colour is fully opaque.
     ///
     /// A translucent child over an animated gradient cannot have a flat fill,
@@ -754,20 +760,8 @@ pub fn verdict(
             }
         }
         Expect::PaintsNamed => {
-            let (role, name) = check
-                .subject
-                .split_once(':')
-                .unwrap_or(("", &check.subject));
-            let hit = after
-                .iter()
-                .filter(|node| node.role == role && node.name.contains(name))
-                .find(|node| node.bounds.is_some_and(|b| b[2] > 0.0 && b[3] > 0.0));
-            if hit.is_none() {
-                let matches: Vec<_> = after
-                    .iter()
-                    .filter(|node| node.role == role && node.name.contains(name))
-                    .collect();
-                let state = matches
+            if !found.iter().any(|node| paints(node)) {
+                let state = found
                     .iter()
                     .map(|node| {
                         format!(
@@ -777,26 +771,33 @@ pub fn verdict(
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
-                let other_painted = after
-                    .iter()
-                    .filter(|node| {
-                        node.role != role
-                            && node.name.contains(name)
-                            && node.bounds.is_some_and(|b| b[2] > 0.0 && b[3] > 0.0)
+                let other_painted = check
+                    .subject
+                    .split_once(':')
+                    .map(|(role, name)| {
+                        after
+                            .iter()
+                            .filter(|node| {
+                                !node.role.eq_ignore_ascii_case(role)
+                                    && crate::target::name_matches(&node.name, name)
+                                    && paints(node)
+                            })
+                            .take(3)
+                            .map(|node| format!("{} id={}", node.role, node.id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     })
-                    .take(3)
-                    .map(|node| format!("{} id={}", node.role, node.id))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                    .unwrap_or_default();
                 let other_painted = if other_painted.is_empty() {
                     "none".to_owned()
                 } else {
                     other_painted
                 };
                 return Err(format!(
-                    "no {role} named {name:?} has a box ({} in the tree: {state}); \
+                    "no painted node matching {:?} has a box ({} in the tree: {state}); \
                      other painted matches: {other_painted}",
-                    matches.len(),
+                    check.subject,
+                    found.len(),
                 ));
             }
         }
@@ -990,6 +991,7 @@ pub fn verdict(
         Expect::PixelsHold
         | Expect::PixelsHoldAfterHover
         | Expect::PixelsChange
+        | Expect::VisibleInk
         | Expect::OpaqueBackground
         | Expect::TransparentBackground
         | Expect::Contrast
@@ -1656,6 +1658,37 @@ mod tests {
         )
         .expect_err("the textbox does not paint");
         assert!(error.contains("other painted matches: button id=8"));
+    }
+
+    #[test]
+    fn paints_named_uses_the_shared_selector_language() {
+        let node = SemanticNode {
+            dom_id: Some("project-rename".into()),
+            id: 7,
+            parent: None,
+            role: "textbox".into(),
+            name: "Rename project".into(),
+            value: None,
+            enabled: true,
+            visible: true,
+            selected: false,
+            bounds: Some([10.0, 10.0, 100.0, 20.0]),
+            slot: Some("inline-edit".into()),
+        };
+        let mut check = parse("");
+        check.expect = Expect::PaintsNamed;
+
+        for selector in [
+            "TEXTBOX:*PROJECT",
+            "rename proj*",
+            "#project-rename",
+            "@inline-edit",
+        ] {
+            check.subject = selector.into();
+            verdict(&check, &[], std::slice::from_ref(&node)).unwrap_or_else(|error| {
+                panic!("{selector:?} did not use shared semantics: {error}")
+            });
+        }
     }
 
     #[test]

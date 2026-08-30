@@ -211,17 +211,26 @@ pub fn show_nodes(nodes: &[SemanticNode], inspect_ms: f64) {
 
 /// Ack latency for a burst of driven events.
 pub fn show_latencies(what: &str, count: usize, latencies: &mut [f64]) {
+    if latencies.is_empty() {
+        println!("drove {count} {what}: no acknowledgements recorded");
+        return;
+    }
     latencies.sort_by(|a, b| a.partial_cmp(b).expect("latencies are finite"));
     let mean = latencies.iter().sum::<f64>() / latencies.len() as f64;
-    // Index as the Python did, including its off-by-one, so the reported p95
-    // means the same thing across the port.
-    let p95_index = ((latencies.len() as f64 * 0.95) as usize).saturating_sub(1);
+    let p95 = p95(latencies).expect("non-empty latency slice");
     println!(
         "drove {count} {what}: ack mean={:.2}ms p95={:.2}ms max={:.2}ms",
         mean,
-        latencies[p95_index],
+        p95,
         latencies.last().copied().unwrap_or_default()
     );
+}
+
+fn p95(sorted: &[f64]) -> Option<f64> {
+    let index = ((sorted.len() as f64 * 0.95).ceil() as usize)
+        .checked_sub(1)?
+        .min(sorted.len() - 1);
+    sorted.get(index).copied()
 }
 
 fn breakdown_of(metrics: &RendererMetrics) -> HashMap<&str, &ScriptSource> {
@@ -304,5 +313,17 @@ pub fn show_delta(before: &RendererMetrics, after: &RendererMetrics, events: usi
             total,
             worst
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::p95;
+
+    #[test]
+    fn p95_is_empty_safe_and_uses_the_nearest_rank() {
+        assert_eq!(p95(&[]), None);
+        let samples: Vec<_> = (1..=21).map(f64::from).collect();
+        assert_eq!(p95(&samples), Some(20.0));
     }
 }

@@ -1,0 +1,3 @@
+// The fixture has no application-specific surfaces. A real profile is still
+// required so the harness never invents product navigation rules.
+AppProfile()

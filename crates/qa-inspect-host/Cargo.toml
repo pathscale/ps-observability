@@ -1,7 +1,7 @@
 [package]
 name = "qa-inspect-host"
 description = "Host a Blitz document and serve it over the inspection socket"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pathscale/ps-observability"
