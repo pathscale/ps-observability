@@ -32,7 +32,7 @@ use crate::capture_analysis::{
     save_artifacts as save_pixel_artifacts, write_ppm as write_capture_ppm,
 };
 use crate::computed_style::{
-    font_size, opaque_background, transparent_background, wait_for_larger_font,
+    font_size, full_opacity, opaque_background, transparent_background, wait_for_larger_font,
 };
 use crate::diagnostics::{dom, metrics, nodes, panes, spill, transcript};
 use crate::inspector::{Client, inspect, inspect_subtree};
@@ -1532,6 +1532,8 @@ async fn run_qa(
             pixel_outcome = Some(opaque_background(client, &check.subject).await);
         } else if open_error.is_none() && check.expect == qa::Expect::TransparentBackground {
             pixel_outcome = Some(transparent_background(client, &check.subject).await);
+        } else if open_error.is_none() && check.expect == qa::Expect::FullOpacity {
+            pixel_outcome = Some(full_opacity(client, &check.subject).await);
         } else if open_error.is_none() && check.expect == qa::Expect::TransparentWindowTint {
             pixel_outcome = Some(transparent_window_tint(client).await);
         } else if open_error.is_none() && check.expect == qa::Expect::VisibleInk {
@@ -1625,6 +1627,7 @@ async fn run_qa(
                 | qa::Expect::InteriorInk
                 | qa::Expect::OpaqueBackground
                 | qa::Expect::TransparentBackground
+                | qa::Expect::FullOpacity
                 | qa::Expect::TransparentWindowTint
                 | qa::Expect::Contrast
                 | qa::Expect::FontSizeGrows

@@ -264,6 +264,12 @@ pub enum Expect {
     /// This is stricter than merely being translucent: an opacity slider at its
     /// floor must admit the native backdrop completely, not leave a pale film.
     TransparentBackground,
+    /// The subject paints at opacity 1 rather than fading all of its content.
+    ///
+    /// Use this when a disabled control may mute its background but must keep
+    /// an icon or label crisp. Applying opacity to the whole control also
+    /// fades the content and is the regression this distinguishes.
+    FullOpacity,
     /// The platform window is transparent and its installed glass tint has
     /// zero alpha.
     ///
@@ -1017,6 +1023,7 @@ pub fn verdict(
         | Expect::InteriorInk
         | Expect::OpaqueBackground
         | Expect::TransparentBackground
+        | Expect::FullOpacity
         | Expect::TransparentWindowTint
         | Expect::Contrast
         | Expect::FontSizeGrows => {
