@@ -37,7 +37,10 @@ use blitz_script::{DefaultScriptFetcher, FetchError, ScriptDocument, ScriptFetch
 use brotli::Decompressor;
 use std::fs;
 use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use url::Url;
+
+const MAX_DECOMPRESSED_ASSET_BYTES: u64 = 32 * 1024 * 1024;
 
 fn trace(message: &str) {
     eprintln!("qa-inspect-host: {message}");
@@ -60,11 +63,50 @@ impl ScriptFetcher for DistScriptFetcher {
 
 fn decompress_utf8(compressed: &[u8], label: &str) -> Result<String, String> {
     let mut decoder = Decompressor::new(compressed, 4096);
-    let mut decoded = String::new();
+    let mut decoded = Vec::new();
     decoder
-        .read_to_string(&mut decoded)
+        .by_ref()
+        .take(MAX_DECOMPRESSED_ASSET_BYTES + 1)
+        .read_to_end(&mut decoded)
         .map_err(|error| format!("could not decompress embedded {label}: {error}"))?;
-    Ok(decoded)
+    if decoded.len() as u64 > MAX_DECOMPRESSED_ASSET_BYTES {
+        return Err(format!(
+            "decompressed {label} exceeds the {} MiB safety limit",
+            MAX_DECOMPRESSED_ASSET_BYTES / (1024 * 1024)
+        ));
+    }
+    String::from_utf8(decoded)
+        .map_err(|error| format!("decompressed {label} is not UTF-8: {error}"))
+}
+
+fn asset_path(root: &Path, reference: &str) -> Result<PathBuf, String> {
+    let reference = reference.split('?').next().unwrap_or(reference);
+    let relative = Path::new(reference.trim_start_matches('/'));
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(format!(
+            "asset path escapes the page directory: {reference:?}"
+        ));
+    }
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|error| format!("could not resolve asset root {}: {error}", root.display()))?;
+    let candidate = fs::canonicalize(canonical_root.join(relative)).map_err(|error| {
+        format!(
+            "could not resolve asset {} below {}: {error}",
+            relative.display(),
+            canonical_root.display()
+        )
+    })?;
+    if !candidate.starts_with(&canonical_root) {
+        return Err(format!(
+            "asset path escapes the page directory: {reference:?}"
+        ));
+    }
+    Ok(candidate)
 }
 
 fn create_dist_document(dist: &std::path::Path, url: &str) -> Result<ScriptDocument, String> {
@@ -92,8 +134,7 @@ fn create_dist_document(dist: &std::path::Path, url: &str) -> Result<ScriptDocum
      * asset.
      */
     fn read_brotli_asset(dist: &std::path::Path, url: &str, label: &str) -> Result<String, String> {
-        let relative = url.split('?').next().unwrap_or(url).trim_start_matches('/');
-        let path = dist.join(relative);
+        let path = asset_path(dist, url)?;
         let bytes = fs::read(&path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
         match decompress_utf8(&bytes, label) {
@@ -183,24 +224,33 @@ pub fn serve() -> Result<(), String> {
         focus_agent_node, hover_agent_node, inspect_document, press_agent_key, snapshot_document,
     };
 
-    fn dimension(variable: &str, default: u32) -> u32 {
-        std::env::var(variable)
+    fn dimension(variable: &str, default: u32) -> Result<u32, String> {
+        let Some(value) = std::env::var_os(variable) else {
+            return Ok(default);
+        };
+        let text = value
+            .into_string()
+            .map_err(|_| format!("{variable} is not valid UTF-8"))?;
+        text.parse::<u32>()
             .ok()
-            .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(default)
+            .ok_or_else(|| format!("{variable} must be a positive integer, got {text:?}"))
     }
 
     // Drain synchronous script and reactive work without imposing a timer on
     // every control. Delayed outcomes are polled by ps-qa against the exact
     // declared verdict, so sleeping here only makes fast controls slow and
     // duplicates the caller's timeout.
+    struct SettleFailure {
+        error: DebugError,
+        painted: bool,
+    }
+
     fn settle_immediate(
         document: &mut ScriptDocument,
         clock: &std::time::Instant,
-    ) -> Result<bool, DebugError> {
-        const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(100);
-
+        deadline: std::time::Duration,
+    ) -> Result<bool, SettleFailure> {
         let before = document.inner().paint_damage().generation;
         let started = std::time::Instant::now();
         let mut iterations = 0_u32;
@@ -209,17 +259,40 @@ pub fn serve() -> Result<(), String> {
                 break;
             }
             iterations = iterations.saturating_add(1);
-            if started.elapsed() >= SETTLE_DEADLINE {
-                return Err(DebugError {
-                    code: "documentNotQuiescent".into(),
-                    message: format!(
-                        "the document still had immediate work after {iterations} settle iterations"
-                    ),
+            if started.elapsed() >= deadline {
+                document.inner_mut().resolve(clock.elapsed().as_secs_f64());
+                return Err(SettleFailure {
+                    painted: document.inner().paint_damage().generation != before,
+                    error: DebugError {
+                        code: "documentNotQuiescent".into(),
+                        message: format!(
+                            "the document still had immediate work after {iterations} settle iterations and {}ms",
+                            deadline.as_millis()
+                        ),
+                    },
                 });
             }
         }
         document.inner_mut().resolve(clock.elapsed().as_secs_f64());
         Ok(document.inner().paint_damage().generation != before)
+    }
+
+    fn settle_response(
+        document: &mut ScriptDocument,
+        clock: &std::time::Instant,
+        deadline: std::time::Duration,
+        painted: &mut bool,
+    ) -> DebugResponse {
+        match settle_immediate(document, clock, deadline) {
+            Ok(did_paint) => {
+                *painted = did_paint;
+                DebugResponse::Ack
+            }
+            Err(failure) => {
+                *painted = failure.painted;
+                DebugResponse::Error(failure.error)
+            }
+        }
     }
 
     fn commit_render(events: &tokio::sync::watch::Sender<Option<DebugEvent>>, revision: &mut u64) {
@@ -229,8 +302,10 @@ pub fn serve() -> Result<(), String> {
         }));
     }
 
-    let width = dimension("QA_HOST_WIDTH", 1344);
-    let height = dimension("QA_HOST_HEIGHT", 900);
+    let width = dimension("QA_HOST_WIDTH", 1344)?;
+    let height = dimension("QA_HOST_HEIGHT", 900)?;
+    let settle_deadline =
+        std::time::Duration::from_millis(u64::from(dimension("QA_HOST_SETTLE_MS", 100)?));
 
     trace("inspection host started");
     let dist = std::env::var_os("QA_INSPECT_PAGE")
@@ -245,8 +320,12 @@ pub fn serve() -> Result<(), String> {
     // Script execution is synchronous; drain the reactive work it queued
     // before announcing the socket instead of sleeping for a fixed 800 ms.
     let animation_clock = std::time::Instant::now();
-    settle_immediate(&mut document, &animation_clock)
-        .map_err(|error| format!("initial document did not settle: {}", error.message))?;
+    if let Err(failure) = settle_immediate(&mut document, &animation_clock, settle_deadline) {
+        trace(&format!(
+            "initial document reached the settle deadline: {}",
+            failure.error.message
+        ));
+    }
     trace("document ready");
 
     /*
@@ -256,23 +335,24 @@ pub fn serve() -> Result<(), String> {
      * server thread must not block indefinitely if this loop has gone away, so
      * the reply travels on a per-request oneshot the caller owns.
      */
-    let (request_tx, request_rx) =
-        mpsc::channel::<(ControlBridgeRequest, std::sync::mpsc::Sender<DebugResponse>)>();
+    let (request_tx, request_rx) = mpsc::channel::<(
+        ControlBridgeRequest,
+        tokio::sync::oneshot::Sender<DebugResponse>,
+    )>();
 
     let bridge: tauri_runtime_blitz::ControlBridge = std::sync::Arc::new(move |request| {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if request_tx.send((request, reply_tx)).is_ok()
-            && let Ok(reply) = reply_rx.recv()
-        {
-            let _ = response_tx.send(reply);
-            return response_rx;
+        match request_tx.send((request, response_tx)) {
+            Ok(()) => response_rx,
+            Err(error) => {
+                let (_, response_tx) = error.0;
+                let _ = response_tx.send(DebugResponse::Error(DebugError {
+                    code: "documentUnavailable".into(),
+                    message: "the document is no longer serving".into(),
+                }));
+                response_rx
+            }
         }
-        let _ = response_tx.send(DebugResponse::Error(DebugError {
-            code: "documentUnavailable".into(),
-            message: "the document is no longer serving".into(),
-        }));
-        response_rx
     });
 
     let (render_events, render_event_receiver) = tokio::sync::watch::channel(None);
@@ -293,7 +373,7 @@ pub fn serve() -> Result<(), String> {
     let mut render_revision = 0_u64;
     #[cfg(feature = "diagnostics")]
     let mut capture = DocumentCapture::new();
-    'serve: while let Ok((request, reply)) = request_rx.recv() {
+    while let Ok((request, reply)) = request_rx.recv() {
         let mut painted = false;
         let response = match request {
             ControlBridgeRequest::Agent(request) => match request {
@@ -304,25 +384,23 @@ pub fn serve() -> Result<(), String> {
                 AgentControlRequest::Act(AgentAction::Focus { node_id }) => {
                     let node_id = blitz_dom::NodeId::from_u64(node_id);
                     match focus_agent_node(&mut document, node_id) {
-                        Ok(()) => match settle_immediate(&mut document, &animation_clock) {
-                            Ok(did_paint) => {
-                                painted = did_paint;
-                                DebugResponse::Ack
-                            }
-                            Err(error) => DebugResponse::Error(error),
-                        },
+                        Ok(()) => settle_response(
+                            &mut document,
+                            &animation_clock,
+                            settle_deadline,
+                            &mut painted,
+                        ),
                         Err(error) => DebugResponse::Error(error),
                     }
                 }
                 AgentControlRequest::Act(AgentAction::Click { node_id }) => {
                     match click_agent_node(&mut document, node_id, 1) {
-                        Ok(_) => match settle_immediate(&mut document, &animation_clock) {
-                            Ok(did_paint) => {
-                                painted = did_paint;
-                                DebugResponse::Ack
-                            }
-                            Err(error) => DebugResponse::Error(error),
-                        },
+                        Ok(_) => settle_response(
+                            &mut document,
+                            &animation_clock,
+                            settle_deadline,
+                            &mut painted,
+                        ),
                         Err(error) => DebugResponse::Error(error),
                     }
                 }
@@ -347,25 +425,23 @@ pub fn serve() -> Result<(), String> {
                      * layer and never removes it looks right once.
                      */
                     match hover_agent_node(&mut document, node_id) {
-                        Ok(_) => match settle_immediate(&mut document, &animation_clock) {
-                            Ok(did_paint) => {
-                                painted = did_paint;
-                                DebugResponse::Ack
-                            }
-                            Err(error) => DebugResponse::Error(error),
-                        },
+                        Ok(_) => settle_response(
+                            &mut document,
+                            &animation_clock,
+                            settle_deadline,
+                            &mut painted,
+                        ),
                         Err(error) => DebugResponse::Error(error),
                     }
                 }
                 AgentControlRequest::Act(AgentAction::DoubleClick { node_id }) => {
                     match click_agent_node(&mut document, node_id, 2) {
-                        Ok(_) => match settle_immediate(&mut document, &animation_clock) {
-                            Ok(did_paint) => {
-                                painted = did_paint;
-                                DebugResponse::Ack
-                            }
-                            Err(error) => DebugResponse::Error(error),
-                        },
+                        Ok(_) => settle_response(
+                            &mut document,
+                            &animation_clock,
+                            settle_deadline,
+                            &mut painted,
+                        ),
                         Err(error) => DebugResponse::Error(error),
                     }
                 }
@@ -387,13 +463,12 @@ pub fn serve() -> Result<(), String> {
                             .inner_mut()
                             .with_text_input(node_id, |mut editor| editor.select_all());
                         document.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(value)));
-                        match settle_immediate(&mut document, &animation_clock) {
-                            Ok(did_paint) => {
-                                painted = did_paint;
-                                DebugResponse::Ack
-                            }
-                            Err(error) => DebugResponse::Error(error),
-                        }
+                        settle_response(
+                            &mut document,
+                            &animation_clock,
+                            settle_deadline,
+                            &mut painted,
+                        )
                     }
                 }
                 AgentControlRequest::Act(AgentAction::Input(InputCommand::Key {
@@ -415,35 +490,36 @@ pub fn serve() -> Result<(), String> {
                         DebugResponse::Ack
                     } else {
                         match press_agent_key(&mut document, &key, &code) {
-                            Ok(()) => match settle_immediate(&mut document, &animation_clock) {
-                                Ok(did_paint) => {
-                                    painted = did_paint;
-                                    DebugResponse::Ack
-                                }
-                                Err(error) => DebugResponse::Error(error),
-                            },
+                            Ok(()) => settle_response(
+                                &mut document,
+                                &animation_clock,
+                                settle_deadline,
+                                &mut painted,
+                            ),
                             Err(error) => DebugResponse::Error(error),
                         }
                     }
-                }
-                AgentControlRequest::Quit => {
-                    let _ = reply.send(DebugResponse::Ack);
-                    break 'serve;
                 }
                 // Everything else needs runtime state this host does not have, and
                 // saying so is better than a plausible-looking Ack: a check that
                 // silently did nothing reports the component as broken.
                 _ => DebugResponse::Error(DebugError {
                     code: "unsupported".into(),
-                    message: "this host serves Inspect, Focus, Hover, Click, SetValue and Key only"
-                        .into(),
+                    message: "this host serves Inspect, Focus, Hover, Click, DoubleClick, SetValue and Key only".into(),
                 }),
             },
             #[cfg(feature = "diagnostics")]
             ControlBridgeRequest::Diagnostics(DiagnosticsRequest::Capture(request)) => {
-                match capture.capture(&mut document, request) {
-                    Ok(captured) => DebugResponse::Captured(captured),
-                    Err(error) => DebugResponse::Error(error),
+                if !request.scale.is_finite() || !(0.25..=8.0).contains(&request.scale) {
+                    DebugResponse::Error(DebugError {
+                        code: "invalidArgument".into(),
+                        message: "capture scale must be finite and between 0.25 and 8".into(),
+                    })
+                } else {
+                    match capture.capture(&mut document, request) {
+                        Ok(captured) => DebugResponse::Captured(captured),
+                        Err(error) => DebugResponse::Error(error),
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -455,19 +531,53 @@ pub fn serve() -> Result<(), String> {
                 }
             }
             #[cfg(feature = "diagnostics")]
+            ControlBridgeRequest::Diagnostics(DiagnosticsRequest::WindowComposition) => {
+                DebugResponse::WindowComposition(
+                    tauri_runtime_blitz::control_protocol::WindowComposition::default(),
+                )
+            }
+            #[cfg(feature = "diagnostics")]
             ControlBridgeRequest::Diagnostics(_) => DebugResponse::Error(DebugError {
                 code: "unsupported".into(),
-                message: "the headless host serves diagnostics Capture and Snapshot only".into(),
+                message: "the headless host serves diagnostics Capture, Snapshot and WindowComposition only".into(),
             }),
         };
-        if reply.send(response).is_err() {
-            break;
-        }
         if painted {
             commit_render(&render_events, &mut render_revision);
+        }
+        if reply.send(response).is_err() {
+            break;
         }
     }
 
     trace("inspection host finished");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asset_path;
+
+    #[test]
+    fn assets_cannot_escape_the_page_directory() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "qa-host-assets-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock is after the epoch")
+                    .as_nanos()
+            ));
+        std::fs::create_dir(&root).expect("create fixture root");
+        std::fs::write(root.join("inside.js"), "fixture").expect("write fixture asset");
+        assert_eq!(
+            asset_path(&root, "inside.js?cache=1").expect("local asset"),
+            std::fs::canonicalize(root.join("inside.js")).unwrap()
+        );
+        assert!(asset_path(&root, "../outside.js").is_err());
+        assert!(asset_path(&root, "/../../outside.js").is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
