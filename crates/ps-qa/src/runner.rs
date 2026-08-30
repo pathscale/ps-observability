@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use blitz_control_protocol::{
     AgentAction, AgentControlRequest, AgentSnapshot, CaptureRequest, CapturedImage, DebugResponse,
     DebugStream, DiagnosticsRequest, InputCommand, Modifiers, PointerPhase, RendererMetrics,
-    SemanticNode, SnapshotRequest,
+    SemanticNode, SnapshotRequest, WindowComposition,
 };
 use eyre::{Context, Result, bail, eyre};
 
@@ -425,6 +425,69 @@ async fn visible_ink(client: &mut Client, selector: &str) -> std::result::Result
     } else {
         Ok(())
     }
+}
+
+/// Require the platform compositor to carry no application tint at zero.
+///
+/// This deliberately does not inspect pixels. An unknown desktop and native
+/// blur make pixel attribution probabilistic; the runtime can report the
+/// surface mode and the exact tint installed on its native glass view.
+async fn transparent_window_tint(client: &mut Client) -> std::result::Result<(), String> {
+    let answer = client
+        .diagnostics(&DiagnosticsRequest::WindowComposition)
+        .await
+        .map_err(|error| format!("could not inspect native window composition: {error}"))?;
+    let composition = match answer.response {
+        DebugResponse::WindowComposition(composition) => composition,
+        DebugResponse::Error(error) => {
+            return Err(format!(
+                "native window composition refused: {} ({})",
+                error.message, error.code
+            ));
+        }
+        other => {
+            return Err(format!(
+                "asked for native window composition, got {other:?}"
+            ));
+        }
+    };
+    if cli::trace() {
+        eprintln!(
+            "        native window: transparent={} glass={} backend={} tint={:?} radius={:?}",
+            composition.surface_transparent,
+            composition.glass_enabled,
+            composition.glass_backend.as_deref().unwrap_or("unknown"),
+            composition.tint_rgba,
+            composition.radius,
+        );
+    }
+    require_transparent_window_tint(&composition)
+}
+
+fn require_transparent_window_tint(
+    composition: &WindowComposition,
+) -> std::result::Result<(), String> {
+    if !composition.supported {
+        return Err("this host cannot inspect native window composition".into());
+    }
+    if !composition.surface_transparent {
+        return Err("the native window surface is opaque".into());
+    }
+    if !composition.glass_enabled {
+        return Err("the native glass layer was not installed".into());
+    }
+    let backend = composition.glass_backend.as_deref().unwrap_or("unknown");
+    let Some([red, green, blue, alpha]) = composition.tint_rgba else {
+        return Err(format!(
+            "native glass backend {backend:?} did not expose an applied tint"
+        ));
+    };
+    if alpha != 0 {
+        return Err(format!(
+            "native glass backend {backend:?} retains tint rgba({red}, {green}, {blue}, {alpha}) at zero opacity"
+        ));
+    }
+    Ok(())
 }
 
 /// Capture a node whose identity has already been resolved.
@@ -1437,6 +1500,8 @@ async fn run_qa(
             pixel_outcome = Some(opaque_background(client, &check.subject).await);
         } else if open_error.is_none() && check.expect == qa::Expect::TransparentBackground {
             pixel_outcome = Some(transparent_background(client, &check.subject).await);
+        } else if open_error.is_none() && check.expect == qa::Expect::TransparentWindowTint {
+            pixel_outcome = Some(transparent_window_tint(client).await);
         } else if open_error.is_none() && check.expect == qa::Expect::VisibleInk {
             pixel_outcome = Some(visible_ink(client, &check.subject).await);
         } else if open_error.is_none() && check.expect == qa::Expect::Contrast {
@@ -1525,6 +1590,7 @@ async fn run_qa(
                 | qa::Expect::VisibleInk
                 | qa::Expect::OpaqueBackground
                 | qa::Expect::TransparentBackground
+                | qa::Expect::TransparentWindowTint
                 | qa::Expect::Contrast
                 | qa::Expect::FontSizeGrows
         );
@@ -5323,14 +5389,15 @@ mod tests {
         is_pagination_control, measure_ink, name_matches, named_document_is_active,
         named_document_is_active_with_permanent, named_document_opener_for, outcome_check_ids,
         outcome_verdict, pagination_advanced, painted_bounds, painted_named, pixels_change,
-        pixels_hold, resolved_action_target, rgb_pixels_hold, saved_control_node, saved_controls,
-        selector_matches_node, stable_arrival, subject_belongs_to_scope,
+        pixels_hold, require_transparent_window_tint, resolved_action_target, rgb_pixels_hold,
+        saved_control_node, saved_controls, selector_matches_node, stable_arrival,
+        subject_belongs_to_scope,
     };
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
     use crate::qa::{Check, Expect};
     use crate::target::{exact_selector_matches_node, retain_exact_candidates, viewport_for_node};
-    use blitz_control_protocol::{AgentSnapshot, CapturedImage, SemanticNode};
+    use blitz_control_protocol::{AgentSnapshot, CapturedImage, SemanticNode, WindowComposition};
     use std::collections::HashSet;
     use std::time::Duration;
 
@@ -5530,6 +5597,39 @@ mod tests {
 
         let transparent = capture(&[255, 255, 255, 0].repeat(4));
         assert_eq!(measure_ink(&transparent).unwrap().visible, 0);
+    }
+
+    #[test]
+    fn zero_opacity_requires_the_applied_native_tint_to_be_clear() {
+        let clear = WindowComposition {
+            supported: true,
+            surface_transparent: true,
+            glass_enabled: true,
+            glass_backend: Some("nativeGlass".into()),
+            tint_rgba: Some([174, 50, 112, 0]),
+            radius: Some(12.0),
+        };
+        assert!(require_transparent_window_tint(&clear).is_ok());
+
+        let accent_sheet = WindowComposition {
+            tint_rgba: Some([174, 50, 112, 255]),
+            ..clear.clone()
+        };
+        assert!(
+            require_transparent_window_tint(&accent_sheet)
+                .unwrap_err()
+                .contains("retains tint")
+        );
+
+        let opaque_window = WindowComposition {
+            surface_transparent: false,
+            ..clear
+        };
+        assert!(
+            require_transparent_window_tint(&opaque_window)
+                .unwrap_err()
+                .contains("surface is opaque")
+        );
     }
 
     #[test]

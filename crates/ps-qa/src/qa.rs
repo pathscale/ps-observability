@@ -258,6 +258,14 @@ pub enum Expect {
     /// This is stricter than merely being translucent: an opacity slider at its
     /// floor must admit the native backdrop completely, not leave a pale film.
     TransparentBackground,
+    /// The platform window is transparent and its installed glass tint has
+    /// zero alpha.
+    ///
+    /// Renderer paint cannot answer this: AppKit composites the window and its
+    /// glass view outside the document. This expectation reads the runtime's
+    /// applied native composition and rejects a merely transparent CSS root
+    /// sitting over an accent-coloured native sheet.
+    TransparentWindowTint,
     /// Every named painted node matching the subject meets its contrast floor.
     ///
     /// Text and labeled controls use 4.5:1. Graphical form chrome and
@@ -994,6 +1002,7 @@ pub fn verdict(
         | Expect::VisibleInk
         | Expect::OpaqueBackground
         | Expect::TransparentBackground
+        | Expect::TransparentWindowTint
         | Expect::Contrast
         | Expect::FontSizeGrows => {
             return Err("paint expectations must be resolved by the live QA runner".to_owned());
