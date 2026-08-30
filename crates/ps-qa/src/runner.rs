@@ -531,6 +531,12 @@ fn require_transparent_window_tint(
     }
     let backend = composition.glass_backend.as_deref().unwrap_or("unknown");
     let Some([red, green, blue, alpha]) = composition.tint_rgba else {
+        if backend == "vibrancy" {
+            // Vibrancy is a system material and deliberately receives no
+            // custom accent tint. `None` is therefore stronger evidence than
+            // a clear colour: this backend installed no tint at all.
+            return Ok(());
+        }
         return Err(format!(
             "native glass backend {backend:?} did not expose an applied tint"
         ));
@@ -1471,8 +1477,11 @@ async fn run_qa(
                     // identical black pixels. Place the persistent comparison
                     // subject first; its descendant is then already visible.
                     reveal_capture_region(client, &check.subject).await?;
-                    let node_id = scroll_hover_target_into_view(client, hover.target()).await?;
                     park_pointer(client).await?;
+                    // Leaving the menu can reconcile its active item. Resolve
+                    // after parking so the hover is sent to the current node,
+                    // not an id from the state the pointer just replaced.
+                    let node_id = scroll_hover_target_into_view(client, hover.target()).await?;
                     let before = capture_region(client, &check.subject).await?;
                     let event_driven = client
                         .arm_paint_events()
@@ -2717,11 +2726,34 @@ async fn drive_check_action(
         if cli::trace() {
             println!("        activating {want:?} (id {node_id})");
         }
-        client
+        match client
             .agent(&AgentControlRequest::Act(AgentAction::Click { node_id }))
             .await
-            .map(|_| Some(node_id))
-            .map_err(|error| format!("could not click {want:?}: {error}"))
+        {
+            Ok(_) => Ok(Some(node_id)),
+            Err(error) if error.to_string().contains("notInteractable") => {
+                // Hover and the baseline inspection can reconcile a virtual
+                // row after its action was prepared. A not-interactable Ack
+                // guarantees the first click did not execute, so re-resolving
+                // once is safe and avoids acting twice on a lost response.
+                let (current_id, _) = locate_control(client, want, &[])
+                    .await
+                    .map_err(|error| format!("could not relocate {want:?}: {error}"))?;
+                if cli::trace() {
+                    println!(
+                        "        target {node_id} reconciled; activating current id {current_id}"
+                    );
+                }
+                client
+                    .agent(&AgentControlRequest::Act(AgentAction::Click {
+                        node_id: current_id,
+                    }))
+                    .await
+                    .map(|_| Some(current_id))
+                    .map_err(|error| format!("could not click {want:?}: {error}"))
+            }
+            Err(error) => Err(format!("could not click {want:?}: {error}")),
+        }
     }
 }
 
@@ -5848,6 +5880,24 @@ mod tests {
             radius: Some(12.0),
         };
         assert!(require_transparent_window_tint(&clear).is_ok());
+
+        let no_tint_backend = WindowComposition {
+            glass_backend: Some("vibrancy".into()),
+            tint_rgba: None,
+            radius: None,
+            ..clear.clone()
+        };
+        assert!(require_transparent_window_tint(&no_tint_backend).is_ok());
+
+        let unreported_tint = WindowComposition {
+            tint_rgba: None,
+            ..clear.clone()
+        };
+        assert!(
+            require_transparent_window_tint(&unreported_tint)
+                .unwrap_err()
+                .contains("did not expose")
+        );
 
         let accent_sheet = WindowComposition {
             tint_rgba: Some([174, 50, 112, 255]),
