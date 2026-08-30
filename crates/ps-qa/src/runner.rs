@@ -546,6 +546,7 @@ async fn capture_node_region(
 async fn capture_stable_region(
     client: &mut Client,
     selector: &str,
+    settle_timeout: Duration,
 ) -> std::result::Result<CapturedImage, String> {
     // Two adjacent samples are not a settled animation. A delayed RAF or one
     // quiet interval between keyframes can produce the same pixels twice and
@@ -561,7 +562,7 @@ async fn capture_stable_region(
     // renderer's capture work. A CPU-backed regional capture can legitimately
     // take longer than one refresh interval; charging that work to the quiet
     // deadline made an unchanged frame fail before four samples existed.
-    let mut deadline = tokio::time::Instant::now() + check_timeout(900);
+    let mut deadline = tokio::time::Instant::now() + settle_timeout;
     let mut matching = 1;
     loop {
         tokio::time::sleep(Duration::from_millis(16)).await;
@@ -601,7 +602,8 @@ async fn capture_stable_region(
                     .unwrap_or_else(|error| format!("; {error}"))
             };
             return Err(format!(
-                "rendered region {selector:?} did not settle within the interaction deadline{detail}"
+                "rendered region {selector:?} did not settle within {}ms{detail}",
+                settle_timeout.as_millis()
             ));
         }
         previous = current;
@@ -1348,13 +1350,21 @@ async fn run_qa(
                     // renderer paint entries.
                     let establish = qa::Hover::Once(hover.target().to_owned());
                     repeat_hover(client, &establish, true).await?;
-                    let before = capture_stable_region(client, &check.subject)
-                        .await
-                        .map_err(|error| format!("before hover: {error}"))?;
+                    let before = capture_stable_region(
+                        client,
+                        &check.subject,
+                        declared_outcome_timeout(check),
+                    )
+                    .await
+                    .map_err(|error| format!("before hover: {error}"))?;
                     repeat_hover(client, hover, true).await?;
-                    let after = capture_stable_region(client, &check.subject)
-                        .await
-                        .map_err(|error| format!("after hover: {error}"))?;
+                    let after = capture_stable_region(
+                        client,
+                        &check.subject,
+                        declared_outcome_timeout(check),
+                    )
+                    .await
+                    .map_err(|error| format!("after hover: {error}"))?;
                     pixels_hold(&before, &after)
                 }
                 .await;
@@ -1373,13 +1383,21 @@ async fn run_qa(
                     }
                     scroll_hover_target_into_view(client, hover.target()).await?;
                     park_pointer(client).await?;
-                    let before = capture_stable_region(client, &check.subject)
-                        .await
-                        .map_err(|error| format!("before hover: {error}"))?;
+                    let before = capture_stable_region(
+                        client,
+                        &check.subject,
+                        declared_outcome_timeout(check),
+                    )
+                    .await
+                    .map_err(|error| format!("before hover: {error}"))?;
                     repeat_hover(client, hover, true).await?;
-                    let after = capture_stable_region(client, &check.subject)
-                        .await
-                        .map_err(|error| format!("after hover: {error}"))?;
+                    let after = capture_stable_region(
+                        client,
+                        &check.subject,
+                        declared_outcome_timeout(check),
+                    )
+                    .await
+                    .map_err(|error| format!("after hover: {error}"))?;
                     let comparison = rgb_pixels_hold(&before, &after);
                     if comparison.is_err()
                         && let Err(error) = save_pixel_artifacts(&check.id, &before, &after)
@@ -2092,12 +2110,8 @@ async fn settle_for_outcome(
     action_target: Option<&str>,
     action_node_id: Option<u64>,
 ) -> Result<(AgentSnapshot, Option<String>, u32)> {
-    let outcome_ms = if check.outcome_timeout_ms == 0 {
-        900
-    } else {
-        check.outcome_timeout_ms
-    };
-    let deadline = tokio::time::Instant::now() + check_timeout(outcome_ms);
+    let outcome_timeout = declared_outcome_timeout(check);
+    let deadline = tokio::time::Instant::now() + outcome_timeout;
     let stable_for = Duration::from_millis(check.stable_for_ms);
     let mut stability = OutcomeStability::default();
     let mut iterations = 0;
@@ -2149,7 +2163,7 @@ async fn settle_for_outcome(
                 format!(
                     "rendered outcome did not remain complete and unchanged for {}ms within {}ms",
                     stable_for.as_millis(),
-                    check_timeout(outcome_ms).as_millis()
+                    outcome_timeout.as_millis()
                 )
             });
             return Ok((after, error, iterations));
@@ -2174,6 +2188,19 @@ async fn settle_for_outcome(
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+}
+
+/// The one deadline a check declared for its rendered result.
+///
+/// Capture settling, semantic settling and transport waits must all derive
+/// from this value. Independent literals let one layer give up while another
+/// still claims the outcome has time remaining.
+fn declared_outcome_timeout(check: &qa::Check) -> Duration {
+    check_timeout(if check.outcome_timeout_ms == 0 {
+        900
+    } else {
+        check.outcome_timeout_ms
+    })
 }
 
 /// Resolve an application-owned surface opener.
@@ -4797,6 +4824,15 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Validate product-owned navigation and safety rules before any command
+    // can reach the cached profile. Component sweeps launch their own hosts and
+    // therefore dispatch before descriptor discovery, but they still use the
+    // profile to classify controls. Validating after that early dispatch made
+    // a missing profile panic from `reach` instead of returning a CLI error.
+    if cli.command.requires_app_profile() {
+        app::AppProfile::load(cli.app.as_deref()).map_err(|error| eyre!(error))?;
+    }
+
     // A component sweep launches its own hosts, so it attaches to something
     // different for every component and cannot use the descriptor discovered
     // once up front. Dispatched here, before that lookup, for the same reason
@@ -4824,13 +4860,6 @@ pub async fn run() -> Result<()> {
             std::process::exit(1);
         }
         return Ok(());
-    }
-
-    // Before attaching to anything: a run that broadly drives an application
-    // against a profile it does not have is worse than one that refuses to
-    // start. Renderer diagnostics remain product-neutral and need no profile.
-    if cli.command.requires_app_profile() {
-        app::AppProfile::load(cli.app.as_deref()).map_err(|error| eyre!(error))?;
     }
 
     let descriptor = inspector::discover(cli.descriptor.as_deref().and_then(|p| p.to_str()))?;
@@ -5402,13 +5431,13 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::{
         InventoryClass, OutcomeStability, arrival_sample_matches, arrived_without_navigation,
-        capture_node_id, duplicate_dom_ids, generated_dom_id, inventory_class,
-        is_pagination_control, measure_ink, name_matches, named_document_is_active,
-        named_document_is_active_with_permanent, named_document_opener_for, outcome_check_ids,
-        outcome_verdict, pagination_advanced, painted_bounds, painted_named, pixels_change,
-        pixels_hold, require_transparent_window_tint, resolved_action_target, rgb_pixels_hold,
-        saved_control_node, saved_controls, selector_matches_node, stable_arrival,
-        subject_belongs_to_scope,
+        capture_node_id, declared_outcome_timeout, duplicate_dom_ids, generated_dom_id,
+        inventory_class, is_pagination_control, measure_ink, name_matches,
+        named_document_is_active, named_document_is_active_with_permanent,
+        named_document_opener_for, outcome_check_ids, outcome_verdict, pagination_advanced,
+        painted_bounds, painted_named, pixels_change, pixels_hold, require_transparent_window_tint,
+        resolved_action_target, rgb_pixels_hold, saved_control_node, saved_controls,
+        selector_matches_node, stable_arrival, subject_belongs_to_scope,
     };
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
@@ -5886,6 +5915,17 @@ mod tests {
             subject: subject.into(),
             expect: Expect::Paints,
         }
+    }
+
+    #[test]
+    fn every_outcome_layer_uses_the_check_deadline() {
+        let mut check = check("deadline", Some("Save"), "Saved");
+        assert_eq!(declared_outcome_timeout(&check), Duration::from_millis(900));
+        check.outcome_timeout_ms = 1_700;
+        assert_eq!(
+            declared_outcome_timeout(&check),
+            Duration::from_millis(1_700)
+        );
     }
 
     #[test]

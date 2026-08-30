@@ -230,7 +230,12 @@ fn measure_ink_bounds(
     let mut histogram: HashMap<(u8, u8, u8), usize> = HashMap::new();
     let pixel = |x: u32, y: u32| {
         let start = ((y * image.width + x) * 4) as usize;
-        [rgba[start], rgba[start + 1], rgba[start + 2], rgba[start + 3]]
+        [
+            rgba[start],
+            rgba[start + 1],
+            rgba[start + 2],
+            rgba[start + 3],
+        ]
     };
     for y in top..bottom {
         for x in left..right {
