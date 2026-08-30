@@ -92,11 +92,10 @@ jobs:
           cargo package -p blitz-control-protocol
           cargo package -p ps-blitz-debug-control
           # The new protocol cannot exist in the registry before this PR is
-          # merged. Verify the dependent package tarballs against this exact
+          # merged. Verify the driver tarball against this exact
           # protocol source without installing a persistent workspace patch;
           # publish.yml repeats ordinary registry-backed `cargo package` after
-          # publishing the protocol and before uploading either dependent.
-          cargo --config 'patch.crates-io.blitz-control-protocol.path="crates/blitz-control-protocol"' \
-            package -p qa-inspect-host
+          # publishing the protocol and before uploading the driver.
+          cargo package -p qa-inspect-host
           cargo --config 'patch.crates-io.blitz-control-protocol.path="crates/blitz-control-protocol"' \
             package -p ps-qa
