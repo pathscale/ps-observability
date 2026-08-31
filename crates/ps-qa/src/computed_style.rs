@@ -118,6 +118,7 @@ pub(crate) async fn wait_for_larger_font(
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let event_driven = client.arm_paint_events().await.unwrap_or(false);
     loop {
         let latest =
             parse_font_size(&value_for_node(client, node_id, selector, "fontSize").await?)?;
@@ -129,7 +130,17 @@ pub(crate) async fn wait_for_larger_font(
                 "{selector:?} font size stayed {latest:.2}px after the interface-size action; expected more than {before:.2}px"
             ));
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        if event_driven {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !remaining.is_zero() {
+                let _ = client
+                    .wait_for_paint(remaining)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }
 

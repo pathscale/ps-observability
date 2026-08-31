@@ -1,10 +1,8 @@
 //! Semantic target selection and viewport recovery.
 
-use std::collections::HashSet;
-use std::time::Duration;
-
 use blitz_control_protocol::{AgentAction, AgentControlRequest, AgentSnapshot, SemanticNode};
 use eyre::{Result, bail};
+use std::collections::HashSet;
 
 use crate::inspector::{Client, inspect};
 use crate::{cli, reach};
@@ -256,8 +254,6 @@ pub(crate) async fn locate_control(
                 }))
                 .await?;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-
         // Re-inspect rather than reusing the old box: the scroll moved it, and
         // pressing at where it used to be is the bug this exists to fix. Nested
         // scrollers may need more than one semantic reveal: the first exposes
@@ -294,7 +290,6 @@ pub(crate) async fn locate_control(
                     delta_y,
                 }))
                 .await?;
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         latest = settled;
     }

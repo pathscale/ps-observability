@@ -214,6 +214,45 @@ fn stable_arrival(painted_streak: &mut u8, arrived: bool) -> bool {
     *painted_streak >= 3
 }
 
+/// Observe semantic state until it satisfies an interaction's outcome.
+///
+/// The first snapshot catches synchronous changes already settled by the
+/// action acknowledgement. Later samples are driven by committed-paint events;
+/// only older runtimes without that stream retain the bounded 25 ms fallback.
+async fn wait_for_semantic_condition(
+    client: &mut Client,
+    within: Duration,
+    mut matches: impl FnMut(&[SemanticNode]) -> bool,
+) -> Result<AgentSnapshot> {
+    let deadline = tokio::time::Instant::now() + within;
+    let event_driven = client.arm_paint_events().await.unwrap_or(false);
+    loop {
+        let snapshot = inspect(client).await?.0;
+        if matches(&snapshot.nodes) || tokio::time::Instant::now() >= deadline {
+            return Ok(snapshot);
+        }
+        if event_driven {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !remaining.is_zero() {
+                let _ = client.wait_for_paint(remaining).await?;
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+async fn settle_sweep_case(
+    client: &mut Client,
+    case: &sweep::Case,
+    before: &[SemanticNode],
+) -> Result<AgentSnapshot> {
+    wait_for_semantic_condition(client, check_timeout(900), |after| {
+        sweep::judge(case, before, after).is_none()
+    })
+    .await
+}
+
 /// Drive every panel check and report what the renderer did.
 ///
 /// Each check runs against the live tree, and the three steps are separated on
@@ -454,7 +493,6 @@ async fn reveal_capture_region(
         }))
         .await
         .map_err(|error| error.to_string())?;
-    tokio::time::sleep(Duration::from_millis(25)).await;
     Ok(node_id)
 }
 
@@ -1180,7 +1218,6 @@ async fn run_qa(
             if cli::trace() && opened > 0 {
                 println!("        opened {opened} collapsed section(s) for {setup_target:?}");
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
         let (expanded, _) = inspect(client).await?;
@@ -1204,7 +1241,6 @@ async fn run_qa(
                     ));
                 }
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
         // A deferred surface cannot reveal a node it has not mounted yet.
@@ -1221,8 +1257,6 @@ async fn run_qa(
                 ));
             } else if let Err(error) = scroll_hover_target_into_view(client, reveal).await {
                 open_error = Some(error);
-            } else {
-                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
 
@@ -1250,7 +1284,6 @@ async fn run_qa(
                     match repeat_hover(client, &first, false).await {
                         Err(error) => Err(error),
                         Ok(()) => {
-                            tokio::time::sleep(Duration::from_millis(30)).await;
                             let snapshot = inspect(client).await?.0;
                             nodes_after_first_hover = Some(hover_signature_counts(&snapshot.nodes));
                             match park_pointer(client).await {
@@ -1270,23 +1303,21 @@ async fn run_qa(
                 };
                 if let Err(error) = hovered {
                     open_error = Some(error);
-                } else if let Some(next) = check.prepare.as_deref().or(check.click.as_deref()) {
-                    if !wait_for_arrival(client, None, next).await? {
-                        // A virtualized row can reconcile after ScrollIntoView
-                        // and lose the hover that was sent to its prior node.
-                        // Reacquire it once; silently continuing turns a setup
-                        // race into a misleading "could not click" failure.
-                        if let Err(error) = repeat_hover(client, hover, false).await {
-                            open_error = Some(error);
-                        } else if !wait_for_arrival(client, None, next).await? {
-                            open_error = Some(format!(
-                                "hovering {:?} did not reveal {next:?}",
-                                hover.target()
-                            ));
-                        }
+                } else if let Some(next) = check.prepare.as_deref().or(check.click.as_deref())
+                    && !wait_for_arrival(client, None, next).await?
+                {
+                    // A virtualized row can reconcile after ScrollIntoView
+                    // and lose the hover that was sent to its prior node.
+                    // Reacquire it once; silently continuing turns a setup
+                    // race into a misleading "could not click" failure.
+                    if let Err(error) = repeat_hover(client, hover, false).await {
+                        open_error = Some(error);
+                    } else if !wait_for_arrival(client, None, next).await? {
+                        open_error = Some(format!(
+                            "hovering {:?} did not reveal {next:?}",
+                            hover.target()
+                        ));
                     }
-                } else {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }
         }
@@ -1391,8 +1422,6 @@ async fn run_qa(
                 .or(check.key_on.as_deref())
             {
                 let _ = wait_for_arrival(client, None, next).await?;
-            } else {
-                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
 
@@ -3058,12 +3087,7 @@ async fn run_sweep(client: &mut Client, family: Option<&str>) -> Result<usize> {
             });
             continue;
         }
-        // Long enough for a synchronous handler and its re-render. A backend
-        // round trip is slower, and a button that only fails under that delay
-        // is reported rather than waited for: a person sees the same thing.
-        tokio::time::sleep(Duration::from_millis(250)).await;
-
-        let (after, _) = inspect(client).await?;
+        let after = settle_sweep_case(client, &case, &before.nodes).await?;
         let failure = sweep::judge(&case, &before.nodes, &after.nodes);
         outcomes.push(sweep::Outcome { case, failure });
     }
@@ -3140,7 +3164,6 @@ async fn expand_everything(client: &mut Client, surface: &reach::Surface) -> Res
         for name in todo {
             if click_named_quiet(client, &name).await.is_ok() {
                 opened += 1;
-                tokio::time::sleep(Duration::from_millis(80)).await;
             }
         }
     }
@@ -3199,7 +3222,6 @@ async fn reveal_deferred_content(
                 node_id: target.0,
             }))
             .await?;
-        tokio::time::sleep(Duration::from_millis(75)).await;
     }
     Ok(8)
 }
@@ -3280,7 +3302,6 @@ async fn materialize_scrolled_content(
             }))
             .await?;
         scrolls += 1;
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     for _ in 0..16 {
@@ -3334,7 +3355,6 @@ async fn materialize_scrolled_content(
             }))
             .await?;
         scrolls += 1;
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(scrolls)
 }
@@ -3420,7 +3440,6 @@ async fn materialize_paginated_content(
                 break;
             }
             revealed += 1;
-            tokio::time::sleep(Duration::from_millis(5)).await;
             let (after, _) = inspect(client).await?;
             let after_scope: HashSet<u64> = reach::on_surface_subtree(&after.nodes, surface)
                 .into_iter()
@@ -3992,7 +4011,6 @@ async fn run_inventory(
                 .unwrap_or_default();
             if !previous.is_empty() {
                 type_text(client, field, "").await?;
-                tokio::time::sleep(Duration::from_millis(25)).await;
             }
             Some((field.to_owned(), previous))
         } else {
@@ -4297,7 +4315,10 @@ async fn open_surface(client: &mut Client, surface: &reach::Surface) -> Result<b
             if let Some(home) = reach::profile().home_opener.as_deref() {
                 let _ = click_named_quiet(client, home).await;
             }
-            tokio::time::sleep(Duration::from_millis(600)).await;
+            let _ = wait_for_semantic_condition(client, check_timeout(900), |nodes| {
+                reach::document_opener(nodes).is_some()
+            })
+            .await?;
         }
         let (tree, _) = inspect(client).await?;
         match reach::document_opener(&tree.nodes) {
@@ -4342,7 +4363,6 @@ async fn open_surface(client: &mut Client, surface: &reach::Surface) -> Result<b
                 node_id: id,
             }))
             .await?;
-        tokio::time::sleep(Duration::from_millis(400)).await;
 
         let (tree, _) = inspect(client).await?;
         if !tree.nodes.iter().any(|n| n.id == id && reach::onscreen(n)) {
@@ -4369,7 +4389,6 @@ async fn open_surface(client: &mut Client, surface: &reach::Surface) -> Result<b
     if let Some(home) = reach::profile().home_opener.as_deref() {
         let _ = click_named_quiet(client, home).await;
     }
-    tokio::time::sleep(Duration::from_millis(400)).await;
     if click_named_quiet(client, &opener).await.is_err() {
         return Ok(false);
     }
@@ -4465,14 +4484,13 @@ async fn sweep_modal(
         if cli::trace() {
             println!("      [modal] clicked: {name:?}");
         }
-        tokio::time::sleep(Duration::from_millis(180)).await;
-        let (after, _) = inspect(client).await?;
         let case = sweep::Case {
             id,
             name: name.clone(),
             family: audit::family_of(&name),
             expect: sweep::expectation_for(&name, reach::is_inert_control(&name)),
         };
+        let after = settle_sweep_case(client, &case, &before.nodes).await?;
         if let Some(why) = sweep::judge(&case, &before.nodes, &after.nodes) {
             failures.push((
                 surface.to_owned(),
@@ -4495,8 +4513,10 @@ async fn sweep_modal(
         }
         // A dismisser belongs to the dialog, not to the surface underneath it.
         here.revealed += 1;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let (after, _) = inspect(client).await?;
+        let after = wait_for_semantic_condition(client, check_timeout(900), |nodes| {
+            !reach::modal_open(nodes)
+        })
+        .await?;
         if !reach::modal_open(&after.nodes) {
             return Ok(false);
         }
@@ -4509,8 +4529,10 @@ async fn sweep_modal(
 
     // Escape, which `AppModal` binds and which is the last thing a person has.
     let _ = press_key(client, "escape", 1, "", false).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let (after, _) = inspect(client).await?;
+    let after = wait_for_semantic_condition(client, check_timeout(900), |nodes| {
+        !reach::modal_open(nodes)
+    })
+    .await?;
     if !reach::modal_open(&after.nodes) {
         return Ok(false);
     }
@@ -4522,21 +4544,13 @@ async fn sweep_modal(
     Ok(true)
 }
 
-/// Wait until the surface is actually showing, up to a few seconds.
-///
-/// Polled rather than slept: Analytics takes longer to build than the others
-/// and a fixed 500ms wait declared it unopened while it was still on its way,
-/// which sent the whole sweep down the retry path and then swept the wrong
-/// surface twice. Polling costs nothing when the pane is already up.
+/// Wait until the surface is actually showing, driven by committed frames.
 async fn settle_on(client: &mut Client, surface: &reach::Surface) -> Result<bool> {
-    for _ in 0..12 {
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let (tree, _) = inspect(client).await?;
-        if reach::on_surface(&tree.nodes, surface) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let tree = wait_for_semantic_condition(client, check_timeout(4_800), |nodes| {
+        reach::on_surface(nodes, surface)
+    })
+    .await?;
+    Ok(reach::on_surface(&tree.nodes, surface))
 }
 
 /// Sweep every surface, and account for every button in the tree.
@@ -4867,7 +4881,6 @@ async fn run_cover(
             if cli::trace() {
                 println!("    clicked: {name:?}");
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
 
             /*
              * If that opened a modal, sweep it and then prove it closes.
@@ -4880,7 +4893,7 @@ async fn run_cover(
              * from a restart rather than grinding on against a window nobody
              * can use.
              */
-            let (after_click, _) = inspect(client).await?;
+            let after_click = settle_sweep_case(client, &case, &before.nodes).await?;
             let after = if reach::modal_open(&after_click.nodes) {
                 let trapped =
                     sweep_modal(client, &name, &mut here, &mut failures, &surface.name).await?;
@@ -4903,16 +4916,8 @@ async fn run_cover(
             } else {
                 after_click
             };
-            if sweep::judge(&case, &before.nodes, &after.nodes).is_some() {
-                // Backend-backed controls can acknowledge immediately and
-                // update the semantic tree on the next task. Retry only a
-                // would-be failure, so fast controls do not all pay for the
-                // slowest one.
-                tokio::time::sleep(Duration::from_millis(800)).await;
-                let (settled, _) = inspect(client).await?;
-                if let Some(why) = sweep::judge(&case, &before.nodes, &settled.nodes) {
-                    failures.push((surface.name.to_owned(), name, why));
-                }
+            if let Some(why) = sweep::judge(&case, &before.nodes, &after.nodes) {
+                failures.push((surface.name.to_owned(), name, why));
             }
         }
 
@@ -5435,7 +5440,6 @@ pub async fn run() -> Result<()> {
                 (Some(name), None) => click_named(&mut client, &name).await?,
                 (None, Some(node_id)) => {
                     click_by_id(&mut client, node_id).await?;
-                    tokio::time::sleep(Duration::from_millis(400)).await;
                     println!("activated node {node_id}");
                 }
                 _ => unreachable!("clap requires exactly one click selector"),
@@ -5505,7 +5509,6 @@ pub async fn run() -> Result<()> {
                     )))
                     .await?;
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
             println!("pressed");
         }
         cli::Command::Cover {
@@ -5569,7 +5572,6 @@ pub async fn run() -> Result<()> {
                     node_id: id,
                 }))
                 .await?;
-            tokio::time::sleep(Duration::from_millis(400)).await;
             let (after_snapshot, _) = inspect(&mut client).await?;
             let after = after_snapshot
                 .nodes
@@ -5638,7 +5640,6 @@ pub async fn run() -> Result<()> {
                     .await?;
                 sleep_pace().await;
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
         }
         cli::Command::Scroll { ticks, delta, over } => {
             let fallback = reach::profile()
