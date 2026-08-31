@@ -292,8 +292,11 @@ pub(crate) fn measure_interior_ink(image: &CapturedImage) -> Result<Ink> {
             image.height
         ));
     }
-    let inset_x = (image.width / 5).max(1);
-    let inset_y = (image.height / 5).max(1);
+    // Borders and focus rings occupy a fixed number of device pixels. A
+    // percentage inset incorrectly discards left-aligned labels in wide
+    // controls (for example, a full-width select trigger).
+    let inset_x = (image.width / 5).clamp(1, 4);
+    let inset_y = (image.height / 5).clamp(1, 4);
     let right = image.width.saturating_sub(inset_x);
     let bottom = image.height.saturating_sub(inset_y);
     if right <= inset_x || bottom <= inset_y {
@@ -436,5 +439,32 @@ mod tests {
             node_id: Some(8),
         };
         assert_eq!(measure_interior_ink(&tiny).unwrap().visible, 0);
+    }
+
+    #[test]
+    fn interior_ink_keeps_left_aligned_content_in_a_wide_control() {
+        let background = [20, 20, 20, 255];
+        let foreground = [240, 240, 240, 255];
+        let width = 100;
+        let height = 20;
+        let mut pixels = background.repeat(width * height);
+
+        // A small label near the leading edge of a wide control. The former
+        // percentage inset started at x=20 and discarded it entirely.
+        for y in 8..12 {
+            for x in 8..14 {
+                let start = (y * width + x) * 4;
+                pixels[start..start + 4].copy_from_slice(&foreground);
+            }
+        }
+
+        let labeled = CapturedImage {
+            width: width as u32,
+            height: height as u32,
+            rgba_base64: base64::engine::general_purpose::STANDARD.encode(pixels),
+            node_id: Some(9),
+        };
+
+        assert_eq!(measure_interior_ink(&labeled).unwrap().visible, 24);
     }
 }
