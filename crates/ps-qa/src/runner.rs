@@ -1741,7 +1741,14 @@ async fn run_qa(
                 let (tree, _) = inspect(client).await?;
                 action_target = resolved_action_target(&tree.nodes, want);
             }
-            let driven = drive_check_action(client, want, check.press, prepared_click).await;
+            let driven = drive_check_action(
+                client,
+                want,
+                check.press,
+                prepared_click,
+                check.hover.as_ref(),
+            )
+            .await;
             action_error = driven.as_ref().err().cloned();
             action_node_id = driven.ok().flatten();
             // The exact declared outcome below polls the renderer. A generic
@@ -2714,6 +2721,7 @@ async fn drive_check_action(
     want: &str,
     coordinate_press: bool,
     prepared_node_id: Option<u64>,
+    retry_hover: Option<&qa::Hover>,
 ) -> std::result::Result<Option<u64>, String> {
     if coordinate_press {
         press_named(client, want)
@@ -2733,9 +2741,19 @@ async fn drive_check_action(
             Ok(_) => Ok(Some(node_id)),
             Err(error) if error.to_string().contains("notInteractable") => {
                 // Hover and the baseline inspection can reconcile a virtual
-                // row after its action was prepared. A not-interactable Ack
-                // guarantees the first click did not execute, so re-resolving
-                // once is safe and avoids acting twice on a lost response.
+                // row after its action was prepared. Hover-gated actions then
+                // disappear with the stale row, so restore the check's
+                // authored hover state before resolving the replacement. A
+                // not-interactable Ack guarantees the first click did not
+                // execute, making this single retry safe.
+                if let Some(hover) = retry_hover {
+                    let reacquire = qa::Hover::Once(hover.target().to_owned());
+                    repeat_hover(client, &reacquire, false)
+                        .await
+                        .map_err(|error| {
+                            format!("could not restore hover for {want:?}: {error}")
+                        })?;
+                }
                 let (current_id, _) = locate_control(client, want, &[])
                     .await
                     .map_err(|error| format!("could not relocate {want:?}: {error}"))?;
