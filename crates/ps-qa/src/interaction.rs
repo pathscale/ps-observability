@@ -1,7 +1,7 @@
 //! Pointer, keyboard, and text input against a running application.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use blitz_control_protocol::{
     AgentAction, AgentControlRequest, InputCommand, KeyPhase, Modifiers, PointerPhase,
@@ -216,7 +216,6 @@ pub(crate) async fn press_key(
                 node_id: target,
             }))
             .await?;
-        tokio::time::sleep(Duration::from_millis(150)).await;
         println!("focused node {target} for {name} x{count}");
     } else if require_target {
         bail!("no enabled, painted key target matching {over:?}");
@@ -241,7 +240,6 @@ pub(crate) async fn press_key(
         }
         sleep_pace().await;
     }
-    tokio::time::sleep(Duration::from_millis(25)).await;
     Ok(())
 }
 
@@ -316,7 +314,6 @@ pub(crate) async fn type_keys(client: &mut Client, count: usize, want: &str) -> 
             node_id: field.id,
         }))
         .await?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let before = metrics(client).await?;
     let mut latencies = Vec::with_capacity(count);
@@ -361,7 +358,6 @@ pub(crate) async fn type_text(client: &mut Client, want: &str, text: &str) -> Re
             value: text.to_owned(),
         }))
         .await?;
-    tokio::time::sleep(Duration::from_millis(25)).await;
     Ok(field.id)
 }
 
@@ -397,7 +393,6 @@ pub(crate) async fn click_named(client: &mut Client, want: &str) -> Result<()> {
         }))
         .await?;
     let ack = started.elapsed().as_secs_f64() * 1000.0;
-    tokio::time::sleep(Duration::from_millis(500)).await;
     let after = metrics(client).await?;
 
     println!("click acked in {ack:.1}ms");
