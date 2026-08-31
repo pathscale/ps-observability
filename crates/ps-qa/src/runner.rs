@@ -705,13 +705,27 @@ async fn wait_for_pixels_change(
 
     loop {
         let after = capture_region(client, selector).await?;
-        if pixels_change(before, &after).is_ok() {
-            return Ok(());
+        match assess_pixel_change(before, &after, tokio::time::Instant::now() >= deadline)? {
+            Some(()) => return Ok(()),
+            None => tokio::time::sleep(Duration::from_millis(8)).await,
         }
-        if tokio::time::Instant::now() >= deadline {
-            return pixels_change(before, &after);
-        }
-        tokio::time::sleep(Duration::from_millis(8)).await;
+    }
+}
+
+/// Decide one capture in the bounded pixel-change wait.
+///
+/// A paint notification only says that *a* frame committed. Reveal or scroll
+/// work queued before the measured action can commit first, so an unchanged
+/// capture before the deadline is pending rather than a failed verdict.
+fn assess_pixel_change(
+    before: &CapturedImage,
+    after: &CapturedImage,
+    timed_out: bool,
+) -> std::result::Result<Option<()>, String> {
+    match pixels_change(before, after) {
+        Ok(()) => Ok(Some(())),
+        Err(error) if timed_out => Err(error),
+        Err(_) => Ok(None),
     }
 }
 
@@ -1537,27 +1551,25 @@ async fn run_qa(
                         return Err("no paint event arrived after hover".to_owned());
                     }
 
-                    if paint_committed {
-                        let after = capture_region(client, &check.subject).await?;
-                        let comparison = pixels_change(&before, &after);
-                        if comparison.is_err()
-                            && let Err(error) = save_pixel_artifacts(&check.id, &before, &after)
-                        {
-                            eprintln!("could not save pixel artifacts for {}: {error}", check.id);
-                        }
-                        comparison
-                    } else {
-                        // Compatibility with runtimes and headless hosts that
-                        // predate paint notifications. Bounded to 100 ms and
-                        // removed once the fleet has adopted the stream.
-                        wait_for_pixels_change(
-                            client,
-                            &check.subject,
-                            &before,
-                            declared_outcome_timeout(check),
-                        )
-                        .await
+                    // The first committed paint may belong to reveal/scroll
+                    // work queued before Hover. In both event-driven and
+                    // compatibility modes, wait for the declared subject's
+                    // pixels to change instead of treating that first frame as
+                    // the final verdict.
+                    let comparison = wait_for_pixels_change(
+                        client,
+                        &check.subject,
+                        &before,
+                        declared_outcome_timeout(check),
+                    )
+                    .await;
+                    if comparison.is_err()
+                        && let Ok(after) = capture_region(client, &check.subject).await
+                        && let Err(error) = save_pixel_artifacts(&check.id, &before, &after)
+                    {
+                        eprintln!("could not save pixel artifacts for {}: {error}", check.id);
                     }
+                    comparison
                 }
                 .await;
                 pixel_outcome = Some(measured);
@@ -5673,9 +5685,9 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::{
         InventoryClass, OutcomeStability, accumulated_hover_signatures, arrival_sample_matches,
-        arrived_without_navigation, capture_node_id, declared_outcome_timeout, duplicate_dom_ids,
-        generated_dom_id, hover_signature_counts, inventory_class, is_pagination_control,
-        measure_ink, name_matches, named_document_is_active,
+        arrived_without_navigation, assess_pixel_change, capture_node_id, declared_outcome_timeout,
+        duplicate_dom_ids, generated_dom_id, hover_signature_counts, inventory_class,
+        is_pagination_control, measure_ink, name_matches, named_document_is_active,
         named_document_is_active_with_permanent, named_document_opener_for, outcome_check_ids,
         outcome_verdict, pagination_advanced, painted_bounds, painted_named, pixels_change,
         pixels_hold, require_transparent_window_tint, resolved_action_target, rgb_pixels_hold,
@@ -5863,6 +5875,36 @@ mod tests {
         assert_eq!(
             rgb_pixels_hold(&before, &visible_colour).unwrap_err(),
             "1 visibly coloured pixel(s) changed after the first hover"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_early_paint_stays_pending_until_the_hover_frame_arrives() {
+        use base64::Engine as _;
+
+        let capture = |rgba: [u8; 4]| CapturedImage {
+            width: 1,
+            height: 1,
+            rgba_base64: base64::engine::general_purpose::STANDARD.encode(rgba),
+            node_id: Some(7),
+        };
+        let before = capture([20, 20, 20, 255]);
+        let unrelated_paint = capture([20, 20, 20, 255]);
+        let hover_paint = capture([12, 20, 20, 255]);
+
+        assert_eq!(
+            assess_pixel_change(&before, &unrelated_paint, false).unwrap(),
+            None,
+            "an earlier reveal/scroll paint must not become the hover verdict"
+        );
+        assert_eq!(
+            assess_pixel_change(&before, &hover_paint, false).unwrap(),
+            Some(()),
+            "the later hover paint completes the verdict"
+        );
+        assert_eq!(
+            assess_pixel_change(&before, &unrelated_paint, true).unwrap_err(),
+            "hover left every rendered pixel unchanged"
         );
     }
 
