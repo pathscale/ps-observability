@@ -169,7 +169,35 @@ fn create_dist_document(dist: &std::path::Path, url: &str) -> Result<ScriptDocum
     trace(&format!("loading page: {}", page_path.display()));
     let index = fs::read_to_string(&page_path)
         .map_err(|error| format!("could not read {}: {error}", page_path.display()))?;
-    let javascript_url = asset_url(&index, "src")?;
+    /*
+     * A page that carries its own markup is served as it stands.
+     *
+     * Everything below rebuilds the document: it pulls the one external
+     * stylesheet and the one external script out of a bundler's `index.html`
+     * and synthesises a shell around them, because that is the shape a
+     * component harness emits and the `<div id="root">` it mounts into is not
+     * in the file.
+     *
+     * That shape is not the only useful one. A repository testing the engine
+     * itself, or a reduction of a bug, writes the markup by hand: a control, a
+     * listener, and a heading naming what the listener saw. Demanding a bundle
+     * from those meant standing up a JavaScript toolchain to assert that a
+     * checkbox toggles, so they went and wrote their own driver instead, which
+     * is how a renderer ends up with two testing stories and one of them
+     * untested.
+     *
+     * Detection is the absence of an external script, not a flag: a hand-written
+     * page has inline script or none, and a built one always has `src=`.
+     */
+    let Ok(javascript_url) = asset_url(&index, "src") else {
+        trace("no external bundle; serving the page as written");
+        let config = DocumentConfig {
+            base_url: Some(url.into()),
+            ..DocumentConfig::default()
+        };
+        return Ok(ScriptDocument::from_html(&index, config));
+    };
+
     let stylesheet_url = asset_url(&index, "href")?;
     let css = read_brotli_asset(dist, stylesheet_url, "external CSS")?;
     let javascript = read_brotli_asset(dist, javascript_url, "external JavaScript")?;
