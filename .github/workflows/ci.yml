@@ -58,13 +58,17 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      # A renderer needs fonts wherever it runs. Not a window stack: the host
-      # takes its runtime with `default-features = false`, so nothing in its
-      # graph is Tauri or GTK, which is what lets this job be here at all.
-      - name: Fontconfig
+      # Nothing is installed for this job, and that is the assertion. The host
+      # serves a socket over a document; it opens no window and reads no font
+      # catalogue, so it should need no system library at all.
+      - name: No system libraries in the graph
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libfontconfig-dev
+          found=$(cargo tree -p qa-inspect-host --edges normal \
+            | grep -ciE 'fontconfig|tauri v|gtk|glib|webkit|soup' || true)
+          if [ "$found" != "0" ]; then
+            echo "the host pulled in $found system-library crates" >&2
+            exit 1
+          fi
       - name: Clippy host
         run: cargo clippy -p qa-inspect-host --all-targets -- -D warnings
       - name: Test real host transport
