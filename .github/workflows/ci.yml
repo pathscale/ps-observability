@@ -67,12 +67,33 @@ jobs:
       # that reads fontconfig's XML, it arrives through `fontdb` behind usvg,
       # and matching it failed this job for a dependency that needs nothing
       # installed.
+      #
+      # `--edges normal,dev`, not `normal`. A dev-dependency is precisely how
+      # this escaped upstream: ps-blitz's `blitz-script` and `blitz-wasm` each
+      # pulled `blitz-dom` with `system-fonts` so their tests could measure
+      # text, which put fontconfig in front of `cargo test` on Linux while the
+      # shipped crates were clean. This job runs `cargo test` below, so the
+      # graph it needs to assert about is the one including dev edges.
+      #
+      # The target is pinned rather than left implicit. `yeslogic-fontconfig-sys`
+      # is reached only on Linux, so a check that inherits the host's target
+      # says nothing the day someone runs it anywhere else.
+      #
+      # ps-blitz#87 has an equivalent gate, as `cargo deny`. It is not a
+      # substitute for this one: that guards ps-blitz's own crates, this guards
+      # the assembled host, which also pulls tauri-runtime-blitz. Worth
+      # converting to `cargo deny` here too, for the same reason the pattern
+      # below had to be corrected once already.
       - name: No system libraries in the graph
         run: |
-          found=$(cargo tree -p qa-inspect-host --edges normal \
+          found=$(cargo tree -p qa-inspect-host --edges normal,dev \
+            --target x86_64-unknown-linux-gnu \
             | grep -ciE 'fontconfig-sys|tauri v|gtk|glib|webkit|soup' || true)
           if [ "$found" != "0" ]; then
             echo "the host pulled in $found system-library crates" >&2
+            cargo tree -p qa-inspect-host --edges normal,dev \
+              --target x86_64-unknown-linux-gnu \
+              | grep -iE 'fontconfig-sys|tauri v|gtk|glib|webkit|soup' >&2 || true
             exit 1
           fi
       - name: Clippy host

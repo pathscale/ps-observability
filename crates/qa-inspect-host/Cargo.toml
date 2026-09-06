@@ -18,18 +18,25 @@ publish = true
 # precisely so that driving a control does not build a browser engine. Keeping
 # the host in its own crate is what lets both stay true.
 [dependencies]
-# `default-features = false` to leave out `system-fonts`, which is a default
-# and which reaches fontconfig on Linux -- a system library, installed to run
-# a headless check.
+# Plain defaults, which as of ps-blitz 0.4.4 no longer include `system-fonts`.
 #
-# Nothing here needs a face. What a check reads is the semantic tree and box
-# geometry, and both survive with no font registered at all: measured over the
-# 14 engine fixtures and all 74 component sweeps, every one passes against a
-# host with none. A document that wants a specific face declares it, the same
-# way it does in a browser; `woff` below is what lets that be fetched.
+# This first said `default-features = false` and then retyped the six remaining
+# defaults by hand to drop the seventh. tauri-runtime-blitz's branch had grown
+# the identical list independently, and two consumers arriving at the same
+# workaround is what showed the problem was upstream: `system-fonts` should
+# never have been a default of `blitz-dom`. A copy of someone else's default
+# list also goes stale the next time they add one, silently and in the
+# direction of dragging in more than you asked for.
 #
-# Everything else here is a default this actually uses.
-blitz-dom = { package = "ps-blitz-dom", version = "^0.4", default-features = false, features = ["accessibility", "svg", "woff", "image-formats", "file-input", "custom-widget"] }
+# Fixed at the source in pathscale/ps-blitz#87, which also adds a `cargo deny`
+# gate there so the default cannot come back.
+#
+# Nothing here needs a face regardless. What a check reads is the semantic tree
+# and box geometry, and both survive with no font registered: measured over the
+# 14 engine fixtures and all 74 component sweeps. A document that wants a
+# specific face declares it, the same way it does in a browser; `woff` is in
+# the default set and is what lets that be fetched.
+blitz-dom = { package = "ps-blitz-dom", version = "^0.4" }
 blitz-script = { package = "ps-blitz-script", version = "^0.4" }
 blitz-traits = { package = "ps-blitz-traits", version = "^0.4" }
 brotli = { version = "^8.0.4", default-features = false, features = ["std"] }
