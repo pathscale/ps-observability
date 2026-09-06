@@ -88,6 +88,34 @@ pub enum Expect {
     /// tree and on no screen, which is how a broken control passes a test that
     /// only asked whether it existed.
     Paints,
+    /// The named node exists in the tree and was laid out, whatever its box
+    /// measures.
+    ///
+    /// For subjects whose observable is *text*. A heading that reports an
+    /// outcome — `Press saw true, left false` — is exactly as wide as its line
+    /// and exactly as tall as its shaped glyphs, so on a host with no font
+    /// registered it lays out at `1328x0` and every box-based assertion about
+    /// it fails while the engine did nothing wrong.
+    ///
+    /// That is not a hypothetical. All six of ps-blitz's activation fixtures
+    /// asserted their outcomes with [`PaintsNamed`](Expect::PaintsNamed) over
+    /// heading text, and all six failed the moment `qa-inspect-host` stopped
+    /// enabling `system-fonts`. They had only ever passed because the host
+    /// carried a font catalogue, which is the thing a headless check must not
+    /// need.
+    ///
+    /// So this asks the question those checks actually mean: did the node the
+    /// document was supposed to produce appear, with the name it was supposed
+    /// to have. It is still falsifiable, and in the two ways that matter:
+    /// naming a heading the document never creates fails on the tree, and a
+    /// node that is created but never laid out fails on the bounds. What it
+    /// deliberately does not assert is that glyphs reached the scene, because
+    /// that is a question about fonts rather than about the engine.
+    ///
+    /// Use [`Paints`](Expect::Paints) or [`PaintsNamed`](Expect::PaintsNamed)
+    /// for anything with a box of its own — a control, a panel, an icon. Those
+    /// are stronger and they cost nothing on a fontless host.
+    Present,
     /// A painted named node is enabled after the action.
     ///
     /// Use this for validation flows where entering a valid value unlocks a
@@ -781,6 +809,47 @@ pub fn verdict(
                 return Err(format!(
                     "{} node(s) matching {:?} should not exist",
                     found.len(),
+                    check.subject
+                ));
+            }
+        }
+        Expect::Present => {
+            if found.is_empty() {
+                let near = after
+                    .iter()
+                    .filter(|node| {
+                        check
+                            .subject
+                            .split_once(':')
+                            .is_some_and(|(role, _)| node.role.eq_ignore_ascii_case(role))
+                    })
+                    .take(3)
+                    .map(|node| format!("{}:{}", node.role, node.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let near = if near.is_empty() {
+                    "none".to_owned()
+                } else {
+                    near
+                };
+                return Err(format!(
+                    "no node matching {:?} exists in the tree; same role present: {near}",
+                    check.subject
+                ));
+            }
+            if !found.iter().any(|node| node.bounds.is_some()) {
+                let state = found
+                    .iter()
+                    .map(|node| {
+                        format!(
+                            "id={} parent={:?} visible={}",
+                            node.id, node.parent, node.visible
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!(
+                    "node(s) matching {:?} exist but none was laid out ({state})",
                     check.subject
                 ));
             }
