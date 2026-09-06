@@ -160,8 +160,28 @@ pub(crate) async fn locate_control(
         let mut candidates: Vec<_> = snapshot
             .nodes
             .iter()
+            /*
+             * The role gate is skipped for a selector that already names one
+             * exact node.
+             *
+             * `#id` and `@slot` identify a single element by what the author
+             * wrote, which is the reason `dom_id` is carried at all. Deciding
+             * first that only interactive roles are addressable threw those
+             * away before the selector was ever consulted, so a `<label>` --
+             * `generic`, with an id, painted and enabled -- could not be
+             * pressed by any spelling. That is not a niche shape: it is how
+             * every switch and styled checkbox on the web is built, the visible
+             * thing a person actually hits, and the only way to press a control
+             * the way its own markup intends.
+             *
+             * A name or `role:name` still goes through the gate. Those are
+             * descriptions rather than identities, and matching them against
+             * every generic node in a document would make one ambiguous.
+             */
             .filter(|n| {
-                roles.contains(&"*")
+                selector_dom_id(want).is_some()
+                    || selector_slot(want).is_some()
+                    || roles.contains(&"*")
                     || roles.is_empty() && reach::interactive(n)
                     || roles.contains(&n.role.as_str())
             })
