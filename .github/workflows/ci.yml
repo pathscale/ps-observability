@@ -61,10 +61,16 @@ jobs:
       # Nothing is installed for this job, and that is the assertion. The host
       # serves a socket over a document; it opens no window and reads no font
       # catalogue, so it should need no system library at all.
+      #
+      # `fontconfig-sys`, not `fontconfig`: the pattern is for crates that link
+      # a system library, and `fontconfig-parser` is not one. It is pure Rust
+      # that reads fontconfig's XML, it arrives through `fontdb` behind usvg,
+      # and matching it failed this job for a dependency that needs nothing
+      # installed.
       - name: No system libraries in the graph
         run: |
           found=$(cargo tree -p qa-inspect-host --edges normal \
-            | grep -ciE 'fontconfig|tauri v|gtk|glib|webkit|soup' || true)
+            | grep -ciE 'fontconfig-sys|tauri v|gtk|glib|webkit|soup' || true)
           if [ "$found" != "0" ]; then
             echo "the host pulled in $found system-library crates" >&2
             exit 1
