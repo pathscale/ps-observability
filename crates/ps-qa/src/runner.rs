@@ -764,17 +764,45 @@ fn start_host(
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(stdout);
         let mut line = String::new();
-        let _ = reader.read_line(&mut line);
-        let _ = tx.send(line);
+        let mut announced = false;
 
+        /*
+         * The descriptor is the first line that looks like one, not the first
+         * line.
+         *
+         * The page shares this pipe. Anything it writes to the console arrives
+         * on the host's stdout, and taking line one unconditionally meant a
+         * single `console.log` during startup was read as a path -- reported as
+         * "the host never announced a descriptor", which points at the host and
+         * at the component, and is wrong about both.
+         *
+         * Found on @pathscale/ui's ThemeColorPicker, which logs once about CSP
+         * blocking inline styles. It had never logged before because the code
+         * that logs was unreachable without `localStorage`, so a harness change
+         * unrelated to it made a component that works look like a component
+         * that will not start. Every component that logs anything at startup
+         * was one line away from the same thing.
+         *
+         * A descriptor is a `.json` path the host has already created by the
+         * time it prints it, so both halves are checkable. Everything else is
+         * forwarded as the diagnostic it is.
+         */
+        while reader.read_line(&mut line).unwrap_or_default() > 0 {
+            let text = line.trim();
+            if !announced
+                && text.ends_with(".json")
+                && std::path::Path::new(text).is_file()
+            {
+                announced = true;
+                let _ = tx.send(text.to_owned());
+            } else if !text.is_empty() {
+                eprintln!("host: {text}");
+            }
+            line.clear();
+        }
         // Keep consuming stdout for the lifetime of the host. Closing the
         // pipe after the descriptor line would deliver EPIPE if a host emits
         // later diagnostics and could terminate an otherwise healthy sweep.
-        let mut diagnostic = String::new();
-        while reader.read_line(&mut diagnostic).unwrap_or_default() > 0 {
-            eprint!("host: {diagnostic}");
-            diagnostic.clear();
-        }
     });
 
     match rx.recv_timeout(startup_timeout) {
