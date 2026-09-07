@@ -789,10 +789,7 @@ fn start_host(
          */
         while reader.read_line(&mut line).unwrap_or_default() > 0 {
             let text = line.trim();
-            if !announced
-                && text.ends_with(".json")
-                && std::path::Path::new(text).is_file()
-            {
+            if !announced && text.ends_with(".json") && std::path::Path::new(text).is_file() {
                 announced = true;
                 let _ = tx.send(text.to_owned());
             } else if !text.is_empty() {

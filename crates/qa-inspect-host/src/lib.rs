@@ -35,9 +35,9 @@ use blitz_dom::Document;
 use blitz_dom::DocumentConfig;
 use blitz_script::{DefaultScriptFetcher, FetchError, ScriptDocument, ScriptFetcher};
 use brotli::Decompressor;
-use std::num::NonZeroUsize;
 use std::fs;
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use url::Url;
 
