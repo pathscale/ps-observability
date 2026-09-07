@@ -35,6 +35,7 @@ use blitz_dom::Document;
 use blitz_dom::DocumentConfig;
 use blitz_script::{DefaultScriptFetcher, FetchError, ScriptDocument, ScriptFetcher};
 use brotli::Decompressor;
+use std::num::NonZeroUsize;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -484,28 +485,69 @@ pub fn serve() -> Result<(), String> {
                 }
                 AgentControlRequest::Act(AgentAction::SetValue { node_id, value }) => {
                     let node_id = blitz_dom::NodeId::from_u64(node_id);
-                    if !document
+                    let current = document
                         .inner()
                         .get_node(node_id)
                         .and_then(|node| node.element_data())
-                        .is_some_and(|element| element.text_input_data().is_some())
-                    {
-                        DebugResponse::Error(DebugError {
+                        .and_then(|element| element.text_input_data())
+                        .map(|input| input.editor.text().to_string());
+                    match current {
+                        None => DebugResponse::Error(DebugError {
                             code: "notEditable".into(),
                             message: "node is not a text input".into(),
-                        })
-                    } else {
-                        document.inner_mut().set_focus_to(node_id);
-                        document
-                            .inner_mut()
-                            .with_text_input(node_id, |mut editor| editor.select_all());
-                        document.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(value)));
-                        settle_response(
-                            &mut document,
-                            &animation_clock,
-                            settle_deadline,
-                            &mut painted,
-                        )
+                        }),
+                        Some(current) => {
+                            document.inner_mut().set_focus_to(node_id);
+                            /*
+                             * Clear by byte count, not by selecting the text
+                             * first.
+                             *
+                             * `select_all` builds its selection with
+                             * `move_lines(&layout, isize::MAX)`, and
+                             * `select_byte_range` resolves its ends through
+                             * `Cursor::from_byte_index(&layout, ..)`. Both read
+                             * the *laid out* text, and this host has no font
+                             * catalogue: every glyph shapes to nothing, so
+                             * there are no lines to walk, the selection comes
+                             * back collapsed, and the commit below inserts at
+                             * the caret instead of replacing.
+                             *
+                             * Setting a pre-filled field therefore appended to
+                             * it. Measured on @pathscale/ui: InlineEdit
+                             * committed "Original titleRenamed title", and the
+                             * connection panel built
+                             * "wss://api.example.comws://qa-committed" and then
+                             * correctly refused it as not an address -- a
+                             * component reported broken for doing its job on a
+                             * value the harness had mistyped.
+                             *
+                             * `delete_bytes_before_selection` and
+                             * `delete_bytes_after_selection` do byte arithmetic
+                             * on the buffer and clamp to its ends, so between
+                             * them they empty it from wherever the caret is,
+                             * with no layout involved. The commit then inserts
+                             * into an empty field, which is what `select_all`
+                             * was reaching for on a host that can shape text.
+                             */
+                            if let Some(len) = NonZeroUsize::new(current.len()) {
+                                document.inner_mut().with_text_input(
+                                    node_id,
+                                    |mut editor| {
+                                        editor.delete_bytes_before_selection(len);
+                                        editor.delete_bytes_after_selection(len);
+                                    },
+                                );
+                            }
+                            document.handle_ui_event(UiEvent::Ime(
+                                BlitzImeEvent::Commit(value),
+                            ));
+                            settle_response(
+                                &mut document,
+                                &animation_clock,
+                                settle_deadline,
+                                &mut painted,
+                            )
+                        }
                     }
                 }
                 AgentControlRequest::Act(AgentAction::Input(InputCommand::Key {
