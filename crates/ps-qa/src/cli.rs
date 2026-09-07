@@ -108,6 +108,32 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub require_paint_events: bool,
 
+    /// Target controls the renderer laid out but did not paint, and press them
+    /// by node id.
+    ///
+    /// For a host with no font catalogue, which is what a Linux CI runner is
+    /// and what `qa-inspect-host` is on any platform now that nothing enables
+    /// `system-fonts`. Text there shapes to no glyphs, so a control whose whole
+    /// size comes from its label lays out at its line width and zero height --
+    /// `button:Open dialog` is in the tree, enabled, with a box, and is
+    /// rejected by the geometry gate that every coordinate-driven step needs.
+    ///
+    /// A click does not need that gate: the protocol's `Click` takes a node id,
+    /// so pressing a zero-height control is exactly as well defined as pressing
+    /// a tall one. What is genuinely unavailable is everything that reasons
+    /// about where a box is -- scrolling one into view, pressing a real pointer
+    /// at a coordinate -- so this mode does not attempt it: an off-screen
+    /// control is pressed where it is rather than scrolled to first.
+    ///
+    /// It buys functional coverage on a host that cannot render text. It does
+    /// not make a visual assertion meaningful there, and it is not a substitute
+    /// for running the same checks on a host with fonts.
+    ///
+    /// `PS_QA_HEADLESS=true` sets it too, so a CI job states it once in its
+    /// environment rather than on every invocation.
+    #[arg(long, global = true, env = "PS_QA_HEADLESS")]
+    pub headless: bool,
+
     /// Save before/after PPM captures for failed pixel checks.
     #[arg(long, global = true)]
     pub pixel_artifact_dir: Option<PathBuf>,
@@ -547,6 +573,7 @@ static TRACE_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 static REQUIRE_PAINT_EVENTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static PIXEL_ARTIFACT_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The inter-event delay, in seconds. Set once, from `main`, for the same
 /// reason as `TRACE`.
@@ -570,6 +597,12 @@ pub fn set_capture_options(
     TRACE_CAPTURE.store(trace_capture, std::sync::atomic::Ordering::Relaxed);
     REQUIRE_PAINT_EVENTS.store(require_paint_events, std::sync::atomic::Ordering::Relaxed);
     let _ = PIXEL_ARTIFACT_DIR.set(pixel_artifact_dir);
+}
+
+/// Record whether unpainted controls may be targeted. Called once, from
+/// `main`.
+pub fn set_headless(on: bool) {
+    HEADLESS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Record the inter-event delay. Called once, from `main`.
@@ -614,6 +647,14 @@ pub fn trace() -> bool {
 
 pub fn trace_capture() -> bool {
     TRACE_CAPTURE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a control the renderer laid out but did not paint may be targeted.
+///
+/// True on a host with no fonts, where a text-labelled control has a box of
+/// zero height and is otherwise perfectly pressable by node id.
+pub fn headless() -> bool {
+    HEADLESS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn require_paint_events() -> bool {

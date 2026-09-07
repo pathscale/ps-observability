@@ -28,6 +28,26 @@ pub(crate) fn painted_bounds(node: &SemanticNode) -> Option<[f64; 4]> {
         .filter(|bounds| bounds[2] > 0.0 && bounds[3] > 0.0)
 }
 
+/// The box a control can be *pressed* by, which is not the same question.
+///
+/// A press is dispatched as `AgentAction::Click { node_id }`, so it needs the
+/// renderer to have laid the node out -- not to have given it area. Those come
+/// apart on a host with no font catalogue: `button:Open dialog` is sized
+/// entirely by its label, and with no glyphs it lays out at its line width and
+/// zero height. It is in the tree, enabled, and pressing it works; only the
+/// geometry gate rejects it.
+///
+/// Off by default, because a zero-area box is normally a retained hidden
+/// control and pressing one is a bug. `--headless` says the host cannot paint
+/// text, which is the case where it is not.
+fn targetable_bounds(node: &SemanticNode) -> Option<[f64; 4]> {
+    match painted_bounds(node) {
+        Some(bounds) => Some(bounds),
+        None if cli::headless() => node.bounds,
+        None => None,
+    }
+}
+
 /// Whether a named check target currently occupies a box in the live tree.
 ///
 /// `role:name` is accepted for precise subjects such as rename textboxes; bare
@@ -191,8 +211,8 @@ pub(crate) async fn locate_control(
             // that retained node still owns a stale non-zero layout box. Letting
             // geometry overrule visibility selected a closed menu's old item
             // instead of the mounted item with the same accessible name.
-            .filter(|node| node.visible)
-            .filter_map(|node| painted_bounds(node).map(|bounds| (node, bounds)))
+            .filter(|node| node.visible || cli::headless())
+            .filter_map(|node| targetable_bounds(node).map(|bounds| (node, bounds)))
             .collect();
         // An explicit accessible name excludes broader substring matches.
         // Sorting is not strong enough here: an on-screen substring can still

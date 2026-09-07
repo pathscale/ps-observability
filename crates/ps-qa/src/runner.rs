@@ -1772,10 +1772,44 @@ async fn run_qa(
         let mut action_error = open_error;
         let mut action_target = None;
         let mut action_node_id = None;
+        /*
+         * Typing first, then the press.
+         *
+         * The click block used to run before this one, so a check declaring
+         * `type_into`, `text` and `click` pressed the button and then typed
+         * into the field -- the opposite of what every one of those checks
+         * reads as, and of what the `what` line beside it claims. It stayed
+         * invisible because the only shapes in use were type-then-key (right by
+         * accident, since `key` came last) and click-alone. The one check that
+         * used both, @pathscale/ui's "saving commits what was typed", reported
+         * a dead Save button for a panel whose Save worked: the press ran
+         * against an empty draft, and the keystroke arrived afterwards.
+         *
+         * Click-then-type is still expressible, and was always the better
+         * spelling for it: `prepare` is the field for an action that has to
+         * happen before the one under test.
+         */
+        if action_error.is_none()
+            && let Some(text) = check.text.as_deref()
+        {
+            if check.key.is_none() && check.click.is_none() {
+                check_started = Some(Instant::now());
+            }
+            if let Some(field) = check.type_into.as_deref() {
+                match type_text(client, field, text).await {
+                    Ok(node_id) => action_node_id = Some(node_id),
+                    Err(error) => {
+                        action_error = Some(format!("could not type into {field:?}: {error}"));
+                    }
+                }
+            } else {
+                action_error = Some("text requires type_into".to_owned());
+            }
+        }
         if action_error.is_none()
             && let Some(want) = check.click.as_deref()
         {
-            if check.text.is_none() && check.key.is_none() {
+            if check.key.is_none() {
                 check_started = Some(Instant::now());
             }
             if check.expect == qa::Expect::TargetPaints && !check.press {
@@ -1791,29 +1825,17 @@ async fn run_qa(
             )
             .await;
             action_error = driven.as_ref().err().cloned();
-            action_node_id = driven.ok().flatten();
+            // The typed field stays the addressed node when a check does both:
+            // `action_node_id` is what an outcome carried by id is compared
+            // against, and for "type this, then save" that is the field.
+            if check.text.is_none() {
+                action_node_id = driven.ok().flatten();
+            }
             // The exact declared outcome below polls the renderer. A generic
             // whole-tree settle here both duplicates that work and waits on
             // unrelated background updates.
         }
 
-        if action_error.is_none()
-            && let Some(text) = check.text.as_deref()
-        {
-            if check.key.is_none() {
-                check_started = Some(Instant::now());
-            }
-            if let Some(field) = check.type_into.as_deref() {
-                match type_text(client, field, text).await {
-                    Ok(node_id) => action_node_id = Some(node_id),
-                    Err(error) => {
-                        action_error = Some(format!("could not type into {field:?}: {error}"));
-                    }
-                }
-            } else {
-                action_error = Some("text requires type_into".to_owned());
-            }
-        }
         if action_error.is_none()
             && let Some(key) = check.key.as_deref()
         {
@@ -5022,6 +5044,7 @@ async fn run_cover(
 pub async fn run() -> Result<()> {
     let cli = <cli::Cli as clap::Parser>::parse();
     cli::set_trace(cli.trace);
+    cli::set_headless(cli.headless);
     cli::set_pace(cli.pace);
     cli::set_timeout_scale(cli.timeout_scale);
     cli::set_capture_options(
