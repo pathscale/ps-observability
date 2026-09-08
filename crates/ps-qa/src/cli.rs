@@ -88,9 +88,14 @@ pub struct Cli {
     /// Multiply interaction and rendered-outcome deadlines on an overloaded
     /// runner. The default remains the strict local latency contract; CI must
     /// opt in explicitly rather than silently weakening every check.
+    ///
+    /// `QA_TIMEOUT_SCALE` sets the same thing. A workflow sets it once for the
+    /// job rather than repeating a flag on every invocation, and the fleet's
+    /// workflows were already written that way while nothing read it.
     #[arg(
         long,
         global = true,
+        env = "QA_TIMEOUT_SCALE",
         default_value_t = 1.0,
         value_parser = parse_timeout_scale
     )]
