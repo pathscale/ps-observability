@@ -3646,7 +3646,17 @@ fn inventory_class(
     isolated: bool,
     duplicate_ids: &std::collections::HashSet<String>,
 ) -> InventoryClass {
-    if node.dom_id.as_deref().is_none_or(|id| id.trim().is_empty()) {
+    // The declared exceptions come first. A control the application has
+    // excluded from the audit -- a link that leaves for a third party, a
+    // native panel, a session-ending action -- is never going to be addressed
+    // by a check, so failing it for the addressability a check would have
+    // needed reports a defect that cannot be fixed except by withdrawing the
+    // exception.
+    if manual {
+        InventoryClass::Manual
+    } else if isolated {
+        InventoryClass::Isolated
+    } else if node.dom_id.as_deref().is_none_or(|id| id.trim().is_empty()) {
         InventoryClass::MissingId
     } else if node.dom_id.as_deref().is_some_and(generated_dom_id) {
         InventoryClass::UnstableId
@@ -3656,10 +3666,6 @@ fn inventory_class(
         .is_some_and(|id| duplicate_ids.contains(id))
     {
         InventoryClass::DuplicateId
-    } else if manual {
-        InventoryClass::Manual
-    } else if isolated {
-        InventoryClass::Isolated
     } else if node.name.trim().is_empty() {
         InventoryClass::Anonymous
     } else if !reach::onscreen(node) {
