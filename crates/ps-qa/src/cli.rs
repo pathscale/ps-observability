@@ -112,8 +112,8 @@ pub struct Cli {
     /// by node id.
     ///
     /// For a host with no font catalogue, which is what a Linux CI runner is
-    /// and what `qa-inspect-host` is on any platform now that nothing enables
-    /// `system-fonts`. Text there shapes to no glyphs, so a control whose whole
+    /// and what any host built without `system-fonts` is on every platform.
+    /// Text there shapes to no glyphs, so a control whose whole
     /// size comes from its label lays out at its line width and zero height --
     /// `button:Open dialog` is in the tree, enabled, with a box, and is
     /// rejected by the geometry gate that every coordinate-driven step needs.
@@ -764,7 +764,7 @@ mod tests {
             "qa-hosted",
             "fixture-text-entry",
             "--host",
-            "qa-inspect-host",
+            "chuzz-headless",
             "--page",
             "page.html",
             "--checks",
@@ -783,7 +783,7 @@ mod tests {
             panic!("qa-hosted did not parse as the hosted QA command");
         };
         assert_eq!(selector.as_deref(), Some("fixture-text-entry"));
-        assert_eq!(host, PathBuf::from("qa-inspect-host"));
+        assert_eq!(host, PathBuf::from("chuzz-headless"));
         assert_eq!(page, PathBuf::from("page.html"));
         assert_eq!(checks, Some(PathBuf::from("checks")));
         assert_eq!(startup_timeout, 30);

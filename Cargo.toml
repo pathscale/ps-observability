@@ -4,7 +4,6 @@ members = [
     "crates/blitz-control-protocol",
     "crates/ps-blitz-debug-control",
     "crates/ps-qa",
-    "crates/qa-inspect-host",
 ]
 
 [workspace.package]

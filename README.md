@@ -1,17 +1,31 @@
 # ps-observability
 
 The observability and QA stack for native Blitz applications. This workspace
-keeps the protocol, transports, renderer host, driver, fixtures, and release
-documentation together so the system has one ownership boundary.
+keeps the protocol, transports, driver, and release documentation together so
+the system has one ownership boundary.
 
 ```text
 application ── tauri-runtime-blitz ── blitz-control-protocol ── ps-qa
-                      ▲                         ▲
-                      │                         │
-               qa-inspect-host ────────────────┘
+                                              ▲
+                                              │
+                       chuzz-headless ────────┘
 
 renderer embedder ── ps-blitz-debug-control ── WebDriver-style HTTP client
 ```
+
+The headless host is not here. It used to be, as `qa-inspect-host`, and that
+made two headless browsers: one a person browses with and one QA drives, with
+the web platform in only the first of them. A host without `URLSearchParams`,
+`matchMedia`, storage, the observers and `performance.getEntriesByType` blanks
+every routed page before its first render, so every gap closed for the browser
+had to be closed a second time here, by hand, or the harness measured a browser
+nobody ships.
+
+So the host is a mode of the browser now: `chuzz-headless`, in
+[pathscale/chuzz](https://github.com/pathscale/chuzz), which loads through the
+same loader and the same engine a tab uses and serves this protocol over the
+same socket. `ps-qa` still links no renderer, because that constraint was
+always about the socket rather than about which repository the host lives in.
 
 These are two deliberate alternatives, not two stacked transports.
 `blitz-control-protocol` is the typed MCP/JSON-RPC inspection plane used by
@@ -30,34 +44,42 @@ instrumentation hooks but do not own a control server.
 - `blitz-control-protocol`: transport-neutral observability domain types and
   their MCP wire encoding. It deliberately has no renderer dependency.
 - `ps-blitz-debug-control`: loopback WebDriver-style transport adapter.
-- `qa-inspect-host`: a real renderer host for headless fixtures and CI.
 - `ps-qa`: the lightweight driver, audit runner, and report generator.
 
 ## Quick start
 
-From this workspace, install the driver and build the real headless renderer
-host:
+Install the driver, and build the host from the chuzz checkout beside this one:
 
 ```zsh
 cargo install ps-qa
-cargo build -p qa-inspect-host
+cargo build --manifest-path ../chuzz/Cargo.toml --bin chuzz-headless --release
 ```
 
-Start the supplied renderer fixture in one terminal:
+Serve one page in one terminal. A directory is served as a site, on a loopback
+origin, so a built application's absolute asset paths and its client routing
+both work; a single file or an `http(s)` URL is taken as given:
 
 ```zsh
-QA_INSPECT_PAGE="$PWD/crates/qa-inspect-host/tests/fixture/page.html" \
-  target/debug/qa-inspect-host
+../chuzz/target/release/chuzz-headless ../support.cafe/dist
 ```
 
-The host prints its descriptor path when ready. In a second terminal, run the
-fixture's outcome check; `ps-qa` discovers the live descriptor automatically:
+The host prints its descriptor path when ready. In a second terminal, drive it;
+`ps-qa` discovers the live descriptor automatically:
 
 ```zsh
-ps-qa \
-  --app crates/qa-inspect-host/tests/fixture/ps-qa.ron \
-  qa fixture-text-entry \
-  --checks crates/qa-inspect-host/tests/fixture/checks
+ps-qa find --role button
+ps-qa audit
+```
+
+`qa-hosted` does both halves at once, launching the host, running a group of
+checks and stopping it again:
+
+```zsh
+ps-qa --app tests/ps-qa/ps-qa.ron \
+  qa-hosted \
+  --host ../chuzz/target/release/chuzz-headless \
+  --page dist \
+  --checks tests/ps-qa
 ```
 
 This is a renderer-backed check: it enters text through the control protocol
@@ -82,10 +104,9 @@ browser remote-debugging port and must remain disabled in production builds.
 
 The protocol, HTTP transport, and `ps-qa` driver are continuously checked on
 Linux; `ps-qa` connects through a Unix-domain socket and currently supports
-macOS and Linux, not Windows. The renderer-backed `qa-inspect-host` artifact is
-currently validated on macOS. Linux renderer-host packaging remains explicit
-follow-up work, so “headless” here means no window or display interaction—not a
-claim that the current host package has completed Linux portability.
+macOS and Linux, not Windows. The host's own platform status belongs to chuzz
+now, and "headless" there means no window or display interaction rather than a
+claim about which platforms the host has been packaged for.
 
 ## Releases
 

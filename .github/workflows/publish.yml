@@ -79,4 +79,3 @@ jobs:
           # The host embeds tauri-runtime-blitz, which in turn consumes the
           # protocol above. Keep it last so a new protocol and driver can ship
           # before the corresponding runtime release reaches crates.io.
-          publish_if_new qa-inspect-host
