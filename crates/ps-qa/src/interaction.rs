@@ -9,7 +9,7 @@ use blitz_control_protocol::{
 };
 use eyre::{Result, bail, eyre};
 
-use crate::diagnostics::metrics;
+use crate::diagnostics::metrics_if_supported;
 use crate::inspector::{Client, inspect};
 use crate::target::{locate_control, selector_matches_node};
 use crate::timing::{pace, sleep_pace};
@@ -315,7 +315,7 @@ pub(crate) async fn type_keys(client: &mut Client, count: usize, want: &str) -> 
         }))
         .await?;
 
-    let before = metrics(client).await?;
+    let before = metrics_if_supported(client).await?;
     let mut latencies = Vec::with_capacity(count);
     for index in 0..count {
         let letter = (b'a' + (index % 26) as u8) as char;
@@ -335,12 +335,10 @@ pub(crate) async fn type_keys(client: &mut Client, count: usize, want: &str) -> 
         latencies.push(started.elapsed().as_secs_f64() * 1000.0);
         sleep_pace().await;
     }
-    let after = metrics(client).await?;
+    let after = metrics_if_supported(client).await?;
 
     report::show_latencies("keystrokes", count, &mut latencies);
-    report::show("before", &before);
-    report::show("after", &after);
-    report::show_delta(&before, &after, count);
+    report_frames(before.as_ref(), after.as_ref(), count);
     Ok(())
 }
 
@@ -385,7 +383,7 @@ pub(crate) async fn click_named(client: &mut Client, want: &str) -> Result<()> {
     // of the viewport gets a `pointerdown` at a point nothing is at and no
     // click at all. "Show 12 earlier messages" sat at y=-2246 and every attempt
     // to press it read as the button doing nothing.
-    let before = metrics(client).await?;
+    let before = metrics_if_supported(client).await?;
     let started = Instant::now();
     client
         .agent(&AgentControlRequest::Act(AgentAction::Click {
@@ -393,11 +391,29 @@ pub(crate) async fn click_named(client: &mut Client, want: &str) -> Result<()> {
         }))
         .await?;
     let ack = started.elapsed().as_secs_f64() * 1000.0;
-    let after = metrics(client).await?;
+    let after = metrics_if_supported(client).await?;
 
     println!("click acked in {ack:.1}ms");
-    report::show("before", &before);
-    report::show("after", &after);
-    report::show_delta(&before, &after, 1);
+    report_frames(before.as_ref(), after.as_ref(), 1);
     Ok(())
+}
+
+/// The frame numbers either side of an action, when there are any.
+///
+/// A headless host has no compositor and says so. The click still happened and
+/// its acknowledgement is still timed; what is missing is the frame context,
+/// and saying that out loud is better than printing zeroes that read as a
+/// renderer doing nothing.
+fn report_frames(
+    before: Option<&blitz_control_protocol::RendererMetrics>,
+    after: Option<&blitz_control_protocol::RendererMetrics>,
+    actions: usize,
+) {
+    let (Some(before), Some(after)) = (before, after) else {
+        println!("frames: the host reports no renderer metrics; it has no compositor");
+        return;
+    };
+    report::show("before", before);
+    report::show("after", after);
+    report::show_delta(before, after, actions);
 }

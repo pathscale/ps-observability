@@ -184,6 +184,20 @@ impl std::fmt::Display for InspectorResponseError {
 
 impl std::error::Error for InspectorResponseError {}
 
+/// Whether a host refused a request because it does not have the thing asked
+/// for, rather than because something went wrong.
+///
+/// The distinction matters for a headless host. It owns a document and no
+/// compositor, so there are no frame metrics to report and saying "unsupported"
+/// is the true answer. A caller that only wanted the numbers as context can
+/// carry on without them; one that exists to judge frame timing cannot, and
+/// should still fail.
+pub fn is_unsupported(error: &eyre::Report) -> bool {
+    error
+        .downcast_ref::<InspectorResponseError>()
+        .is_some_and(|refusal| refusal.code == "unsupported")
+}
+
 impl Client {
     fn queue_event(&mut self, event: DebugEvent) {
         if self.events.len() == MAX_QUEUED_EVENTS {
