@@ -575,6 +575,14 @@ pub fn checks(dir: Option<&std::path::Path>) -> Result<Vec<Check>, String> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "ron"))
+        // The application profile is not a check group.
+        //
+        // The documented layout puts `ps-qa.ron` beside the checks, and this
+        // glob then read it as one and failed the whole run with
+        // "Expected opening `[`" at line 5 -- pointing at the profile's
+        // syntax, which is correct, rather than at the file being included by
+        // mistake. The documented layout could not be used.
+        .filter(|path| path.file_name().is_some_and(|name| name != "ps-qa.ron"))
         .collect();
     // Name order, so a run is reproducible rather than dependent on whatever
     // order the filesystem happens to hand back.
