@@ -2277,6 +2277,14 @@ fn merge_outcome_snapshot(
     scoped
 }
 
+/// How often a scoped outcome poll re-reads the whole document.
+///
+/// The scope exists so a settling poll does not serialise a large tree every
+/// turn. The interval exists so it cannot be blind to the rest of the page for
+/// a whole deadline. Long enough that the saving is real, short enough that a
+/// three-second check gets a dozen chances to see a change outside its pane.
+const FULL_DOCUMENT_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Wait for the declared result, not merely for a tree that already contains
 /// the subject.
 ///
@@ -2298,7 +2306,9 @@ async fn settle_for_outcome(
     let mut stability = OutcomeStability::default();
     let mut iterations = 0;
     let mut scope = outcome_poll_scope(before);
-    let mut probed_full_document = false;
+    // When the whole tree was last serialised, so a scoped poll cannot go
+    // permanently blind to the rest of the page. See the interval below.
+    let mut last_full_probe: Option<tokio::time::Instant> = None;
     let event_driven = client.arm_paint_events().await.unwrap_or(false);
     loop {
         let mut after = if let Some(scoped) = scope.as_ref() {
@@ -2319,13 +2329,21 @@ async fn settle_for_outcome(
         let now = tokio::time::Instant::now();
         let mut passing =
             outcome_verdict(check, before, &after.nodes, action_target, action_node_id).is_ok();
-        if !passing && scope.is_some() && !probed_full_document {
-            // Portalled dialogs and global toasts may live outside the active
-            // pane. Probe the full document once when the scoped verdict says
-            // the result is absent; subsequent stability samples remain
-            // scoped if the outcome belongs to the pane after all.
+        let due_for_full_probe = last_full_probe
+            .is_none_or(|at| now.duration_since(at) >= FULL_DOCUMENT_PROBE_INTERVAL);
+        if !passing && scope.is_some() && due_for_full_probe {
+            // Portalled dialogs, global toasts and a shell whose header is not
+            // in the active pane all live outside the scope. Probe the whole
+            // tree when the scoped verdict says the result is absent, and keep
+            // probing on an interval rather than once: a sign-in that swaps a
+            // header Login for a Logout is exactly this shape, and a one-shot
+            // probe taken before the swap left the poll scoped for the rest of
+            // its deadline. Measured on honey.id, where thirty seconds of
+            // polling never saw a control a single fresh snapshot found at
+            // once. Between probes the stability samples stay scoped, which is
+            // what keeps this from serialising the document every turn.
             after = inspect(client).await?.0;
-            probed_full_document = true;
+            last_full_probe = Some(now);
             passing =
                 outcome_verdict(check, before, &after.nodes, action_target, action_node_id).is_ok();
             scope = if passing {
