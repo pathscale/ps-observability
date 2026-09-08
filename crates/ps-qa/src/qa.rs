@@ -99,8 +99,8 @@ pub enum Expect {
     ///
     /// That is not a hypothetical. All six of ps-blitz's activation fixtures
     /// asserted their outcomes with [`PaintsNamed`](Expect::PaintsNamed) over
-    /// heading text, and all six failed the moment `qa-inspect-host` stopped
-    /// enabling `system-fonts`. They had only ever passed because the host
+    /// heading text, and all six failed the moment the host of the day stopped
+    /// enabling `system-fonts`. They had only ever passed because that host
     /// carried a font catalogue, which is the thing a headless check must not
     /// need.
     ///

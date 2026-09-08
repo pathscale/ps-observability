@@ -743,9 +743,10 @@ fn start_host(
 
     let mut child = HostProcess(
         std::process::Command::new(host)
-            // The page this host is to serve. `QA_INSPECT_PAGE` is
-            // `qa-inspect-host`'s interface; a host with a different one can
-            // read its own environment and ignore this.
+            // The page this host is to serve. The variable is the host
+            // interface, not a particular host's: `chuzz-headless` reads it,
+            // and a host with a different one can read its own environment and
+            // ignore this.
             .env("QA_INSPECT_PAGE", page)
             .stdout(std::process::Stdio::piped())
             // Host diagnostics belong to the sweep artifact. Discarding them
