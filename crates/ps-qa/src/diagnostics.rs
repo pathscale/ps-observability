@@ -21,6 +21,22 @@ pub(crate) async fn metrics(client: &mut Client) -> Result<RendererMetrics> {
     }
 }
 
+/// Frame metrics when the host has them, and `None` when it says it does not.
+///
+/// A headless host is a document with no compositor: there are no frames, so
+/// there is nothing to count. Commands that only print the numbers as context
+/// around an action use this and carry on without them. Commands that exist to
+/// judge frame timing -- `idle`, `frames`, `drift`, `blink` -- keep using
+/// [`metrics`] and keep failing, because a zeroed reading from a host that
+/// never painted would pass every one of them while proving nothing.
+pub(crate) async fn metrics_if_supported(client: &mut Client) -> Result<Option<RendererMetrics>> {
+    match metrics(client).await {
+        Ok(metrics) => Ok(Some(metrics)),
+        Err(error) if crate::inspector::is_unsupported(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) async fn transcript(client: &mut Client) -> Result<()> {
     let answer = client
         .diagnostics(&DiagnosticsRequest::Snapshot(SnapshotRequest {
