@@ -8,6 +8,7 @@ use blitz_control_protocol::{
 use eyre::{Result, bail};
 
 use crate::inspector::{Client, inspect};
+use crate::target::{selector_matches_node, unmatched_selector_reason};
 use crate::{reach, report};
 
 pub(crate) async fn metrics(client: &mut Client) -> Result<RendererMetrics> {
@@ -477,10 +478,33 @@ pub(crate) async fn dom(client: &mut Client, want: &str, depth: usize) -> Result
         )
     };
 
+    /*
+     * The selector grammar first, free text second.
+     *
+     * `dom` is the tool an author reaches for when a check cannot find its
+     * subject, so it has to answer the same question the check asked. Matching
+     * only `name.contains || role.contains` meant a subject spelled
+     * `role:name`, `#id` or `@slot` reported zero matches here while the same
+     * spelling addressed a node perfectly well in a check, which sends the
+     * reader looking for a missing element instead of at their selector.
+     *
+     * Free-text substring search over name, role and value is still what a
+     * bare word does: exploring a document you do not know yet is the other
+     * half of this command's job, and a selector is not always what you have.
+     */
+    if let Some(reason) = unmatched_selector_reason(&snapshot.nodes, want) {
+        bail!("{want:?} selects nothing in this document: {reason}");
+    }
+    let grammar = want.starts_with('#')
+        || want.starts_with('@')
+        || crate::target::selector_role(want).is_some();
     let matched: Vec<&SemanticNode> = snapshot
         .nodes
         .iter()
         .filter(|node| {
+            if grammar {
+                return selector_matches_node(node, want);
+            }
             node.name.contains(want)
                 || node.role.contains(want)
                 || node.value.as_deref().is_some_and(|v| v.contains(want))

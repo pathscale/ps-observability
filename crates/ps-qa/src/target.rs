@@ -361,6 +361,64 @@ pub(crate) fn selector_matches_node(node: &SemanticNode, selector: &str) -> bool
     name_matches(&node.name, selector)
 }
 
+/// The role half of a `role:name` selector, when the selector has one.
+///
+/// A role is a single token, which is what separates the selector grammar from
+/// an accessible name that happens to contain a colon: `link:crates.vip` names
+/// a role, `Default permission: Auto` does not.
+pub(crate) fn selector_role(selector: &str) -> Option<&str> {
+    if selector.starts_with('#') || selector.starts_with('@') {
+        return None;
+    }
+    let (role, name) = selector.split_once(':')?;
+    (!role.is_empty() && !name.is_empty() && !role.contains(char::is_whitespace)).then_some(role)
+}
+
+/// Why a selector this tree cannot answer was not understood.
+///
+/// Only for the grammar. A plain name that matches nothing is an ordinary
+/// negative result and the caller says so in its own words; a `role:name`,
+/// `#id` or `@slot` whose grammatical half does not exist in the tree at all is
+/// a selector the tool did not understand, and reporting that as "nothing
+/// matched" is how `Contrast` on `link:crates.vip` came back as a page with no
+/// painted text on it rather than as a selector nobody had implemented.
+pub(crate) fn unmatched_selector_reason(nodes: &[SemanticNode], selector: &str) -> Option<String> {
+    if selector.is_empty()
+        || nodes
+            .iter()
+            .any(|node| selector_matches_node(node, selector))
+    {
+        return None;
+    }
+    if let Some(dom_id) = selector_dom_id(selector) {
+        return Some(format!(
+            "no node carries the DOM id {dom_id:?}; drop the leading '#' to match an \
+             accessible name instead"
+        ));
+    }
+    if let Some(slot) = selector_slot(selector) {
+        return Some(format!(
+            "no node carries the component slot {slot:?}; drop the leading '@' to match an \
+             accessible name instead"
+        ));
+    }
+    let role = selector_role(selector)?;
+    if nodes
+        .iter()
+        .any(|node| node.role.eq_ignore_ascii_case(role))
+    {
+        return None;
+    }
+    let mut present: Vec<&str> = nodes.iter().map(|node| node.role.as_str()).collect();
+    present.sort_unstable();
+    present.dedup();
+    present.truncate(12);
+    Some(format!(
+        "no node has role {role:?}, so {selector:?} can never match; roles present: {}",
+        present.join(", ")
+    ))
+}
+
 pub(crate) fn exact_selector_matches_node(node: &SemanticNode, selector: &str) -> bool {
     if let Some(dom_id) = selector_dom_id(selector) {
         return node.dom_id.as_deref() == Some(dom_id);
@@ -438,6 +496,63 @@ mod tests {
         let save = node(None, "Save settings");
         assert!(!selector_matches_node(&save, "button"));
         assert!(selector_matches_node(&save, "save"));
+    }
+
+    /// The audit's old predicate is written out here because the point is that
+    /// it *passes* the document it should have rejected.
+    fn contains_either(node: &SemanticNode, want: &str) -> bool {
+        node.name.contains(want) || node.role.contains(want)
+    }
+
+    #[test]
+    fn a_role_selector_matched_nothing_under_a_substring_predicate() {
+        let link = SemanticNode {
+            role: "link".into(),
+            ..node(None, "crates.vip")
+        };
+        let heading = SemanticNode {
+            role: "heading".into(),
+            ..node(None, "A private registry")
+        };
+        let page = [link.clone(), heading.clone()];
+
+        // The false clean bill of health: nothing is audited, so nothing fails.
+        assert!(
+            !page
+                .iter()
+                .any(|node| contains_either(node, "link:crates.vip")),
+            "the substring predicate silently selects an empty page"
+        );
+        // The grammar every check is written in selects the one link.
+        assert!(selector_matches_node(&link, "link:crates.vip"));
+        assert!(!selector_matches_node(&heading, "link:crates.vip"));
+        assert!(unmatched_selector_reason(&page, "link:crates.vip").is_none());
+    }
+
+    #[test]
+    fn a_grammar_selector_the_tree_cannot_answer_is_reported_as_such() {
+        let page = [node(Some("save"), "Save settings")];
+
+        let role = unmatched_selector_reason(&page, "link:crates.vip")
+            .expect("this document has no links at all");
+        assert!(role.contains("role \"link\""), "{role}");
+        assert!(
+            role.contains("button"),
+            "the roles present are named: {role}"
+        );
+
+        let dom_id =
+            unmatched_selector_reason(&page, "#missing").expect("no node carries that DOM id");
+        assert!(dom_id.contains("DOM id"), "{dom_id}");
+
+        let slot = unmatched_selector_reason(&page, "@listbox").expect("no node carries that slot");
+        assert!(slot.contains("slot"), "{slot}");
+
+        // A plain name that matches nothing is an ordinary negative result, and
+        // so is a role selector whose role exists but whose name does not.
+        assert!(unmatched_selector_reason(&page, "Nothing here").is_none());
+        assert!(unmatched_selector_reason(&page, "button:Nothing here").is_none());
+        assert!(unmatched_selector_reason(&page, "Default permission: Auto").is_none());
     }
 
     #[test]
