@@ -20,6 +20,11 @@
 //! application driven by agents while it drives a browser it embeds is a client
 //! and a server at once.
 //!
+//! [`lifecycle`] is the one answer neither transport nor core can give.
+//! `Relaunch` and `Quit` are about the process, so the embedder that started it
+//! registers what they mean; it is here rather than in a host because more than
+//! one host serves the same request.
+//!
 //! There were three copies of this vocabulary before, in three repositories,
 //! and two of them were transports rather than duplicates: an in-process
 //! interface in the browser and a socket in the Tauri runtime, each with its
@@ -68,6 +73,8 @@ pub mod document;
 /// The in-process transport.
 #[cfg(feature = "engine")]
 pub mod in_process;
+/// The embedder's answer to a request about the process, not the document.
+pub mod lifecycle;
 /// The socket transport, listening half.
 ///
 /// Unix only. The transport is a Unix domain socket with owner-only
