@@ -59,15 +59,15 @@
 //! diagnostics says so by omitting the tool from `tools/list`; see
 //! [`encode_tools_list_response`].
 
+/// The socket transport, connecting half.
+#[cfg(feature = "client")]
+pub mod client;
 /// The core: reading, capturing and driving a document.
 #[cfg(feature = "engine")]
 pub mod document;
 /// The in-process transport.
 #[cfg(feature = "engine")]
 pub mod in_process;
-/// The socket transport, connecting half.
-#[cfg(feature = "client")]
-pub mod client;
 /// The socket transport, listening half.
 ///
 /// Unix only. The transport is a Unix domain socket with owner-only
