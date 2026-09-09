@@ -62,6 +62,9 @@
 /// The core: reading, capturing and driving a document.
 #[cfg(feature = "engine")]
 pub mod document;
+/// The in-process transport.
+#[cfg(feature = "engine")]
+pub mod in_process;
 /// The socket transport, listening half.
 ///
 /// Unix only. The transport is a Unix domain socket with owner-only
