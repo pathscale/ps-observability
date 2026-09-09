@@ -2329,8 +2329,8 @@ async fn settle_for_outcome(
         let now = tokio::time::Instant::now();
         let mut passing =
             outcome_verdict(check, before, &after.nodes, action_target, action_node_id).is_ok();
-        let due_for_full_probe = last_full_probe
-            .is_none_or(|at| now.duration_since(at) >= FULL_DOCUMENT_PROBE_INTERVAL);
+        let due_for_full_probe =
+            last_full_probe.is_none_or(|at| now.duration_since(at) >= FULL_DOCUMENT_PROBE_INTERVAL);
         if !passing && scope.is_some() && due_for_full_probe {
             // Portalled dialogs, global toasts and a shell whose header is not
             // in the active pane all live outside the scope. Probe the whole
