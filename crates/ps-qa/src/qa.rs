@@ -522,6 +522,32 @@ pub struct Check {
     /// be reported as a fast completed render.
     #[serde(default)]
     pub stable_for_ms: u64,
+    /// Also require the semantic tree's visibility flag, not geometry alone.
+    ///
+    /// [`Paints`](Expect::Paints), [`PaintsNamed`](Expect::PaintsNamed),
+    /// [`PaintsMore`](Expect::PaintsMore) and [`Count`](Expect::Count) judge on
+    /// boxes, for the reason written on the `paints` predicate: the flag and
+    /// the renderer disagree, and trusting the flag once reported a screen full
+    /// of icons as painting nothing.
+    ///
+    /// That leaves a whole class of component unprovable in one direction. An
+    /// Accordion, a Collapsible, a Tabs panel and anything else that hides by
+    /// flipping `hidden` while keeping its box satisfies every geometry
+    /// assertion whether it is open or closed. [`Vanishes`](Expect::Vanishes)
+    /// reads the flag and so can prove such a thing closed; nothing could prove
+    /// it open, which caps what a suite can assert about disclosure on every
+    /// site that has one.
+    ///
+    /// So this is opt-in and per check. A check that declares it is saying "for
+    /// this subject the flag is the honest signal", which is true exactly where
+    /// the box does not move. Leave it off for anything with a box of its own:
+    /// there the geometry question is stronger and it does not depend on a flag
+    /// that walks ancestors.
+    ///
+    /// With `Count`, only members that are shown are counted, which is what
+    /// makes an exact count of open panels expressible at all.
+    #[serde(default)]
+    pub require_visible: bool,
     /// Run this check only after every ordinary shared-instance outcome.
     ///
     /// A destructive sequence may deliberately remove fixture state that
@@ -693,6 +719,15 @@ fn paints(node: &SemanticNode) -> bool {
     node.bounds.is_some_and(|b| b[2] > 0.0 && b[3] > 0.0)
 }
 
+/// Whether a node counts as shown, under this check's declared strictness.
+///
+/// Geometry is the default and stays the default for the reason written on
+/// [`paints`]. [`Check::require_visible`] is how a check that needs the flag as
+/// well says so, for the components geometry alone cannot judge.
+fn shows(check: &Check, node: &SemanticNode) -> bool {
+    paints(node) && (!check.require_visible || node.visible)
+}
+
 /// The verdict for one check, given the tree before and after its action.
 pub fn verdict(
     check: &Check,
@@ -757,7 +792,11 @@ pub fn verdict(
             if found.is_empty() {
                 return Err(format!("no node matching {:?} exists", check.subject));
             }
-            let broken: Vec<_> = found.iter().copied().filter(|node| !paints(node)).collect();
+            let broken: Vec<_> = found
+                .iter()
+                .copied()
+                .filter(|node| !shows(check, node))
+                .collect();
             if !broken.is_empty() {
                 /*
                  * Say which half of "paints" failed.
@@ -887,7 +926,7 @@ pub fn verdict(
             }
         }
         Expect::PaintsNamed => {
-            if !found.iter().any(|node| paints(node)) {
+            if !found.iter().any(|node| shows(check, node)) {
                 let state = found
                     .iter()
                     .map(|node| {
@@ -1178,9 +1217,9 @@ pub fn verdict(
         Expect::PaintsMore => {
             let was = matching(before, &check.subject)
                 .into_iter()
-                .filter(|node| paints(node))
+                .filter(|node| shows(check, node))
                 .count();
-            let now = found.iter().filter(|node| paints(node)).count();
+            let now = found.iter().filter(|node| shows(check, node)).count();
             if now <= was {
                 return Err(format!(
                     "{:?} on screen went {was} -> {now}, expected one more",
@@ -1236,11 +1275,19 @@ pub fn verdict(
             let want = check
                 .expect_count
                 .ok_or_else(|| "Count requires expect_count".to_owned())?;
-            if found.len() != want {
+            // Tree membership by default, so an exact family size keeps
+            // counting the members a retained pane legitimately holds. A check
+            // that declared `require_visible` is asking about the ones a person
+            // can see, and counts only those.
+            let counted: Vec<&&SemanticNode> = found
+                .iter()
+                .filter(|node| !check.require_visible || shows(check, node))
+                .collect();
+            if counted.len() != want {
                 return Err(format!(
                     "{:?} has {} member(s), expected {want}",
                     check.subject,
-                    found.len()
+                    counted.len()
                 ));
             }
         }
@@ -1482,6 +1529,73 @@ mod tests {
             bounds: Some([0.0, 0.0, width, height]),
             slot: None,
         }
+    }
+
+    /// A disclosure that keeps its box can be proven closed but never open.
+    ///
+    /// This is the false pass: the geometry assertion is satisfied by the
+    /// *closed* panel, so it says nothing at all about the control it names. No
+    /// spelling available before `require_visible` could tell the two states
+    /// apart, which is why disclosure coverage stopped at "it closes".
+    #[test]
+    fn a_panel_that_hides_by_flag_alone_needs_the_flag_to_be_read() {
+        let panel = |visible: bool| SemanticNode {
+            visible,
+            bounds: Some([0.0, 120.0, 400.0, 200.0]),
+            ..painted_node(2, "Advanced options", 400.0, 200.0)
+        };
+        let closed = [
+            painted_node(1, "Advanced options", 180.0, 30.0),
+            panel(false),
+        ];
+        let open = [
+            painted_node(1, "Advanced options", 180.0, 30.0),
+            panel(true),
+        ];
+
+        let mut geometry = parse("");
+        geometry.click = Some("Advanced options".into());
+        geometry.subject = "Advanced options".into();
+        geometry.expect = Expect::Paints;
+        assert!(
+            verdict(&geometry, &closed, &closed).is_ok(),
+            "the closed panel already satisfies a geometry-only assertion"
+        );
+
+        let mut strict = geometry.clone();
+        strict.require_visible = true;
+        assert!(
+            verdict(&strict, &closed, &closed).is_err(),
+            "reading the flag distinguishes closed from open"
+        );
+        assert!(verdict(&strict, &closed, &open).is_ok());
+
+        // The same is true of the family assertions: nothing about the boxes
+        // moves when the panel opens.
+        let mut more = strict.clone();
+        more.expect = Expect::PaintsMore;
+        more.require_visible = false;
+        assert!(
+            verdict(&more, &closed, &open).is_err(),
+            "counting boxes cannot see a disclosure open"
+        );
+        more.require_visible = true;
+        assert!(verdict(&more, &closed, &open).is_ok());
+
+        let mut count = strict.clone();
+        count.expect = Expect::Count;
+        count.expect_count = Some(2);
+        count.require_visible = false;
+        assert!(
+            verdict(&count, &closed, &closed).is_ok(),
+            "counting tree membership cannot see a disclosure closed either"
+        );
+        count.require_visible = true;
+        assert!(
+            verdict(&count, &closed, &closed).is_err(),
+            "only the trigger is on screen while the panel is closed"
+        );
+        assert!(verdict(&count, &closed, &open).is_ok());
     }
 
     /// A hidden mirror copy must not keep a closed control "on screen".
@@ -1811,6 +1925,7 @@ mod tests {
             settle_after_ms: 0,
             outcome_timeout_ms: 0,
             stable_for_ms: 0,
+            require_visible: false,
             destructive: false,
             subject: "Output level".into(),
             expect: Expect::ValueChanges,
