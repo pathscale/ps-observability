@@ -56,7 +56,7 @@ use crate::{
 /// Timers and animation frames remain asynchronous and are observed normally.
 /// A poll hook that stays runnable is different: reporting the exhaustion lets
 /// a caller fail the interaction instead of compensating with a sleep.
-const MAX_SETTLE_POLLS: usize = 100;
+pub(crate) const MAX_SETTLE_POLLS: usize = 100;
 
 /// One document, driven in process.
 ///
@@ -333,7 +333,7 @@ pub fn settle(document: &mut ScriptDocument) -> Result<(), DebugError> {
 /// caret is, with no layout involved. A host that behaves differently depending
 /// on which fonts the machine has is a harness that reports different verdicts
 /// on CI and on a laptop.
-fn set_node_value(
+pub(crate) fn set_node_value(
     document: &mut ScriptDocument,
     node_id: blitz_dom::NodeId,
     value: String,
