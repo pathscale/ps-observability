@@ -2,7 +2,6 @@
 resolver = "3"
 members = [
     "crates/blitz-control-protocol",
-    "crates/ps-blitz-debug-control",
     "crates/ps-qa",
 ]
 
