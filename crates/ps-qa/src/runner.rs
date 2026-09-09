@@ -1938,12 +1938,26 @@ async fn run_qa(
                 }
             }
         }
-        if action_error.is_none() && action_paint_armed {
-            // A real committed frame is the cheapest happens-after boundary.
-            // Some valid actions change no pixels, so absence is a bounded
-            // compatibility fallback rather than a verdict by itself.
-            let _ = client.wait_for_paint(declared_outcome_timeout(check)).await;
-        }
+        /*
+         * No blocking wait for a frame here.
+         *
+         * This used to wait the whole declared budget for a committed paint as
+         * a "cheapest happens-after boundary". A host with no compositor never
+         * commits one, and neither does a valid action that changes no pixels,
+         * so the wait ran to the deadline and the check's reported duration
+         * became its own budget: 211ms against a declared 200, 3004ms against
+         * 3000. Read as latency those numbers say a control is on the edge of
+         * its deadline. They are a constant, and the outcome had usually
+         * arrived within a few milliseconds.
+         *
+         * Nothing is lost by dropping it. `settle_for_outcome` inspects before
+         * it waits and then waits on the same paint stream against the same
+         * deadline, so a frame that matters is still waited for and one that
+         * never comes no longer decides what the harness reports as a
+         * measurement. The arming above stays, and is handed on below so a
+         * frame committed between the action and the settle loop is not
+         * discarded by a second arm.
+         */
         let transport_timed_out = action_error
             .as_deref()
             .is_some_and(|error| error.contains("inspector did not answer within"));
@@ -1999,6 +2013,7 @@ async fn run_qa(
                 &before.nodes,
                 action_target.as_deref(),
                 action_node_id,
+                action_paint_armed,
             )
             .await
             {
@@ -2344,6 +2359,7 @@ async fn settle_for_outcome(
     before: &[SemanticNode],
     action_target: Option<&str>,
     action_node_id: Option<u64>,
+    already_armed: bool,
 ) -> Result<(AgentSnapshot, Option<String>, u32)> {
     let outcome_timeout = declared_outcome_timeout(check);
     let deadline = tokio::time::Instant::now() + outcome_timeout;
@@ -2354,7 +2370,14 @@ async fn settle_for_outcome(
     // When the whole tree was last serialised, so a scoped poll cannot go
     // permanently blind to the rest of the page. See the interval below.
     let mut last_full_probe: Option<tokio::time::Instant> = None;
-    let event_driven = client.arm_paint_events().await.unwrap_or(false);
+    // Arming discards the frames already queued, which is right before an
+    // action and wrong after one: the commit this loop is waiting for may
+    // already have arrived. A caller that armed before driving says so.
+    let event_driven = if already_armed {
+        true
+    } else {
+        client.arm_paint_events().await.unwrap_or(false)
+    };
     loop {
         let mut after = if let Some(scoped) = scope.as_ref() {
             match inspect_subtree(client, scoped.root).await {
@@ -5809,8 +5832,9 @@ mod tests {
         named_document_is_active_with_permanent, named_document_opener_for, outcome_check_ids,
         outcome_verdict, pagination_advanced, painted_bounds, painted_named, pixels_change,
         pixels_hold, require_transparent_window_tint, resolved_action_target, rgb_pixels_hold,
-        saved_control_node, saved_controls, selector_matches_node, setup_value_landed,
-        stable_arrival, subject_belongs_to_scope, validate_surface_filter_against,
+        saved_control_node, saved_controls, selector_matches_node, settle_for_outcome,
+        setup_value_landed, stable_arrival, subject_belongs_to_scope,
+        validate_surface_filter_against,
     };
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
@@ -6356,6 +6380,129 @@ mod tests {
             &before,
             &component("Show 3 more projects", true, true)
         ));
+    }
+
+    /// A host with a document and no compositor, which never commits a frame.
+    ///
+    /// That is not a contrived shape: it is exactly what the headless host is,
+    /// and every wait for a paint event against it runs to its deadline.
+    async fn serve_silent_host(socket: std::path::PathBuf, nodes: Vec<SemanticNode>) {
+        use blitz_control_protocol::{
+            DebugResponse, IncomingRequest, MessageStream, TransportStream, decode_incoming,
+            encode_initialize_response, encode_response, framed_json,
+        };
+        use tokio::net::UnixListener;
+
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let (stream, _) = listener.accept().await.expect("accept test client");
+        let mut stream = TransportStream::new(framed_json(stream));
+        while let Some(Ok(message)) = stream.recv().await {
+            let answer = match decode_incoming(message) {
+                Ok(IncomingRequest::Initialize { id }) => {
+                    encode_initialize_response(id, "silent-host-fixture")
+                        .expect("encode initialize response")
+                }
+                Ok(IncomingRequest::Agent { id, .. }) => encode_response(
+                    id,
+                    &DebugResponse::AgentSnapshot(AgentSnapshot {
+                        nodes: nodes.clone(),
+                        ..AgentSnapshot::default()
+                    }),
+                )
+                .expect("encode snapshot"),
+                // Streaming is available. Frames are not, because nothing here
+                // draws.
+                Ok(IncomingRequest::Diagnostics { id, .. }) => {
+                    encode_response(id, &DebugResponse::Ack).expect("encode ack")
+                }
+                _ => continue,
+            };
+            if stream.send(answer).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// The post-action wait for a frame reported the budget as a latency.
+    ///
+    /// The runner used to block on `wait_for_paint(declared_outcome_timeout)`
+    /// between the action and judging it. Against a host that commits no frame
+    /// that call always costs the whole declared budget, and the check's
+    /// reported duration became its own deadline: 211ms against a declared 200,
+    /// 3004ms against 3000. The first half of this test is that constant. The
+    /// second is the path the runner takes now, against the same silent host
+    /// and the same budget.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_outcome_path_does_not_spend_the_declared_budget_waiting_for_a_frame() {
+        let socket = std::env::temp_dir().join(format!(
+            "ps-qa-silent-host-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos()
+        ));
+        let saved = SemanticNode {
+            dom_id: None,
+            id: 3,
+            parent: None,
+            role: "button".into(),
+            name: "Saved".into(),
+            value: None,
+            enabled: true,
+            visible: true,
+            selected: false,
+            bounds: Some([0.0, 0.0, 90.0, 24.0]),
+            slot: None,
+        };
+        let host = serve_silent_host(socket.clone(), vec![saved.clone()]);
+
+        let client_socket = socket.clone();
+        let driver = async move {
+            let mut check = check("saved-paints", Some("Save"), "Saved");
+            check.outcome_timeout_ms = 200;
+            let budget = declared_outcome_timeout(&check);
+
+            let mut client = crate::inspector::Client::connect(&client_socket)
+                .await
+                .expect("connect to the silent host");
+            client.initialize().await.expect("initialize completes");
+            assert!(
+                client
+                    .arm_paint_events()
+                    .await
+                    .expect("streaming is served"),
+                "the host serves the paint stream; it just never commits a frame"
+            );
+
+            let waited = std::time::Instant::now();
+            assert!(
+                !client
+                    .wait_for_paint(budget)
+                    .await
+                    .expect("waiting for a frame is not itself an error"),
+                "no frame is ever committed"
+            );
+            assert!(
+                waited.elapsed() >= budget,
+                "the removed boundary spent the whole declared budget: {:?}",
+                waited.elapsed()
+            );
+
+            let settled = std::time::Instant::now();
+            let (_, error, _) = settle_for_outcome(&mut client, &check, &[], None, None, true)
+                .await
+                .expect("the outcome is judged from the tree");
+            assert!(error.is_none(), "{error:?}");
+            assert!(
+                settled.elapsed() < budget / 2,
+                "the outcome is judged when it arrives, not when the budget expires: {:?}",
+                settled.elapsed()
+            );
+        };
+
+        tokio::join!(host, driver);
+        let _ = std::fs::remove_file(socket);
     }
 
     /// A baseline that predates the setup value lets the setup pass the check.
