@@ -148,6 +148,7 @@ tabs, then activates the exact semantic node id.
 | Expectation | Passes when |
 | --- | --- |
 | `Paints` | the subject exists and has a **non-zero rendered box** |
+| `Present` | the subject exists in the tree and was laid out, whatever it measures |
 | `Enabled` | a painted subject accepts input after the action |
 | `Disabled` | a painted subject refuses input after the action |
 | `Vanishes` | nothing matching is on screen (it may remain in the tree) |
@@ -187,6 +188,24 @@ unprovable in one direction: an Accordion, a Collapsible or a Tabs panel keeps
 its box and flips `hidden`, so every geometry assertion is satisfied whether it
 is open or closed, and only `Vanishes` could tell. Add `require_visible: true`
 to ask for the flag as well, for a subject whose box does not move.
+
+A box is also a font question, and CI runs a host with no font catalogue. Text
+lays out at height zero there, so a control sized by its own label has no box
+at all: a `w-full` primary call to action measures `0x44` while the same tree
+carries `enabled=true`. `Present` is the answer on the geometry axis, but it
+says nothing about input state, so `Enabled` and `Disabled` were unassertable
+for exactly the controls a suite most wants to gate on. Add `text_sized: true`
+to judge the flag on a subject that was laid out, whatever it measures:
+
+```ron
+subject: "button:Continue",
+expect: Enabled,
+text_sized: true,
+```
+
+It gives up the box and nothing else. A subject the document never produced, one
+that never reached layout, and one carrying the wrong flag all still fail, and
+declaring it on any other expectation is an error rather than a silent no-op.
 
 Navigation has its own deadline. `open_timeout_ms` is the arrival budget for
 the `open` step, separate from `outcome_timeout_ms` so that a route which
