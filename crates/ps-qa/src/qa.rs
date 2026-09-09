@@ -670,6 +670,39 @@ fn validate_check(
         ));
     }
 
+    /*
+     * A setup value cannot be the thing a check proves.
+     *
+     * `setup_type_into` establishes a precondition before the baseline, so the
+     * only honest reading of a change expectation on that same field is "the
+     * measured action changed what setup put there". With no measured action
+     * there is nothing between the two observations but the harness's own
+     * typing: the check either compares the setup value with itself, or, if
+     * the baseline wins the race with the runtime, reports the setup's own
+     * effect as the outcome. Neither says anything about the application.
+     */
+    if matches!(
+        check.expect,
+        Expect::ValueChanges | Expect::NameChanges | Expect::SelectionChanges
+    ) && check.setup_type_into.as_deref() == Some(check.subject.as_str())
+        && check.click.is_none()
+        && check.text.is_none()
+        && check.key.is_none()
+        && check.scroll_over.is_none()
+    {
+        return Err(format!(
+            concat!(
+                "{}: check {:?} asserts {:?} on {:?}, which is the field its own setup value ",
+                "was typed into, and drives no action; declare the action that is supposed to ",
+                "change it, or assert the value with a different subject"
+            ),
+            file.display(),
+            check.id,
+            check.expect,
+            check.subject,
+        ));
+    }
+
     if check.scroll_over.is_some() && (check.scroll_ticks == 0 || check.scroll_delta == 0.0) {
         return Err(format!(
             "{}: check {:?} must declare non-zero scroll_ticks and scroll_delta with scroll_over",
@@ -1877,6 +1910,24 @@ mod tests {
             action_description(&check),
             "activate \"Save\", scroll 4 x -300 over \"listitem:\""
         );
+    }
+
+    #[test]
+    fn a_change_expectation_on_the_setup_field_needs_an_action() {
+        let mut check = parse("setup_type_into:Some(\"Filter\"),setup_text:Some(\"acme\"),");
+        check.click = None;
+        check.subject = "Filter".into();
+        check.expect = Expect::ValueChanges;
+
+        let error = validate_check(&check, Path::new("filter.ron"), &mut HashMap::new())
+            .expect_err("nothing but the harness's own typing happens between the observations");
+        assert!(error.contains("setup value"), "{error}");
+
+        // The ordinary shape is still valid: setup establishes the value and a
+        // declared action is what has to change it.
+        check.click = Some("Clear".into());
+        validate_check(&check, Path::new("filter.ron"), &mut HashMap::new())
+            .expect("an action between the two observations is the point");
     }
 
     #[test]

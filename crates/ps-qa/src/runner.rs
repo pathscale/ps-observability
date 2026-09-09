@@ -242,6 +242,17 @@ async fn wait_for_semantic_condition(
     }
 }
 
+/// Whether the value a setup step sent has reached the semantic tree.
+///
+/// By the id `SetValue` addressed, and by exact equality: `SetValue` replaces
+/// the field's contents with this string, so anything else is either a
+/// different node with the same name or a value that has not landed yet.
+fn setup_value_landed(nodes: &[SemanticNode], node_id: u64, value: &str) -> bool {
+    nodes
+        .iter()
+        .any(|node| node.id == node_id && node.value.as_deref() == Some(value))
+}
+
 async fn settle_sweep_case(
     client: &mut Client,
     case: &sweep::Case,
@@ -1220,11 +1231,45 @@ async fn run_qa(
                 check.setup_type_into.as_deref(),
                 check.setup_text.as_deref(),
             )
-            && let Err(error) = type_text(client, field, value).await
         {
-            open_error = Some(format!(
-                "could not establish setup value in {field:?}: {error}"
-            ));
+            match type_text(client, field, value).await {
+                Err(error) => {
+                    open_error = Some(format!(
+                        "could not establish setup value in {field:?}: {error}"
+                    ));
+                }
+                /*
+                 * Wait for the value to reach the tree, not merely for the
+                 * runtime to acknowledge being told.
+                 *
+                 * `SetValue` is acknowledged when it is applied, and the
+                 * semantic tree the baseline reads is a separate observation.
+                 * A baseline taken in between records the *pre-setup* value,
+                 * and then the setup's own effect is a change between before
+                 * and after: a `ValueChanges` on that field passes without the
+                 * measured action having done anything at all. That is a check
+                 * reporting a feature as working because the harness typed
+                 * into it.
+                 *
+                 * The value is compared against the id `SetValue` addressed,
+                 * so a same-named neighbour cannot answer for it.
+                 */
+                Ok(node_id) => {
+                    let settled =
+                        wait_for_semantic_condition(client, check_timeout(900), |nodes| {
+                            setup_value_landed(nodes, node_id, value)
+                        })
+                        .await?;
+                    if !setup_value_landed(&settled.nodes, node_id, value) {
+                        open_error = Some(format!(
+                            "the setup value {value:?} had not reached {field:?} within {}ms; \
+                             a baseline taken before it lands lets the setup satisfy the \
+                             check's own outcome",
+                            check_timeout(900).as_millis()
+                        ));
+                    }
+                }
+            }
         }
 
         /*
@@ -5764,8 +5809,8 @@ mod tests {
         named_document_is_active_with_permanent, named_document_opener_for, outcome_check_ids,
         outcome_verdict, pagination_advanced, painted_bounds, painted_named, pixels_change,
         pixels_hold, require_transparent_window_tint, resolved_action_target, rgb_pixels_hold,
-        saved_control_node, saved_controls, selector_matches_node, stable_arrival,
-        subject_belongs_to_scope, validate_surface_filter_against,
+        saved_control_node, saved_controls, selector_matches_node, setup_value_landed,
+        stable_arrival, subject_belongs_to_scope, validate_surface_filter_against,
     };
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
@@ -6311,6 +6356,52 @@ mod tests {
             &before,
             &component("Show 3 more projects", true, true)
         ));
+    }
+
+    /// A baseline that predates the setup value lets the setup pass the check.
+    ///
+    /// This is the shape the harness has to make impossible: the `before`
+    /// snapshot still holds the pre-setup value because the tree had not caught
+    /// up with `SetValue`, so the difference between the two observations is
+    /// the harness's own typing and the measured action is never consulted.
+    /// The verdict below is `Ok` with a click that did nothing.
+    #[test]
+    fn a_baseline_that_predates_the_setup_makes_its_outcome_vacuous() {
+        let field = |value: &str| SemanticNode {
+            dom_id: None,
+            id: 7,
+            parent: None,
+            role: "textbox".into(),
+            name: "Filter".into(),
+            value: Some(value.into()),
+            enabled: true,
+            visible: true,
+            selected: false,
+            bounds: Some([0.0, 0.0, 240.0, 28.0]),
+            slot: None,
+        };
+        let mut check = check("filter-value", Some("Apply"), "Filter");
+        check.setup_type_into = Some("Filter".into());
+        check.setup_text = Some("acme".into());
+        check.expect = Expect::ValueChanges;
+
+        let raced = [field("")];
+        let settled = [field("acme")];
+        assert!(
+            crate::qa::verdict(&check, &raced, &settled).is_ok(),
+            "the setup's own effect satisfies the outcome when the baseline predates it"
+        );
+
+        // The gate: that baseline is not one the harness may take, and the
+        // settled tree is.
+        assert!(!setup_value_landed(&raced, 7, "acme"));
+        assert!(setup_value_landed(&settled, 7, "acme"));
+        // By id, so a same-named neighbour cannot answer for the field.
+        assert!(!setup_value_landed(&settled, 8, "acme"));
+
+        // Once the baseline is honest the check measures the action, and a
+        // click that changed nothing fails.
+        assert!(crate::qa::verdict(&check, &settled, &settled).is_err());
     }
 
     fn check(id: &str, click: Option<&str>, subject: &str) -> Check {
