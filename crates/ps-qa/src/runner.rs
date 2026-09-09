@@ -6434,7 +6434,7 @@ mod tests {
         while let Some(Ok(message)) = stream.recv().await {
             let answer = match decode_incoming(message) {
                 Ok(IncomingRequest::Initialize { id }) => {
-                    encode_initialize_response(id, "silent-host-fixture")
+                    encode_initialize_response(id, "silent-host-fixture", "0.0.0")
                         .expect("encode initialize response")
                 }
                 Ok(IncomingRequest::Agent { id, .. }) => encode_response(

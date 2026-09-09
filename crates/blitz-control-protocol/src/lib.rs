@@ -62,6 +62,13 @@
 /// The core: reading, capturing and driving a document.
 #[cfg(feature = "engine")]
 pub mod document;
+/// The socket transport, listening half.
+///
+/// Unix only. The transport is a Unix domain socket with owner-only
+/// permissions, which is the access control: there is no handshake and no
+/// token, because the file mode already says who may connect.
+#[cfg(all(feature = "server", unix))]
+pub mod server;
 
 use endpoint_libs::libs::ws::mcp_wire::{INVALID_PARAMS, INVALID_REQUEST, parse};
 pub use endpoint_libs::libs::ws::{
@@ -885,8 +892,15 @@ pub fn decode_incoming_value(
     }
 }
 
+/// The MCP handshake, answered on behalf of whichever host is serving.
+///
+/// `server_name` used to be the literal `tauri-runtime-blitz`, because that is
+/// where this code lived. There are three hosts now, and none of them is this
+/// crate: a window runtime, a headless browser, and an embedder driving a
+/// browser in-process. Each says its own name.
 pub fn encode_initialize_response(
     id: JsonRpcId,
+    server_name: &str,
     server_version: &str,
 ) -> Result<WireMessage, DebugProtocolError> {
     encode_rpc(JsonRpcMessage::Response(JsonRpcResponse::result(
@@ -894,7 +908,7 @@ pub fn encode_initialize_response(
         serde_json::json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": "tauri-runtime-blitz", "version": server_version}
+            "serverInfo": {"name": server_name, "version": server_version}
         }),
     )))
 }
