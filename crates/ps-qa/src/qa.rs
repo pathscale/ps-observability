@@ -505,6 +505,20 @@ pub struct Check {
     /// rendered action still has to pass the one-second budget.
     #[serde(default)]
     pub settle_after_ms: u64,
+    /// Deadline for this check's [`open`](Self::open) step.
+    ///
+    /// Navigation is not the interaction contract. `open` may be a route change
+    /// that fetches before it can paint, and a live network round trip lands on
+    /// either side of the 900ms every other step gets. The failure that
+    /// produces is also the wrong sentence: `could not open "Crates"` reads as
+    /// a missing tab rather than as a deadline, and the reader goes looking for
+    /// a control that is there.
+    ///
+    /// So a route that is known to fetch declares what it costs here, and every
+    /// other navigation in the suite keeps the strict default rather than being
+    /// weakened to cover the slow one.
+    #[serde(default)]
+    pub open_timeout_ms: u64,
     /// Deadline for this check's rendered outcome.
     ///
     /// Ordinary interactions keep the 900ms contract. A declared backend or
@@ -1974,6 +1988,7 @@ mod tests {
             covers: Vec::new(),
             press: false,
             settle_after_ms: 0,
+            open_timeout_ms: 0,
             outcome_timeout_ms: 0,
             stable_for_ms: 0,
             require_visible: false,
