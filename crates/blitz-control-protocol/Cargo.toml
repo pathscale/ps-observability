@@ -27,6 +27,13 @@ publish = true
 #   engine    the core. Reads and drives a `blitz-dom` document.
 #   capture   the core's expensive half: offscreen paint, layout and
 #             computed-style snapshots, renderer metrics.
+#   server    the socket transport, listening half. No blitz.
+#   client    the socket transport, connecting half. No blitz.
+#
+# `server` and `client` carry no engine because a transport does not need one:
+# the framing is shared, the document is not. `ps-qa` takes `client` and gets
+# serde, endpoint-libs and tokio. A peer that is both, such as AgencyZero
+# driving an embedded browser while agents drive it, takes both halves.
 [features]
 default = []
 engine = [
@@ -56,6 +63,7 @@ capture = [
     # for the script half of the same capture.
     "blitz-shell/debug-control",
 ]
+server = ["dep:tokio"]
 
 [dependencies]
 endpoint-libs.workspace = true
@@ -89,6 +97,16 @@ blitz-paint = { package = "ps-blitz-paint", version = "^0.4.8", optional = true 
 blitz-shell = { package = "ps-blitz-shell", version = "^0.4.8", default-features = false, optional = true }
 base64 = { version = "0.22", optional = true }
 
+# Both transports. A listener and a connector need the same runtime and the
+# same framing, and nothing else.
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "time",
+], optional = true }
 
 [dev-dependencies]
 # The framing round-trip test drives a real duplex pipe rather than asserting
