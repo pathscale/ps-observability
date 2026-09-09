@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo check -p blitz-control-protocol -p ps-blitz-debug-control -p ps-qa
+      - run: cargo check -p blitz-control-protocol -p ps-qa
 
   core:
     name: Protocol, transports, and driver (Linux)
@@ -37,14 +37,32 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy -p blitz-control-protocol -p ps-blitz-debug-control -p ps-qa --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test -p blitz-control-protocol -p ps-blitz-debug-control -p ps-qa
+        run: cargo test --workspace
+      # The workspace above builds the protocol with no features, which is the
+      # vocabulary and both transports' framing. The core is behind `engine`
+      # and `capture` because it needs the renderer, and a job that never
+      # enables them would leave the semantic tree, the capture surface and the
+      # in-process transport untested here.
+      - name: The core, and both transports over it
+        run: cargo test -p blitz-control-protocol --all-features
       - name: Keep the driver renderer-free
         run: |
           cargo tree -p ps-qa > /tmp/ps-qa-tree.txt
           if grep -Eq '(^| )((ps-)?blitz-(dom|html|paint|shell)|tauri|winit|wgpu) v' /tmp/ps-qa-tree.txt; then
             echo 'ps-qa pulled a renderer or window runtime into its dependency tree' >&2
+            exit 1
+          fi
+      # The same boundary from the other side. The protocol crate carries the
+      # core now, so with no features enabled it must still cost a client
+      # nothing: an accidental non-optional renderer dependency would put the
+      # engine into every consumer of the vocabulary, including this one.
+      - name: Keep the vocabulary renderer-free
+        run: |
+          cargo tree -p blitz-control-protocol > /tmp/protocol-tree.txt
+          if grep -Eq '(^| )((ps-)?blitz-(dom|html|paint|shell)|tauri|winit|wgpu) v' /tmp/protocol-tree.txt; then
+            echo 'the default protocol build pulled in a renderer' >&2
             exit 1
           fi
 
@@ -64,7 +82,6 @@ jobs:
           set -euo pipefail
 
           cargo package -p blitz-control-protocol
-          cargo package -p ps-blitz-debug-control
           # The new protocol cannot exist in the registry before this PR is
           # merged. Verify the driver tarball against this exact
           # protocol source without installing a persistent workspace patch;

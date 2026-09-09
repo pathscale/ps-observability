@@ -5,12 +5,19 @@ keeps the protocol, transports, driver, and release documentation together so
 the system has one ownership boundary.
 
 ```text
-application ── tauri-runtime-blitz ── blitz-control-protocol ── ps-qa
-                                              ▲
-                                              │
-                       chuzz-headless ────────┘
-
-renderer embedder ── ps-blitz-debug-control ── WebDriver-style HTTP client
+                      blitz-control-protocol
+                   ┌──────────┴──────────────┐
+            the vocabulary               the core
+                   │                (over blitz-dom)
+     ┌─────────────┴─────────────┐         │
+  socket transport      in-process transport
+     │        │                            │
+  server    client              an embedder holding
+     │        │                   the document
+     │        └── ps-qa (no blitz, no window)
+     │
+     ├── tauri-runtime-blitz, for the application window
+     └── chuzz-headless, for a page with no window
 ```
 
 The headless host is not here. It used to be, as `qa-inspect-host`, and that
@@ -27,12 +34,24 @@ same loader and the same engine a tab uses and serves this protocol over the
 same socket. `ps-qa` still links no renderer, because that constraint was
 always about the socket rather than about which repository the host lives in.
 
-These are two deliberate alternatives, not two stacked transports.
-`blitz-control-protocol` is the typed MCP/JSON-RPC inspection plane used by
-`tauri-runtime-blitz`, the headless host, and `ps-qa`.
-`ps-blitz-debug-control` is a smaller HTTP adapter for embedders that need a
-WebDriver-shaped session and command channel; it does not depend on or duplicate
-the typed protocol crate.
+`blitz-control-protocol` is the whole surface: one vocabulary, one core, and
+two transports over that core. The core reads and drives a `blitz-dom`
+document and knows nothing about sockets. The socket transport is how a harness
+or an agent outside the process reaches a running application; the in-process
+transport is how an embedder that already holds the document calls straight in.
+Both halves of the socket are here, because a peer can be both: an application
+driven by agents while it drives a browser it embeds is a client and a server
+at once.
+
+Everything that needs the renderer is behind a feature, so a client pays for
+none of it. `cargo tree -p ps-qa` showing no renderer, window runtime or GPU
+stack is the check, and CI fails on it.
+
+The loopback WebDriver-shaped adapter that used to be here, `ps-blitz-debug-control`,
+lives in [pathscale/ps-blitz](https://github.com/pathscale/ps-blitz) now. It is
+what `blitz-script` takes behind its `debug-control` feature, so keeping it here
+made ps-blitz depend on this repository while this repository needs `blitz-dom`.
+Two repositories pointing at each other have no release order.
 
 `endpoint-libs` owns framing and MCP/JSON-RPC wire primitives. This workspace
 owns observability semantics: commands, events, revision rules, session
@@ -41,9 +60,9 @@ instrumentation hooks but do not own a control server.
 
 ## Crates
 
-- `blitz-control-protocol`: transport-neutral observability domain types and
-  their MCP wire encoding. It deliberately has no renderer dependency.
-- `ps-blitz-debug-control`: loopback WebDriver-style transport adapter.
+- `blitz-control-protocol`: the vocabulary, the core, and both transports. The
+  vocabulary and the transports have no renderer dependency; the core is behind
+  a feature and is the only part that does.
 - `ps-qa`: the lightweight driver, audit runner, and report generator.
 
 ## Quick start

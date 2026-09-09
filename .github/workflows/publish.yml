@@ -74,7 +74,6 @@ jobs:
           }
 
           publish_if_new blitz-control-protocol
-          publish_if_new ps-blitz-debug-control
           publish_if_new ps-qa
           # The host embeds tauri-runtime-blitz, which in turn consumes the
           # protocol above. Keep it last so a new protocol and driver can ship
