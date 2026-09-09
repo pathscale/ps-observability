@@ -6154,11 +6154,11 @@ mod tests {
     }
 
     #[test]
-    fn inventory_rejects_missing_and_duplicate_dom_ids_before_exclusions() {
+    fn inventory_rejects_missing_and_duplicate_dom_ids() {
         let mut missing = component("Import data", true, true);
         missing.dom_id = None;
         assert_eq!(
-            inventory_class(&missing, true, false, &HashSet::new()),
+            inventory_class(&missing, false, false, &HashSet::new()),
             InventoryClass::MissingId
         );
 
@@ -6167,6 +6167,27 @@ mod tests {
         assert_eq!(
             inventory_class(&duplicate, false, false, &duplicates),
             InventoryClass::DuplicateId
+        );
+    }
+
+    /// A declared exception outranks an id defect, which is what
+    /// `fix(qa): count a declared exception as excluded, not as unaddressable`
+    /// decided. An excluded control is one no check will ever drive, so
+    /// reporting it as unaddressable names a defect that can only be fixed by
+    /// withdrawing the exception. This test is here because the ordering is a
+    /// choice rather than an accident: the previous version of the test above
+    /// asserted the opposite and was left behind when the choice was made.
+    #[test]
+    fn inventory_counts_an_excluded_control_as_excluded() {
+        let mut missing = component("Import data", true, true);
+        missing.dom_id = None;
+        assert_eq!(
+            inventory_class(&missing, true, false, &HashSet::new()),
+            InventoryClass::Manual
+        );
+        assert_eq!(
+            inventory_class(&missing, false, true, &HashSet::new()),
+            InventoryClass::Isolated
         );
     }
 
