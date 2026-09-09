@@ -82,6 +82,14 @@ pub(crate) fn name_matches(name: &str, pattern: &str) -> bool {
 /// `cover` already read it this way; `open_named` and `press_named` did not,
 /// which is the bug the two helpers below exist to close.
 pub(crate) fn viewport_of(snapshot: &AgentSnapshot) -> (f64, f64) {
+    viewport_of_nodes(&snapshot.nodes)
+}
+
+/// The same viewport, for callers that hold a tree rather than a snapshot.
+///
+/// A verdict is judged from two node lists, so the geometry rules a verdict
+/// needs cannot be reachable only through the transport type.
+pub(crate) fn viewport_of_nodes(nodes: &[SemanticNode]) -> (f64, f64) {
     /*
      * The window, not `main`.
      *
@@ -92,8 +100,7 @@ pub(crate) fn viewport_of(snapshot: &AgentSnapshot) -> (f64, f64) {
      * Taking the top of the window keeps the below-the-fold case, which is what
      * this bound is actually for, without swallowing the header.
      */
-    let bottom = snapshot
-        .nodes
+    let bottom = nodes
         .iter()
         .filter(|node| node.role == "main")
         .filter_map(|node| node.bounds)
@@ -109,10 +116,14 @@ pub(crate) fn viewport_of(snapshot: &AgentSnapshot) -> (f64, f64) {
 /// scroll coordinates as window-visible sends pointer events behind the tab
 /// strip instead of revealing the row inside its panel.
 pub(crate) fn viewport_for_node(snapshot: &AgentSnapshot, node_id: u64) -> (f64, f64) {
+    viewport_for_node_in(&snapshot.nodes, node_id)
+}
+
+pub(crate) fn viewport_for_node_in(nodes: &[SemanticNode], node_id: u64) -> (f64, f64) {
     let mut cursor = Some(node_id);
     for _ in 0..32 {
         let Some(id) = cursor else { break };
-        let Some(node) = snapshot.nodes.iter().find(|node| node.id == id) else {
+        let Some(node) = nodes.iter().find(|node| node.id == id) else {
             break;
         };
         if node.role == "main"
@@ -122,7 +133,7 @@ pub(crate) fn viewport_for_node(snapshot: &AgentSnapshot, node_id: u64) -> (f64,
         }
         cursor = node.parent;
     }
-    viewport_of(snapshot)
+    viewport_of_nodes(nodes)
 }
 
 /// Whether a node's box lies outside the window, so pressing it would land on
