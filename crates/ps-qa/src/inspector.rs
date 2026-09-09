@@ -71,12 +71,24 @@ impl Descriptor {
 /// `--descriptor <path>` wins. Otherwise the build's own pinned path is tried,
 /// then the temporary directory is scanned, which is the fallback for a
 /// hand-launched build and the one that can find a stale instance.
+///
+/// A named descriptor that is not there is an error, not an invitation to
+/// scan. Falling through to discovery attached to the newest *other* host on
+/// the machine, which on a machine running several suites at once is another
+/// site's document: the tree came back, it was plausible, and it described a
+/// page nobody had asked about. A typo in a path is not consent to inspect
+/// somebody else's application.
 pub fn discover(explicit: Option<&str>) -> Result<Descriptor> {
     if let Some(path) = explicit {
         let path = PathBuf::from(path);
-        if path.exists() {
-            return read_descriptor(&path);
+        if !path.exists() {
+            bail!(
+                "descriptor {} does not exist. ps-qa attaches to the descriptor you \
+                 name and to no other; omit --descriptor to discover a running host.",
+                path.display()
+            );
         }
+        return read_descriptor(&path);
     }
 
     // The delivery script pins this path into the bundle's `Info.plist`, so a
