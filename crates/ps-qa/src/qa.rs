@@ -630,13 +630,50 @@ pub fn checks(dir: Option<&std::path::Path>) -> Result<Vec<Check>, String> {
 
     let mut all = Vec::new();
     let mut ids = HashMap::new();
+    // The last surface any file asked for, and which file asked. A check with
+    // no `open` runs on whatever the previous check left in front of it, which
+    // is a fine and deliberate way to write a sequence *inside* one file. See
+    // below for why it stops there.
+    let mut established: Option<(std::path::PathBuf, String)> = None;
     for file in files {
         let text = std::fs::read_to_string(&file)
             .map_err(|error| format!("could not read {}: {error}", file.display()))?;
         let group: Vec<Check> = ron::from_str(&text)
             .map_err(|error| format!("could not parse {}: {error}", file.display()))?;
-        for check in &group {
+        for (index, check) in group.iter().enumerate() {
             validate_check(check, &file, &mut ids)?;
+            /*
+             * A file may not inherit another file's surface in silence.
+             *
+             * Files are separate documents, read in name order, and a reader of
+             * one has no reason to know which surface the file before it left
+             * open. A first check with no `open` therefore runs against a
+             * screen nobody in this file chose: one site's checks measured a
+             * page they had never navigated to and passed, which is the worst
+             * possible outcome for a check.
+             *
+             * Inside a file the same inheritance is how a sequence is written
+             * and is left alone.
+             */
+            if index == 0
+                && check.open.is_none()
+                && let Some((previous_file, opener)) = &established
+            {
+                return Err(format!(
+                    concat!(
+                        "{}: check {:?} is the first in its file and declares no `open`, so it ",
+                        "would run on {:?}, which {} navigated to. Declare the surface this ",
+                        "file starts on."
+                    ),
+                    file.display(),
+                    check.id,
+                    opener,
+                    previous_file.display(),
+                ));
+            }
+            if let Some(opener) = check.open.as_deref() {
+                established = Some((file.to_path_buf(), opener.to_owned()));
+            }
         }
         all.extend(group);
     }
@@ -1547,7 +1584,7 @@ pub fn tally<'a>(results: &[(&'a Check, Result<(), String>)]) -> HashMap<&'a str
 #[cfg(test)]
 mod tests {
     use super::{
-        Check, Expect, action_description, name_changed, selection_changed, validate_check,
+        Check, Expect, action_description, checks, name_changed, selection_changed, validate_check,
         value_changed, verdict,
     };
     use blitz_control_protocol::SemanticNode;
@@ -1924,6 +1961,67 @@ mod tests {
             action_description(&check),
             "activate \"Save\", scroll 4 x -300 over \"listitem:\""
         );
+    }
+
+    /// A file may not start on a surface another file navigated to.
+    ///
+    /// Inheriting the previous check's screen is how a sequence is written
+    /// inside one file. Across files it is a dependency nobody declared and
+    /// nobody reading either file can see, and it is how one site's checks came
+    /// to measure a page they had never navigated to and pass.
+    #[test]
+    fn a_file_may_not_inherit_the_surface_another_file_opened() {
+        let directory = std::env::temp_dir().join(format!(
+            "ps-qa-check-files-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).expect("create check directory");
+        let check = |id: &str, open: &str| {
+            format!(
+                "(id:\"{id}\",group:\"g\",what:\"w\",open:{open},hover:None,\
+                 click:Some(\"Act\"),subject:\"Result\",expect:Paints)"
+            )
+        };
+        std::fs::write(
+            directory.join("a-settings.ron"),
+            format!(
+                "[{},{}]",
+                check("settings-open", "Some(\"Settings\")"),
+                check("settings-edit", "None")
+            ),
+        )
+        .expect("write the first file");
+        std::fs::write(
+            directory.join("b-registry.ron"),
+            format!("[{}]", check("registry-publish", "None")),
+        )
+        .expect("write the second file");
+
+        let error = checks(Some(&directory)).expect_err("the second file declares no surface");
+        assert!(error.contains("registry-publish"), "{error}");
+        assert!(
+            error.contains("Settings"),
+            "the inherited surface is named: {error}"
+        );
+        assert!(
+            error.contains("a-settings.ron"),
+            "so is the file that set it: {error}"
+        );
+
+        // Declaring the surface is the fix, and the whole directory then loads.
+        std::fs::write(
+            directory.join("b-registry.ron"),
+            format!("[{}]", check("registry-publish", "Some(\"Registry\")")),
+        )
+        .expect("rewrite the second file");
+        let loaded = checks(Some(&directory)).expect("both files declare where they start");
+        assert_eq!(loaded.len(), 3);
+
+        std::fs::remove_dir_all(&directory).expect("remove check directory");
     }
 
     #[test]
