@@ -95,6 +95,12 @@ ps-qa click "<name>"      # activate the first matching semantic node
 ps-qa nodes               # tree size and a role histogram
 ```
 
+`dom` takes either a selector or free text: `role:name`, `#id` and `@slot` mean
+what they mean in a check, and a bare word searches names, roles and values. A
+selector the document cannot answer at all, such as a role no node carries or
+an id nobody declares, is reported as such rather than as zero matches, which
+is the difference between "your selector" and "your page".
+
 `press` remains a generic, explicit pointer-path diagnostic. Application suites
 use semantic activation by default: resolve a name with `find`, retain the node
 id, and act on that id. When repeated rows intentionally share an accessible
@@ -173,6 +179,20 @@ tabs, then activates the exact semantic node id.
 | `ValueChanges` | the same semantic node exposes a different value after activation |
 | `SelectionChanges` | the same semantic node changes selected/pressed state |
 | `NameChanges` | the same semantic node exposes a different accessible name after the action |
+
+`Paints`, `PaintsNamed`, `PaintsMore` and `Count` judge on boxes, because the
+tree's visibility flag and the renderer disagree and trusting the flag once
+reported a screen full of icons as painting nothing. That leaves a disclosure
+unprovable in one direction: an Accordion, a Collapsible or a Tabs panel keeps
+its box and flips `hidden`, so every geometry assertion is satisfied whether it
+is open or closed, and only `Vanishes` could tell. Add `require_visible: true`
+to ask for the flag as well, for a subject whose box does not move.
+
+Navigation has its own deadline. `open_timeout_ms` is the arrival budget for
+the `open` step, separate from `outcome_timeout_ms` so that a route which
+fetches can declare what it costs without weakening the interaction the check
+exists to measure. Without it a live network round trip lands on either side of
+900ms and fails as `could not open …`, which reads as a missing control.
 
 Outcome checks can continue past activation with literal semantic input:
 `type_into: Some("New item"), text: Some("qa audit newest"), key: Some("Enter")`.
