@@ -120,12 +120,20 @@ pub enum Expect {
     ///
     /// Use this for validation flows where entering a valid value unlocks a
     /// Save or Send control without changing its geometry.
+    ///
+    /// A control whose box comes from its own label has no box on a host with
+    /// no fonts, and this refuses it however right the flag is. Declare
+    /// [`text_sized`](Check::text_sized) on such a subject to judge the flag
+    /// alone.
     Enabled,
     /// A painted named node refuses input after the action.
     ///
     /// This is the observable completion state for actions such as clearing a
     /// saved value: the control remains visible, but cannot be invoked again
     /// until there is something new to act on.
+    ///
+    /// Takes [`text_sized`](Check::text_sized) on the same terms as
+    /// [`Enabled`](Expect::Enabled).
     Disabled,
     /// No node matching the name exists.
     ///
@@ -562,6 +570,36 @@ pub struct Check {
     /// makes an exact count of open panels expressible at all.
     #[serde(default)]
     pub require_visible: bool,
+    /// The subject's box comes from its text, so judge its input state on the
+    /// flag and layout alone.
+    ///
+    /// [`Enabled`](Expect::Enabled) and [`Disabled`](Expect::Disabled) ask two
+    /// questions at once: the tree says this control accepts input, *and* it has
+    /// a box a person could aim at. That second half is the same font question
+    /// [`Present`](Expect::Present) exists for, and it is unanswerable on the
+    /// host that matters most. CI runs without a font catalogue; text lays out
+    /// at zero there, so a control sized by its own label measures nothing.
+    /// Measured on a `w-full` primary call to action: `0x44`, `enabled=true`
+    /// in the very tree the check reads, and both verdicts refused it. Two
+    /// sites hit this within a day of each other, one rewriting two checks to
+    /// assert what the button *gates* instead of the button, the other
+    /// dropping to [`Present`](Expect::Present) and losing the state assertion
+    /// entirely.
+    ///
+    /// So this is opt-in and per check, exactly like
+    /// [`require_visible`](Self::require_visible), and for the same reason: the
+    /// default meaning of an existing check must not change under it. A check
+    /// that declares this is saying "this subject is sized by its glyphs", and
+    /// gives up only the box, never the state. The node must still exist and
+    /// must still have been laid out, which is the floor
+    /// [`Present`](Expect::Present) already holds, so a control the document
+    /// never produced still fails.
+    ///
+    /// It is rejected on any other expectation. For the geometry axis the
+    /// vocabulary already has an answer, and it is
+    /// [`Present`](Expect::Present).
+    #[serde(default)]
+    pub text_sized: bool,
     /// Run this check only after every ordinary shared-instance outcome.
     ///
     /// A destructive sequence may deliberately remove fixture state that
@@ -762,6 +800,28 @@ fn validate_check(
         ));
     }
 
+    /*
+     * A weakening that does nothing must not look like it did something.
+     *
+     * `text_sized` trades a box for a layout, and only the two input-state
+     * verdicts ask for a box on the subject's own behalf. Accepted silently
+     * anywhere else it would read as "this check tolerates a fontless host"
+     * while the geometry it actually depends on was never relaxed, which is
+     * the sort of thing a suite discovers on the CI run it was written for.
+     */
+    if check.text_sized && !matches!(check.expect, Expect::Enabled | Expect::Disabled) {
+        return Err(format!(
+            concat!(
+                "{}: check {:?} declares text_sized with {:?}, which does not judge the ",
+                "subject's box on its own. text_sized applies to Enabled and Disabled; for a ",
+                "geometry assertion on a fontless host the expectation is Present"
+            ),
+            file.display(),
+            check.id,
+            check.expect,
+        ));
+    }
+
     if check.expect == Expect::Count && check.expect_count.is_none() {
         return Err(format!(
             "{}: check {:?} must declare expect_count with Count",
@@ -810,6 +870,21 @@ fn paints(node: &SemanticNode) -> bool {
 /// well says so, for the components geometry alone cannot judge.
 fn shows(check: &Check, node: &SemanticNode) -> bool {
     paints(node) && (!check.require_visible || node.visible)
+}
+
+/// Whether this check may read the subject's input state off this node.
+///
+/// A box is the default evidence that the control is on a screen, and stays
+/// the default. [`Check::text_sized`] trades it for the weaker thing that
+/// survives a fontless host: the node was laid out. That is the same floor
+/// [`Expect::Present`] holds, and it is still falsifiable - a node the document
+/// never created is not here, and one that never reached layout has no bounds.
+fn state_readable(check: &Check, node: &SemanticNode) -> bool {
+    if check.text_sized {
+        node.bounds.is_some()
+    } else {
+        paints(node)
+    }
 }
 
 /// The verdict for one check, given the tree before and after its action.
@@ -919,10 +994,28 @@ pub fn verdict(
                 ));
             }
         }
-        Expect::Enabled => {
-            if found.iter().any(|node| paints(node) && node.enabled) {
+        Expect::Enabled | Expect::Disabled => {
+            let wanted = check.expect == Expect::Enabled;
+            let word = if wanted { "enabled" } else { "disabled" };
+            if found
+                .iter()
+                .any(|node| state_readable(check, node) && node.enabled == wanted)
+            {
                 return Ok(());
             }
+            /*
+             * Say when the state was right and only the box was empty.
+             *
+             * "no painted, enabled node" sends the reader looking for a
+             * missing control, and on a fontless host the control is there
+             * with the flag the check asked for. That is a one-word fix in the
+             * check file, so name the word rather than making the next person
+             * measure the tree to find it.
+             */
+            let text_sized_would_pass = !check.text_sized
+                && found
+                    .iter()
+                    .any(|node| node.bounds.is_some() && node.enabled == wanted);
             let states = found
                 .iter()
                 .take(3)
@@ -933,28 +1026,22 @@ pub fn verdict(
                     )
                 })
                 .collect::<Vec<_>>();
+            let hint = if text_sized_would_pass {
+                format!(
+                    "; a laid-out node is already {word} with an empty box, which is what a \
+                     control sized by its own label measures on a host with no fonts. Declare \
+                     text_sized: true to judge the flag there"
+                )
+            } else {
+                String::new()
+            };
             return Err(format!(
-                "no painted, enabled node matching {:?} ({})",
-                check.subject,
-                states.join(", ")
-            ));
-        }
-        Expect::Disabled => {
-            if found.iter().any(|node| paints(node) && !node.enabled) {
-                return Ok(());
-            }
-            let states = found
-                .iter()
-                .take(3)
-                .map(|node| {
-                    format!(
-                        "id={} role={:?} name={:?} enabled={} bounds={:?}",
-                        node.id, node.role, node.name, node.enabled, node.bounds
-                    )
-                })
-                .collect::<Vec<_>>();
-            return Err(format!(
-                "no painted, disabled node matching {:?} ({})",
+                "no {}, {word} node matching {:?} ({}){hint}",
+                if check.text_sized {
+                    "laid out"
+                } else {
+                    "painted"
+                },
                 check.subject,
                 states.join(", ")
             ));
@@ -2090,6 +2177,7 @@ mod tests {
             outcome_timeout_ms: 0,
             stable_for_ms: 0,
             require_visible: false,
+            text_sized: false,
             destructive: false,
             subject: "Output level".into(),
             expect: Expect::ValueChanges,
@@ -2425,6 +2513,96 @@ mod tests {
         assert!(verdict(&check, &[], &[node(false, Some([0.0, 0.0, 20.0, 20.0]))]).is_ok());
         assert!(verdict(&check, &[], &[node(true, Some([0.0, 0.0, 20.0, 20.0]))]).is_err());
         assert!(verdict(&check, &[], &[node(false, Some([0.0, 0.0, 0.0, 0.0]))]).is_err());
+    }
+
+    /// A primary call to action is unassertable on the host CI actually runs.
+    ///
+    /// This is the shape both sites measured: a `w-full` button whose width
+    /// collapses to its label, so with no font catalogue it lays out `0x44`
+    /// while the very tree the check reads carries `enabled=true`. `Enabled`
+    /// and `Disabled` both refuse it on the box, so the state nobody disputes
+    /// cannot be asserted at all. One suite rewrote two checks to assert what
+    /// the button gates; another dropped to `Present` and lost the state.
+    #[test]
+    fn a_control_sized_by_its_label_can_still_be_judged_on_a_fontless_host() {
+        let cta = |enabled: bool, bounds| SemanticNode {
+            dom_id: None,
+            id: 41,
+            parent: None,
+            role: "button".into(),
+            name: "Continue".into(),
+            value: None,
+            enabled,
+            visible: true,
+            selected: false,
+            bounds,
+            slot: None,
+        };
+        // What a host with no font catalogue reports for that button.
+        let fontless = [cta(true, Some([24.0, 612.0, 0.0, 44.0]))];
+
+        let mut check = parse("");
+        check.subject = "button:Continue".into();
+        check.expect = Expect::Enabled;
+        let error = verdict(&check, &[], &fontless)
+            .expect_err("this is the gap: the flag is right and the box is empty");
+        assert!(
+            error.contains("text_sized"),
+            "the failure has to name the one-word fix, got {error:?}"
+        );
+
+        check.text_sized = true;
+        verdict(&check, &[], &fontless).expect("the tree carries the state the check asks about");
+
+        // And it still fails everywhere it should. A subject the document
+        // never produced is the case that matters most: an expectation that
+        // passes for a node which does not exist is worse than no expectation.
+        assert!(
+            verdict(&check, &[], &[]).is_err(),
+            "an absent control must still fail"
+        );
+        assert!(
+            verdict(&check, &[], &[cta(true, None)]).is_err(),
+            "a node that never reached layout must still fail"
+        );
+        assert!(
+            verdict(&check, &[], &[cta(false, Some([24.0, 612.0, 0.0, 44.0]))]).is_err(),
+            "only the box is given up, never the state"
+        );
+
+        // The same subject on a fonted host is unaffected either way.
+        let fonted = [cta(true, Some([24.0, 612.0, 328.0, 44.0]))];
+        verdict(&check, &[], &fonted).expect("a real box satisfies the weaker box test too");
+        check.text_sized = false;
+        verdict(&check, &[], &fonted).expect("the default meaning of Enabled has not moved");
+
+        // Disabled reads the flag on the same terms.
+        check.expect = Expect::Disabled;
+        check.text_sized = true;
+        verdict(&check, &[], &[cta(false, Some([24.0, 612.0, 0.0, 44.0]))])
+            .expect("a disabled text-sized control is assertable too");
+        assert!(verdict(&check, &[], &fontless).is_err());
+    }
+
+    /// The weakening is scoped to the verdicts it weakens.
+    ///
+    /// Declared from a check file, so this also pins the spelling a suite
+    /// writes.
+    #[test]
+    fn text_sized_is_refused_where_it_would_relax_nothing() {
+        let mut check = parse("text_sized:true,");
+        assert!(check.text_sized, "the field is read from the check file");
+        check.expect = Expect::Paints;
+        let error = validate_check(&check, Path::new("cta.ron"), &mut HashMap::new())
+            .expect_err("Paints does not consult text_sized");
+        assert!(
+            error.contains("Present"),
+            "point at the answer, got {error:?}"
+        );
+
+        check.expect = Expect::Enabled;
+        validate_check(&check, Path::new("cta.ron"), &mut HashMap::new())
+            .expect("Enabled is one of the two verdicts it applies to");
     }
 
     #[test]
