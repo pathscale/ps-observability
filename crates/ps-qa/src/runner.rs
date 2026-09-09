@@ -51,14 +51,19 @@ use crate::{app, audit, cli, inspector, paint_audit, qa, reach, report, sweep};
 ///
 /// Background counters and provider refreshes can keep the whole semantic tree
 /// changing indefinitely. They are irrelevant to whether the requested panel
-/// arrived, so navigation gets the same sub-second budget as every other QA
-/// action and polls its exact marker.
+/// arrived, so it polls its exact marker rather than a settled tree.
+///
+/// `within` is the caller's budget, already scaled. Ordinary reveals keep the
+/// sub-second interaction contract; a check's `open` step passes whatever that
+/// check declared, because a route change that costs a live network round trip
+/// is not an interaction and cannot honestly be held to one.
 async fn wait_for_arrival(
     client: &mut Client,
     destination: Option<&reach::Surface>,
     want_here: &str,
+    within: Duration,
 ) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + check_timeout(900);
+    let deadline = tokio::time::Instant::now() + within;
     let mut painted_streak = 0;
     let mut root = None;
     loop {
@@ -148,11 +153,12 @@ async fn wait_for_navigation_arrival(
     want_here: &str,
     named_document: bool,
     document_name: &str,
+    within: Duration,
 ) -> Result<bool> {
     if !named_document {
-        return wait_for_arrival(client, destination, want_here).await;
+        return wait_for_arrival(client, destination, want_here, within).await;
     }
-    let deadline = tokio::time::Instant::now() + check_timeout(900);
+    let deadline = tokio::time::Instant::now() + within;
     let mut painted_streak = 0;
     let mut selected_tab = None;
     loop {
@@ -1102,6 +1108,7 @@ async fn run_qa(
          */
         let mut open_error = None;
         let mut pixel_outcome: Option<std::result::Result<(), String>> = None;
+        let open_budget = declared_open_timeout(check);
         if let Some(want) = check.open.as_deref() {
             /*
              * A permanent surface marker can answer "already there". A
@@ -1171,6 +1178,7 @@ async fn run_qa(
                     want_here,
                     named_document,
                     want,
+                    open_budget,
                 )
                 .await?;
                 // A surface transition can briefly remove the opener before
@@ -1185,6 +1193,7 @@ async fn run_qa(
                         want_here,
                         named_document,
                         want,
+                        open_budget,
                     )
                     .await?;
                 }
@@ -1195,6 +1204,7 @@ async fn run_qa(
                         want_here,
                         named_document,
                         want,
+                        open_budget,
                     )
                     .await?;
                 }
@@ -1210,12 +1220,15 @@ async fn run_qa(
                         want_here,
                         named_document,
                         want,
+                        open_budget,
                     )
                     .await?
                     {
                         open_error = Some(format!(
-                            "could not open {want:?}: destination did not paint within {}ms",
-                            check_timeout(900).as_millis()
+                            "could not open {want:?}: the control was activated but the \
+                             destination did not paint within {}ms. Raise open_timeout_ms \
+                             if this route fetches.",
+                            open_budget.as_millis()
                         ));
                     }
                 }
@@ -1334,7 +1347,7 @@ async fn run_qa(
         if open_error.is_none()
             && let Some(reveal) = check.reveal_before_capture.as_deref()
         {
-            let arrived = wait_for_arrival(client, None, reveal).await?;
+            let arrived = wait_for_arrival(client, None, reveal, check_timeout(900)).await?;
             if !arrived {
                 open_error = Some(format!(
                     "could not reveal {reveal:?}: it did not paint within {}ms",
@@ -1389,7 +1402,7 @@ async fn run_qa(
                 if let Err(error) = hovered {
                     open_error = Some(error);
                 } else if let Some(next) = check.prepare.as_deref().or(check.click.as_deref())
-                    && !wait_for_arrival(client, None, next).await?
+                    && !wait_for_arrival(client, None, next, check_timeout(900)).await?
                 {
                     // A virtualized row can reconcile after ScrollIntoView
                     // and lose the hover that was sent to its prior node.
@@ -1397,7 +1410,7 @@ async fn run_qa(
                     // race into a misleading "could not click" failure.
                     if let Err(error) = repeat_hover(client, hover, false).await {
                         open_error = Some(error);
-                    } else if !wait_for_arrival(client, None, next).await? {
+                    } else if !wait_for_arrival(client, None, next, check_timeout(900)).await? {
                         open_error = Some(format!(
                             "hovering {:?} did not reveal {next:?}",
                             hover.target()
@@ -1506,7 +1519,7 @@ async fn run_qa(
                 .or(check.type_into.as_deref())
                 .or(check.key_on.as_deref())
             {
-                let _ = wait_for_arrival(client, None, next).await?;
+                let _ = wait_for_arrival(client, None, next, check_timeout(900)).await?;
             }
         }
 
@@ -1546,7 +1559,7 @@ async fn run_qa(
                 pixel_outcome = Some(measured);
             } else if check.expect == qa::Expect::PixelsHoldAfterHover {
                 let measured = async {
-                    match wait_for_arrival(client, None, hover.target()).await {
+                    match wait_for_arrival(client, None, hover.target(), check_timeout(900)).await {
                         Ok(true) => {}
                         Ok(false) => {
                             return Err(format!(
@@ -2463,6 +2476,24 @@ async fn settle_for_outcome(
 /// Capture settling, semantic settling and transport waits must all derive
 /// from this value. Independent literals let one layer give up while another
 /// still claims the outcome has time remaining.
+/// The budget a check's navigation step is allowed.
+///
+/// Separate from the outcome budget on purpose. Opening a surface and measuring
+/// a control are different questions with different costs: the outcome contract
+/// is about how fast the interface answers a person, while `open` may be a
+/// route change that fetches. A route that takes a live network round trip
+/// lands on either side of a fixed 900ms with no way to say so, and the failure
+/// it produced blamed the control -- `could not open "Crates"` reads as a
+/// missing tab, not as a deadline. Raising the deadline for every check to
+/// cover the slow one would have weakened every other navigation in the suite.
+fn declared_open_timeout(check: &qa::Check) -> Duration {
+    check_timeout(if check.open_timeout_ms == 0 {
+        900
+    } else {
+        check.open_timeout_ms
+    })
+}
+
 fn declared_outcome_timeout(check: &qa::Check) -> Duration {
     check_timeout(if check.outcome_timeout_ms == 0 {
         900
@@ -3385,7 +3416,7 @@ async fn materialize_deferred_content(
     };
     let query = want.split_once(':').map_or(want, |(_, name)| name);
     type_text(client, field, query).await?;
-    if wait_for_arrival(client, None, want).await? {
+    if wait_for_arrival(client, None, want, check_timeout(900)).await? {
         // The reveal field is a discovery mechanism, not part of the check's
         // authored state. Leaving it filled hides outcomes whose accessible
         // name changes (and poisons every later check on the surface). Lazy
@@ -3394,9 +3425,9 @@ async fn materialize_deferred_content(
         // A virtualized catalogue that truly requires its query gets it put
         // back rather than losing the control before the action.
         type_text(client, field, "").await?;
-        if !wait_for_arrival(client, None, want).await? {
+        if !wait_for_arrival(client, None, want, check_timeout(900)).await? {
             type_text(client, field, query).await?;
-            let _ = wait_for_arrival(client, None, want).await?;
+            let _ = wait_for_arrival(client, None, want, check_timeout(900)).await?;
         }
     } else {
         // Absence is itself a valid authored outcome (for example, a setup
@@ -5826,15 +5857,15 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::{
         InventoryClass, OutcomeStability, accumulated_hover_signatures, arrival_sample_matches,
-        arrived_without_navigation, assess_pixel_change, capture_node_id, declared_outcome_timeout,
-        duplicate_dom_ids, generated_dom_id, hover_signature_counts, inventory_class,
-        is_pagination_control, measure_ink, name_matches, named_document_is_active,
-        named_document_is_active_with_permanent, named_document_opener_for, outcome_check_ids,
-        outcome_verdict, pagination_advanced, painted_bounds, painted_named, pixels_change,
-        pixels_hold, require_transparent_window_tint, resolved_action_target, rgb_pixels_hold,
-        saved_control_node, saved_controls, selector_matches_node, settle_for_outcome,
-        setup_value_landed, stable_arrival, subject_belongs_to_scope,
-        validate_surface_filter_against,
+        arrived_without_navigation, assess_pixel_change, capture_node_id, declared_open_timeout,
+        declared_outcome_timeout, duplicate_dom_ids, generated_dom_id, hover_signature_counts,
+        inventory_class, is_pagination_control, measure_ink, name_matches,
+        named_document_is_active, named_document_is_active_with_permanent,
+        named_document_opener_for, outcome_check_ids, outcome_verdict, pagination_advanced,
+        painted_bounds, painted_named, pixels_change, pixels_hold, require_transparent_window_tint,
+        resolved_action_target, rgb_pixels_hold, saved_control_node, saved_controls,
+        selector_matches_node, settle_for_outcome, setup_value_landed, stable_arrival,
+        subject_belongs_to_scope, validate_surface_filter_against,
     };
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
@@ -6581,6 +6612,7 @@ mod tests {
             covers: Vec::new(),
             press: false,
             settle_after_ms: 0,
+            open_timeout_ms: 0,
             outcome_timeout_ms: 0,
             stable_for_ms: 0,
             require_visible: false,
@@ -6598,6 +6630,33 @@ mod tests {
         assert_eq!(
             declared_outcome_timeout(&check),
             Duration::from_millis(1_700)
+        );
+    }
+
+    /// Navigation has its own budget, and it is not the outcome budget.
+    ///
+    /// A route change that fetches lands on either side of a fixed 900ms, and
+    /// the only way to cover it before this was to raise `outcome_timeout_ms`,
+    /// which weakens the measured interaction the check exists to time. The two
+    /// deadlines move independently.
+    #[test]
+    fn the_open_step_takes_its_own_declared_deadline() {
+        let mut check = check("crates-tab", Some("Publish"), "Published");
+        assert_eq!(declared_open_timeout(&check), Duration::from_millis(900));
+
+        check.open_timeout_ms = 4_000;
+        assert_eq!(declared_open_timeout(&check), Duration::from_millis(4_000));
+        assert_eq!(
+            declared_outcome_timeout(&check),
+            Duration::from_millis(900),
+            "a slow route must not weaken the interaction contract"
+        );
+
+        check.outcome_timeout_ms = 1_500;
+        assert_eq!(declared_open_timeout(&check), Duration::from_millis(4_000));
+        assert_eq!(
+            declared_outcome_timeout(&check),
+            Duration::from_millis(1_500)
         );
     }
 
