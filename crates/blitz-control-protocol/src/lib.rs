@@ -1,4 +1,32 @@
-//! Typed local debugging protocol carried by endpoint-libs framing.
+//! The Blitz agent-control and diagnostics surface: one vocabulary, one core,
+//! two transports.
+//!
+//! # The shape of this crate
+//!
+//! This module is the **vocabulary**: the request, response and event types,
+//! and the MCP framing that carries them. It is what a client needs and all it
+//! needs, it costs serde and endpoint-libs, and it is what you get with no
+//! features enabled.
+//!
+//! [`document`] is the **core**, behind `engine`. It answers a request against
+//! a `blitz-dom` document: the semantic tree, the capture surface, input
+//! injection. It knows nothing about sockets.
+//!
+//! [`in_process`] and [`server`] are the **two transports** over that core. An
+//! embedder holding the document calls the first one directly; a harness or an
+//! agent outside the process reaches the second one over a Unix socket.
+//! [`client`] is the connecting half of that socket, and it is a sibling of the
+//! server rather than a layer on top of it, because a peer can be both: an
+//! application driven by agents while it drives a browser it embeds is a client
+//! and a server at once.
+//!
+//! There were three copies of this vocabulary before, in three repositories,
+//! and two of them were transports rather than duplicates: an in-process
+//! interface in the browser and a socket in the Tauri runtime, each with its
+//! own spelling of the same commands. The transports are both still here. The
+//! spelling is not.
+//!
+//! # Typed local debugging protocol carried by endpoint-libs framing.
 //!
 //! This is deliberately not WebDriver. It models the native renderer and app
 //! lifecycle directly, supports observation by more than one client, and has
@@ -30,6 +58,10 @@
 //! which is where the expense actually is. A build that cannot serve
 //! diagnostics says so by omitting the tool from `tools/list`; see
 //! [`encode_tools_list_response`].
+
+/// The core: reading, capturing and driving a document.
+#[cfg(feature = "engine")]
+pub mod document;
 
 use endpoint_libs::libs::ws::mcp_wire::{INVALID_PARAMS, INVALID_REQUEST, parse};
 pub use endpoint_libs::libs::ws::{
