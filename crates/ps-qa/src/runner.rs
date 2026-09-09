@@ -6345,6 +6345,7 @@ mod tests {
             settle_after_ms: 0,
             outcome_timeout_ms: 0,
             stable_for_ms: 0,
+            require_visible: false,
             destructive: false,
             subject: subject.into(),
             expect: Expect::Paints,
