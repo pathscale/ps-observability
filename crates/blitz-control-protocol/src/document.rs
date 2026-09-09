@@ -2667,3 +2667,897 @@ mod role_projection_tests {
         );
     }
 }
+
+/// What the runtime's own tests asserted about this code.
+///
+/// They lived in `tauri-runtime-blitz`'s `runtime.rs`, beside a window, and
+/// every one of them is about a document instead: what a node is named, what
+/// it is called, whether it is visible, what an activation reaches, what a
+/// capture draws, and what a diagnostic row reports. They move with the code
+/// they cover.
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use crate::SemanticNode;
+    use crate::document::{
+        SemanticCandidate, diagnostic_layout_row, diagnostic_style_row, dom_chain_is_attached,
+        element_attr, layout_chain_is_valid, layout_chain_validities, node_is_visible,
+        semantic_name, semantic_role, semantic_selected,
+    };
+    use blitz_dom::DocumentConfig;
+
+    #[test]
+    fn semantic_visibility_includes_display_none_ancestors() {
+        let mut document = ScriptDocument::from_html(
+            "<main><button id='shown'>Run</button><div style='display:none'><button id='hidden'>Hidden</button></div></main>",
+            DocumentConfig::default(),
+        );
+        document.inner_mut().resolve(0.0);
+        let inner = document.inner();
+        let node_id = |value: &str| {
+            inner
+                .tree()
+                .iter()
+                .find_map(|(id, node)| {
+                    node.element_data()
+                        .is_some_and(|element| element_attr(element, "id") == Some(value))
+                        .then_some(id)
+                })
+                .unwrap()
+        };
+        let shown = node_id("shown");
+        let hidden = node_id("hidden");
+        assert!(node_is_visible(&inner, shown));
+        assert!(!node_is_visible(&inner, hidden));
+        let shown_node = inner.get_node(shown).unwrap();
+        let shown_element = shown_node.element_data().unwrap();
+        assert_eq!(semantic_role(shown_element), "button");
+        let labels = crate::document::LabelIndex::build(&inner);
+        assert_eq!(
+            semantic_name(shown_element, shown_node, "button", &inner, shown, &labels),
+            "Run"
+        );
+    }
+
+    /// A name is made of rendered text, so a `<style>` inside a link is not
+    /// part of it.
+    ///
+    /// `textContent` is the DOM property and includes every text node in the
+    /// subtree, stylesheets and scripts among them. An accessible name does
+    /// not, because those elements are not rendered.
+    ///
+    /// Measured on honey.id, whose header logo is an anchor wrapping an inline
+    /// SVG with a `<style>` in it. The home link arrived named
+    /// ".animated-logo path { fill-opacity: 0; ... }", which is unusable to a
+    /// person and unaddressable to a check.
+
+    #[test]
+    fn a_style_element_is_not_part_of_a_name() {
+        let mut document = ScriptDocument::from_html(
+            "<main>\
+               <a id='logo' href='/'>\
+                 <svg><style>.logo path { fill: red; }</style></svg>\
+                 Honey\
+               </a>\
+               <a id='scripted' href='/x'><script>var noise = 1;</script>Docs</a>\
+             </main>",
+            DocumentConfig::default(),
+        );
+        document.inner_mut().resolve(0.0);
+        let inner = document.inner();
+        let labels = crate::document::LabelIndex::build(&inner);
+        let named = |value: &str| {
+            let id = inner
+                .tree()
+                .iter()
+                .find_map(|(id, node)| {
+                    node.element_data()
+                        .is_some_and(|element| element_attr(element, "id") == Some(value))
+                        .then_some(id)
+                })
+                .unwrap();
+            let node = inner.get_node(id).unwrap();
+            let element = node.element_data().unwrap();
+            let role = semantic_role(element);
+            semantic_name(element, node, &role, &inner, id, &labels)
+        };
+
+        assert_eq!(named("logo"), "Honey", "a stylesheet is not part of a name");
+        assert_eq!(named("scripted"), "Docs", "and neither is a script");
+    }
+
+    /// Two stacked lines make two words, not one run-on word.
+    ///
+    /// crates.vip's failure alert is a column of two block-level lines, and it
+    /// arrived named "This page could not loadWebSocket connection failed":
+    /// every text node was concatenated with nothing between it and the next.
+    /// A name a person cannot read is a name a check cannot address.
+    ///
+    /// The inline case is the other half of the assertion, and it is what
+    /// stops the fix being "put a space everywhere": a name built from two
+    ///
+    /// `inline-block` is the third case, and it is why the test is not
+    /// "outside is inline": an atomic inline establishes its own box, so a
+    /// browser separates it the way it separates a block.
+    /// spans is still one word, because that is what the page draws.
+    #[test]
+    fn stacked_lines_are_separated_and_inline_ones_are_not() {
+        let mut document = ScriptDocument::from_html(
+            "<main>\
+               <div id='stacked' role='alert'>\
+                 <div>This page could not load</div>\
+                 <div>WebSocket connection failed</div>\
+               </div>\
+               <div id='inline' role='alert'><span>Work</span><span>Tables</span></div>\
+               <div id='atomic' role='alert'>\
+                 <span style='display: inline-block'>Registry</span>\
+                 <span style='display: inline-block'>unavailable</span>\
+               </div>\
+             </main>",
+            DocumentConfig::default(),
+        );
+        document.inner_mut().resolve(0.0);
+        let inner = document.inner();
+        let labels = crate::document::LabelIndex::build(&inner);
+        let named = |value: &str| {
+            let id = inner
+                .tree()
+                .iter()
+                .find_map(|(id, node)| {
+                    node.element_data()
+                        .is_some_and(|element| element_attr(element, "id") == Some(value))
+                        .then_some(id)
+                })
+                .unwrap();
+            let node = inner.get_node(id).unwrap();
+            let element = node.element_data().unwrap();
+            let role = semantic_role(element);
+            semantic_name(element, node, &role, &inner, id, &labels)
+        };
+
+        assert_eq!(
+            named("stacked"),
+            "This page could not load WebSocket connection failed",
+            "block-level lines are separate words"
+        );
+        assert_eq!(
+            named("inline"),
+            "WorkTables",
+            "inline spans are one word, as the page draws them"
+        );
+        assert_eq!(
+            named("atomic"),
+            "Registry unavailable",
+            "an inline-block is an atomic inline, and a browser separates it"
+        );
+    }
+
+    /// A form control is named by the label pointing at it.
+    ///
+    /// The name came from `aria-label`, `alt` and `title` and from nothing
+    /// else, so the ordinary way to label a field produced no name at all and
+    /// every text input on every page arrived anonymous. That is not only a
+    /// reporting defect: a harness addresses a control by name, so an
+    /// anonymous field cannot be typed into and a check that means "enter a URL
+    /// and save" cannot be written.
+    ///
+    /// Measured on support.cafe's connection settings, whose three fields each
+    /// carry a correct `<Label for>` and all reported as `textbox ""`.
+
+    #[test]
+    fn a_field_is_named_by_its_label() {
+        let mut document = ScriptDocument::from_html(
+            "<main>\
+               <label for='endpoint'>Endpoint URL</label><input id='endpoint'>\
+               <label>Wrapped<input id='wrapped'></label>\
+               <label for='overridden'>Ignored</label>\
+               <input id='overridden' aria-label='Author own name'>\
+               <input id='placeheld' placeholder='Search everything'>\
+               <input id='nameless'>\
+             </main>",
+            DocumentConfig::default(),
+        );
+        document.inner_mut().resolve(0.0);
+        let inner = document.inner();
+        let labels = crate::document::LabelIndex::build(&inner);
+        let named = |value: &str| {
+            let id = inner
+                .tree()
+                .iter()
+                .find_map(|(id, node)| {
+                    node.element_data()
+                        .is_some_and(|element| element_attr(element, "id") == Some(value))
+                        .then_some(id)
+                })
+                .unwrap();
+            let node = inner.get_node(id).unwrap();
+            let element = node.element_data().unwrap();
+            let role = semantic_role(element);
+            semantic_name(element, node, &role, &inner, id, &labels)
+        };
+
+        assert_eq!(named("endpoint"), "Endpoint URL", "a `for` association");
+        assert_eq!(named("wrapped"), "Wrapped", "a label wrapped around it");
+        assert_eq!(
+            named("overridden"),
+            "Author own name",
+            "`aria-label` is the author overriding the visible text, and wins"
+        );
+        assert_eq!(
+            named("placeheld"),
+            "Search everything",
+            "a placeholder is the last resort, and names most search fields"
+        );
+        assert_eq!(named("nameless"), "", "nothing names it, so it has no name");
+    }
+
+    /// A live region is named by what it says.
+    ///
+    /// `alert` and `status` are the roles an application uses to report that
+    /// something happened -- a refusal, a saved confirmation -- and what they
+    /// report is their content. Anonymous, "the reason is shown" is not a
+    /// question a check can ask, so every validation outcome has to be
+    /// approximated by something else that moved.
+    ///
+    /// The negative half is the point of the test. A wrapper's text content is
+    /// its whole subtree, so naming generic containers would give every one of
+    /// them a name made of the entire page, and any name-matching selector
+    /// would then match everything.
+
+    #[test]
+    fn a_live_region_is_named_by_what_it_says() {
+        let mut document = ScriptDocument::from_html(
+            "<main>\
+               <p id='refusal' role='alert'>that is not an address</p>\
+               <p id='saved' role='status'>Settings saved</p>\
+               <div id='wrapper'><span>inner text</span></div>\
+             </main>",
+            DocumentConfig::default(),
+        );
+        document.inner_mut().resolve(0.0);
+        let inner = document.inner();
+        let labels = crate::document::LabelIndex::build(&inner);
+        let named = |value: &str| {
+            let id = inner
+                .tree()
+                .iter()
+                .find_map(|(id, node)| {
+                    node.element_data()
+                        .is_some_and(|element| element_attr(element, "id") == Some(value))
+                        .then_some(id)
+                })
+                .unwrap();
+            let node = inner.get_node(id).unwrap();
+            let element = node.element_data().unwrap();
+            let role = semantic_role(element);
+            semantic_name(element, node, &role, &inner, id, &labels)
+        };
+
+        assert_eq!(named("refusal"), "that is not an address");
+        assert_eq!(named("saved"), "Settings saved");
+        assert_eq!(
+            named("wrapper"),
+            "",
+            "a container named by its subtree would make every selector match everything"
+        );
+    }
+
+    #[test]
+    fn rooted_inspection_returns_only_the_requested_dom_subtree() {
+        let mut document = ScriptDocument::from_html(
+            "<main><section id='left'><button>Left action</button></section><section id='right'><button>Right action</button></section></main>",
+            DocumentConfig::default(),
+        );
+        document.inner_mut().resolve(0.0);
+        let root = document
+            .inner()
+            .query_selector("#left")
+            .unwrap()
+            .unwrap()
+            .as_u64();
+
+        let DebugResponse::AgentSnapshot(snapshot) =
+            inspect_document(&mut document, Some(root), 40, 7)
+        else {
+            panic!("rooted inspection did not return a semantic snapshot");
+        };
+        let names: Vec<_> = snapshot
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        assert!(names.contains(&"Left action"));
+        assert!(!names.contains(&"Right action"));
+        assert_eq!(snapshot.revision, 7);
+    }
+
+    #[test]
+    fn semantic_geometry_rejects_a_detached_layout_ancestor() {
+        let mut document = ScriptDocument::from_html(
+            "<main><button id='target'>Run</button></main>",
+            DocumentConfig::default(),
+        );
+        document.inner_mut().resolve(0.0);
+        let inner = document.inner();
+        let target = inner.query_selector("#target").unwrap().unwrap();
+        let node_limit = inner.tree().iter().count();
+        assert!(layout_chain_is_valid(&inner, target, node_limit));
+        let candidate = || SemanticCandidate {
+            id: target,
+            parent: None,
+            visible: true,
+        };
+        assert_eq!(
+            layout_chain_validities(&inner, &[candidate()], node_limit).get(&target),
+            Some(&true)
+        );
+
+        let missing_parent = (1..=1024)
+            .map(blitz_dom::NodeId::from_u64)
+            .find(|id| inner.get_node(*id).is_none())
+            .expect("the fixture must leave at least one node id unused");
+        inner
+            .get_node(target)
+            .unwrap()
+            .layout_parent
+            .set(Some(missing_parent));
+
+        assert!(!layout_chain_is_valid(&inner, target, node_limit));
+        assert_eq!(
+            layout_chain_validities(&inner, &[candidate()], node_limit).get(&target),
+            Some(&false)
+        );
+    }
+
+    #[test]
+    fn semantic_geometry_rejects_a_retained_dom_subtree() {
+        let mut document = ScriptDocument::from_html(
+            "<main><section id='removed'><button id='target'>Run</button></section></main>",
+            DocumentConfig::default(),
+        );
+        let (removed, target) = {
+            let inner = document.inner();
+            (
+                inner.query_selector("#removed").unwrap().unwrap(),
+                inner.query_selector("#target").unwrap().unwrap(),
+            )
+        };
+        let node_limit = document.inner().tree().iter().count();
+        assert!(dom_chain_is_attached(&document.inner(), target, node_limit));
+
+        blitz_dom::DocumentMutator::new(&mut document.inner_mut()).remove_node(removed);
+
+        let inner = document.inner();
+        assert!(
+            inner.get_node(target).is_some(),
+            "the DOM keeps detached nodes alive for JavaScript wrappers"
+        );
+        assert!(!dom_chain_is_attached(&inner, target, node_limit));
+    }
+
+    #[test]
+    fn semantic_selection_includes_native_and_aria_states() {
+        let document = ScriptDocument::from_html(
+            r#"
+            <button id="pressed" aria-pressed="true">Pressed</button>
+            <div id="checked" role="radio" aria-checked="true">Checked</div>
+            <div id="selected" role="option" aria-selected="true">Selected</div>
+            <button id="current-page" aria-current="page">Current page</button>
+            <input id="native" type="checkbox" checked>
+            <button id="plain">Plain</button>
+            <!--
+              A framework rendering a controlled value writes the value out
+              rather than omitting the attribute. Solid emits `checked="false"`
+              for `checked={false}`, and reading presence alone called that
+              selected: every Switch, Radio and Checkbox in the QA harness
+              reported `selected: true` before anything was pressed, and could
+              never change, which read as three components ignoring a click.
+            -->
+            <input id="native-unchecked" type="checkbox" checked="false">
+            <div id="aria-false" role="option" aria-selected="false">Not selected</div>
+            <button id="current-false" aria-current="false">Not current</button>
+            <div id="selected-false" role="option" selected="false">Not selected</div>
+            "#,
+            DocumentConfig::default(),
+        );
+        let inner = document.inner();
+        let selected = |selector: &str| {
+            let id = inner.query_selector(selector).unwrap().unwrap();
+            semantic_selected(inner.get_node(id).unwrap().element_data().unwrap())
+        };
+
+        assert!(selected("#pressed"));
+        assert!(selected("#checked"));
+        assert!(selected("#selected"));
+        assert!(selected("#current-page"));
+        assert!(selected("#native"));
+        assert!(!selected("#plain"));
+        assert!(!selected("#native-unchecked"));
+        assert!(!selected("#aria-false"));
+        assert!(!selected("#current-false"));
+        assert!(!selected("#selected-false"));
+    }
+
+    #[test]
+    fn node_activation_reaches_an_offscreen_mousedown_handler() {
+        let mut document = ScriptDocument::from_html(
+            r#"
+            <button id="target" style="position:absolute;left:-900px;width:80px;height:30px">Run</button>
+            <output id="result"></output>
+            <script>
+              const target = document.getElementById("target");
+              const result = document.getElementById("result");
+              target.addEventListener("mousedown", () => result.textContent += "down ");
+              target.addEventListener("click", () => result.textContent += "click");
+            </script>
+            "#,
+            DocumentConfig::default(),
+        );
+        document.execute_scripts();
+        document.inner_mut().resolve(0.0);
+        let (target, result) = {
+            let inner = document.inner();
+            (
+                inner.query_selector("#target").unwrap().unwrap(),
+                inner.query_selector("#result").unwrap().unwrap(),
+            )
+        };
+        assert!(
+            document
+                .inner()
+                .get_client_bounding_rect(target)
+                .is_some_and(|rect| rect.x < 0.0),
+            "the fixture must be outside the viewport"
+        );
+
+        activate_agent_node(&mut document, target.as_u64(), 1).unwrap();
+
+        assert_eq!(
+            document.inner().get_node(result).unwrap().text_content(),
+            "down click"
+        );
+    }
+
+    #[test]
+    fn node_activation_bubbles_to_delegated_handlers() {
+        let mut document = ScriptDocument::from_html(
+            r#"
+            <main id="root">
+              <button id="target" style="width:80px;height:30px">Run</button>
+              <output id="result"></output>
+            </main>
+            <script>
+              const root = document.getElementById("root");
+              const result = document.getElementById("result");
+              root.addEventListener("mousedown", event => {
+                if (event.target.id === "target") result.textContent += "down ";
+              });
+              root.addEventListener("click", event => {
+                if (event.target.id === "target") result.textContent += "click";
+              });
+            </script>
+            "#,
+            DocumentConfig::default(),
+        );
+        document.execute_scripts();
+        document.inner_mut().resolve(0.0);
+        let (target, result) = {
+            let inner = document.inner();
+            (
+                inner.query_selector("#target").unwrap().unwrap(),
+                inner.query_selector("#result").unwrap().unwrap(),
+            )
+        };
+
+        activate_agent_node(&mut document, target.as_u64(), 1).unwrap();
+
+        assert_eq!(
+            document.inner().get_node(result).unwrap().text_content(),
+            "down click"
+        );
+    }
+
+    #[test]
+    fn node_activation_reaches_solid_style_document_delegation() {
+        let mut document = ScriptDocument::from_html(
+            r#"
+            <main id="root">
+              <button id="target" style="width:80px;height:30px">Run</button>
+              <output id="result"></output>
+            </main>
+            <script>
+              const target = document.getElementById("target");
+              const result = document.getElementById("result");
+              target.$$click = () => result.textContent = "delegated";
+              document.addEventListener("click", event => {
+                let node = event.target;
+                while (node) {
+                  if (node.$$click) node.$$click(event);
+                  node = node.parentNode;
+                }
+              });
+            </script>
+            "#,
+            DocumentConfig::default(),
+        );
+        document.execute_scripts();
+        document.inner_mut().resolve(0.0);
+        let (target, result) = {
+            let inner = document.inner();
+            (
+                inner.query_selector("#target").unwrap().unwrap(),
+                inner.query_selector("#result").unwrap().unwrap(),
+            )
+        };
+
+        activate_agent_node(&mut document, target.as_u64(), 1).unwrap();
+
+        assert_eq!(
+            document.inner().get_node(result).unwrap().text_content(),
+            "delegated"
+        );
+    }
+
+    #[test]
+    fn node_activation_applies_the_native_focus_default() {
+        let mut document = ScriptDocument::from_html(
+            r#"<main><div id="slider" role="slider" tabindex="0" style="width:80px;height:30px">Value</div></main>"#,
+            DocumentConfig::default(),
+        );
+        document.inner_mut().resolve(0.0);
+        let slider = document.inner().query_selector("#slider").unwrap().unwrap();
+
+        activate_agent_node(&mut document, slider.as_u64(), 1).unwrap();
+
+        assert_eq!(document.inner().get_focussed_node_id(), Some(slider));
+    }
+
+    #[test]
+    fn semantic_focus_does_not_activate_the_target() {
+        let mut document = ScriptDocument::from_html(
+            r#"
+            <main>
+              <button id="target" style="width:80px;height:30px">Start fork</button>
+              <output id="result"></output>
+            </main>
+            <script>
+              document.getElementById("target").addEventListener("click", () => {
+                document.getElementById("result").textContent = "activated";
+              });
+            </script>
+            "#,
+            DocumentConfig::default(),
+        );
+        document.execute_scripts();
+        document.inner_mut().resolve(0.0);
+        let (target, result) = {
+            let inner = document.inner();
+            (
+                inner.query_selector("#target").unwrap().unwrap(),
+                inner.query_selector("#result").unwrap().unwrap(),
+            )
+        };
+
+        focus_agent_node(&mut document, target).unwrap();
+
+        assert_eq!(document.inner().get_focussed_node_id(), Some(target));
+        assert_eq!(
+            document.inner().get_node(result).unwrap().text_content(),
+            ""
+        );
+    }
+
+    /// It used to need a font, and it no longer does.
+    ///
+    /// Replacing a field.s contents came down to select-all selecting
+    /// something, and selection is over shaped text: with no face registered
+    /// parley measures nothing, the select-all covers nothing, and the
+    /// replacement lands after the old value. So this ran on macOS only, where
+    /// Core Text supplies a face for free, and compiled out everywhere else.
+    ///
+    /// `set_node_value` counts bytes now, which is what the headless browser
+    /// always did and why its copy was the one that survived the merge. There
+    /// is no layout in the path, so the test runs everywhere, which is where
+    /// the property was always meant to hold.
+    #[test]
+    fn setting_a_node_value_replaces_text_and_dispatches_input() {
+        let mut document = ScriptDocument::from_html(
+            r#"
+            <main>
+              <input id="field" value="old" style="width:80px;height:30px">
+              <output id="result"></output>
+            </main>
+            <script>
+              const field = document.getElementById("field");
+              const result = document.getElementById("result");
+              field.addEventListener("input", event => result.textContent = event.target.value);
+            </script>
+            "#,
+            DocumentConfig::default(),
+        );
+        document.execute_scripts();
+        document.inner_mut().resolve(0.0);
+        let (field, result) = {
+            let inner = document.inner();
+            (
+                inner.query_selector("#field").unwrap().unwrap(),
+                inner.query_selector("#result").unwrap().unwrap(),
+            )
+        };
+
+        let replacement = "https://example.test/org/repository/issues/40?view=full#comment-2";
+        crate::in_process::set_node_value(&mut document, field, replacement.into()).unwrap();
+
+        let inner = document.inner();
+        let text = inner
+            .get_node(field)
+            .unwrap()
+            .element_data()
+            .unwrap()
+            .text_input_data()
+            .unwrap()
+            .editor
+            .raw_text();
+        assert_eq!(text, replacement);
+        assert_eq!(inner.get_node(result).unwrap().text_content(), replacement);
+    }
+
+    #[test]
+    fn node_double_click_is_one_runtime_action() {
+        let mut document = ScriptDocument::from_html(
+            r#"
+            <button id="target" style="width:80px;height:30px">Open row</button>
+            <output id="result"></output>
+            <script>
+              document.getElementById("target").addEventListener("dblclick", () => {
+                document.getElementById("result").textContent = "double";
+              });
+            </script>
+            "#,
+            DocumentConfig::default(),
+        );
+        document.execute_scripts();
+        let (target, result) = {
+            let inner = document.inner();
+            (
+                inner.query_selector("#target").unwrap().unwrap(),
+                inner.query_selector("#result").unwrap().unwrap(),
+            )
+        };
+
+        activate_agent_node(&mut document, target.as_u64(), 2).unwrap();
+
+        assert_eq!(
+            document.inner().get_node(result).unwrap().text_content(),
+            "double"
+        );
+    }
+
+    #[cfg(feature = "capture")]
+    #[test]
+    fn repeated_live_captures_reuse_one_surface_and_keep_identical_pixels() {
+        use blitz_traits::shell::{ColorScheme, Viewport};
+
+        let mut document = ScriptDocument::from_html(
+            "<body style='margin:0;background:transparent'><main style='width:320px;height:200px;background:rgba(24,32,42,.55);color:#f4f5f7'>\
+               <h1>Capture cache</h1><button>Ready</button>\
+             </main></body>",
+            DocumentConfig::default(),
+        );
+        document
+            .inner_mut()
+            .set_viewport(Viewport::new(320, 200, 1.0, ColorScheme::Dark));
+        document.inner_mut().resolve(0.0);
+
+        let mut surface = None;
+        let request = crate::CaptureRequest::default();
+        let first = capture_document_with_surface(&mut document, request, &mut surface).unwrap();
+        let first_renderer = surface
+            .as_ref()
+            .map(|cached| std::ptr::from_ref(&cached.renderer))
+            .unwrap();
+        let second = capture_document_with_surface(&mut document, request, &mut surface).unwrap();
+        let second_renderer = surface
+            .as_ref()
+            .map(|cached| std::ptr::from_ref(&cached.renderer))
+            .unwrap();
+
+        assert_eq!(first_renderer, second_renderer);
+        assert_eq!(first.width, 320);
+        assert_eq!(first.height, 200);
+        assert_eq!(first.rgba_base64, second.rgba_base64);
+    }
+
+    #[cfg(feature = "capture")]
+    #[test]
+    fn node_region_matches_the_same_pixels_cut_from_a_full_document_capture() {
+        use base64::Engine as _;
+        use blitz_traits::shell::{ColorScheme, Viewport};
+
+        let mut document = ScriptDocument::from_html(
+            "<main style='width:320px;height:200px;background:#18202a;padding:24px'>\
+               <button id='target' style='width:96px;height:40px;background:#d24db8;color:#111'>Ready</button>\
+             </main>",
+            DocumentConfig::default(),
+        );
+        document
+            .inner_mut()
+            .set_viewport(Viewport::new(320, 200, 1.0, ColorScheme::Dark));
+        document.inner_mut().resolve(0.0);
+        let (target, left, top) = {
+            let inner = document.inner();
+            let target = inner.query_selector("#target").unwrap().unwrap();
+            let position = inner.get_node(target).unwrap().absolute_position(0.0, 0.0);
+            (
+                target,
+                position.x.round() as usize,
+                position.y.round() as usize,
+            )
+        };
+
+        let mut surface = None;
+        let full = capture_document_with_surface(
+            &mut document,
+            crate::CaptureRequest::default(),
+            &mut surface,
+        )
+        .unwrap();
+        let node = capture_document_with_surface(
+            &mut document,
+            crate::CaptureRequest {
+                node_id: Some(target.as_u64()),
+                scale: 1.0,
+            },
+            &mut surface,
+        )
+        .unwrap();
+
+        let full_rgba = base64::engine::general_purpose::STANDARD
+            .decode(full.rgba_base64)
+            .unwrap();
+        let node_rgba = base64::engine::general_purpose::STANDARD
+            .decode(node.rgba_base64)
+            .unwrap();
+        let mut expected = Vec::with_capacity(node_rgba.len());
+        for row in 0..node.height as usize {
+            let start = ((top + row) * full.width as usize + left) * 4;
+            expected.extend_from_slice(&full_rgba[start..start + node.width as usize * 4]);
+        }
+
+        assert!(node.width > 0);
+        assert!(node.height > 0);
+        assert_eq!(node_rgba, expected);
+    }
+
+    #[cfg(feature = "capture")]
+    #[test]
+    fn diagnostic_layout_reports_scroll_state_without_script_evaluation() {
+        let mut document = ScriptDocument::from_html(
+            "<section id='scroller' style='height:100px;overflow-y:auto'><div style='height:400px'>tail</div></section>",
+            DocumentConfig::default(),
+        );
+        document.inner_mut().resolve(0.0);
+        let scroller = document
+            .inner()
+            .tree()
+            .iter()
+            .find_map(|(id, node)| {
+                node.element_data()
+                    .is_some_and(|element| element_attr(element, "id") == Some("scroller"))
+                    .then_some(id)
+            })
+            .unwrap();
+        document
+            .inner_mut()
+            .get_node_mut(scroller)
+            .unwrap()
+            .scroll_offset_mut()
+            .y = 60.0;
+
+        let inner = document.inner();
+        let row = diagnostic_layout_row(
+            &inner,
+            &SemanticNode {
+                dom_id: Some("scroller".into()),
+                id: scroller.as_u64(),
+                parent: None,
+                role: "generic".into(),
+                name: "Scrollable region".into(),
+                value: None,
+                enabled: true,
+                visible: true,
+                selected: false,
+                bounds: Some([0.0, 0.0, 100.0, 100.0]),
+                slot: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(row.scroll_offset.y, 60.0);
+        assert_eq!(row.client_size.height, 100.0);
+        assert!(row.scroll_size.height >= 100.0);
+        assert!(row.scroll_range.height >= 0.0);
+    }
+
+    #[cfg(feature = "capture")]
+    #[test]
+    fn diagnostic_style_reports_resolved_font_and_border() {
+        let mut document = ScriptDocument::from_html(
+            "<main id='target' style='font-size:1.4375rem;border:2px solid #123456'>Readable</main>",
+            DocumentConfig::default(),
+        );
+        document.inner_mut().resolve(0.0);
+        let target = document.inner().query_selector("#target").unwrap().unwrap();
+        let inner = document.inner();
+        let row = diagnostic_style_row(
+            &inner,
+            &SemanticNode {
+                dom_id: Some("target".into()),
+                id: target.as_u64(),
+                parent: None,
+                role: "main".into(),
+                name: "Readable".into(),
+                value: None,
+                enabled: true,
+                visible: true,
+                selected: false,
+                bounds: Some([0.0, 0.0, 100.0, 24.0]),
+                slot: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(row["fontSize"], "23px");
+        assert_eq!(row["borderColor"], "#123456ff");
+        assert_eq!(row["borderWidth"], "2px");
+        assert_eq!(row["hasTextContent"], true);
+    }
+
+    #[test]
+    fn native_key_event_preserves_physical_code_and_modifiers() {
+        let event = key_event(
+            KeyPhase::Down,
+            Key::Character("2".into()),
+            Code::Digit2,
+            KeyboardModifiers::META,
+        );
+        assert_eq!(event.code, Code::Digit2);
+        assert!(event.modifiers.meta());
+        assert!(event.text.is_none());
+    }
+
+    #[test]
+    fn agent_action_settlement_drains_until_the_document_is_idle() {
+        let mut document =
+            ScriptDocument::from_html("<main>Ready</main>", DocumentConfig::default());
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&polls);
+        document.set_poll_hook(move |_, _| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3
+        });
+
+        crate::in_process::settle(&mut document).unwrap();
+
+        assert_eq!(polls.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn agent_action_settlement_never_acks_a_still_runnable_document() {
+        let mut document =
+            ScriptDocument::from_html("<main>Busy</main>", DocumentConfig::default());
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&polls);
+        document.set_poll_hook(move |_, _| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        });
+
+        let error = crate::in_process::settle(&mut document).unwrap_err();
+
+        assert_eq!(error.code, "actionDidNotSettle");
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::Relaxed),
+            crate::in_process::MAX_SETTLE_POLLS
+        );
+    }
+}
