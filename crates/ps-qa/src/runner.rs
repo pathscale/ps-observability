@@ -6620,6 +6620,7 @@ mod tests {
             outcome_timeout_ms: 0,
             stable_for_ms: 0,
             require_visible: false,
+            text_sized: false,
             destructive: false,
             subject: subject.into(),
             expect: Expect::Paints,
