@@ -1,7 +1,7 @@
 [package]
 name = "blitz-control-protocol"
-description = "Wire types for the Blitz agent-control and diagnostics protocol"
-version = "0.4.0"
+description = "The Blitz agent-control and diagnostics surface: one vocabulary, one core, two transports"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,19 +13,88 @@ keywords = ["observability", "testing", "blitz", "mcp", "ui"]
 categories = ["development-tools::testing", "development-tools::debugging"]
 publish = true
 
-# Deliberately tiny. This crate exists so a client can speak the protocol
-# without building the runtime that serves it: adding anything here that pulls
-# in a window, a renderer or a font stack defeats the whole point. The check
-# is `cargo tree -p blitz-control-protocol`, which should stay in the dozens
-# of crates rather than the hundreds.
+# The vocabulary is what this crate is by default, and it stays deliberately
+# tiny. A client speaks the protocol without building the renderer that serves
+# it: adding anything to the *default* dependencies that pulls in a window, a
+# renderer or a font stack defeats the whole point. The check is
+# `cargo tree -p blitz-control-protocol`, which should stay in the dozens of
+# crates rather than the hundreds, and `cargo tree -p ps-qa`, which CI fails if
+# a renderer or a window runtime appears in it.
+#
+# Everything that needs blitz is behind a feature, and the features are cut on
+# that boundary rather than on what each consumer happened to want:
+#
+#   engine    the core. Reads and drives a `blitz-dom` document.
+#   capture   the core's expensive half: offscreen paint, layout and
+#             computed-style snapshots, renderer metrics.
+[features]
+default = []
+engine = [
+    "dep:blitz-dom",
+    "dep:blitz-script",
+    "dep:blitz-traits",
+    "dep:keyboard-types",
+    "dep:style",
+    # The role rules live in blitz-dom, which owns them for the AccessKit tree
+    # as well. Naming the feature rather than relying on it being a default:
+    # a consumer that turns blitz-dom's defaults off must still get the roles.
+    "blitz-dom/accessibility",
+]
+capture = [
+    "engine",
+    "dep:anyrender",
+    "dep:anyrender_vello_cpu",
+    "dep:base64",
+    "dep:blitz-paint",
+    # Frame timings and the deep-profiling session, which blitz-shell owns
+    # because it is what presents frames. This is the only reason the shell is
+    # in the graph, so a build that reads the semantic tree and drives input
+    # gets no window stack at all.
+    "dep:blitz-shell",
+    # Where the frame timings and the sampling guard are: `blitz-shell` keeps
+    # both behind this feature, and it forwards to `blitz-script/debug-control`
+    # for the script half of the same capture.
+    "blitz-shell/debug-control",
+]
+
 [dependencies]
 endpoint-libs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
 
+# The core, and nothing else, reaches for these.
+blitz-dom = { package = "ps-blitz-dom", version = "^0.4.8", optional = true }
+# Naming stylo directly: the computed-style reader and the visibility check read
+# `style::values::computed`, and blitz-dom does not re-export it. The version is
+# the one blitz-dom resolves, so cargo unifies them instead of putting two
+# incompatible copies of every computed value in the graph.
+style = { version = "0.20.0", package = "stylo", optional = true }
+# No `system-fonts`. It reaches `fontique/system` and, on Linux, the
+# `yeslogic-fontconfig-sys` system library, so enabling it here would decide
+# that every consumer needs one installed, including a headless one that reads
+# no font catalogue. An application that wants the machine's fonts asks itself.
+blitz-script = { package = "ps-blitz-script", version = "^0.4.8", optional = true }
+blitz-traits = { package = "ps-blitz-traits", version = "^0.4.8", optional = true }
+keyboard-types = { version = "0.7", optional = true }
+
+# Capture. The CPU renderer on purpose: a capture must not need a GPU, a
+# surface or a display server, or it stops working in the places it is most
+# needed. It draws the same scene through the same `blitz-paint` entry point
+# the window uses, so what it returns is the real frame rather than a second
+# opinion about it.
+anyrender = { package = "ps-anyrender", version = "^0.13.0", optional = true }
+anyrender_vello_cpu = { package = "ps-anyrender-vello-cpu", version = "^0.17.0", optional = true }
+blitz-paint = { package = "ps-blitz-paint", version = "^0.4.8", optional = true }
+blitz-shell = { package = "ps-blitz-shell", version = "^0.4.8", default-features = false, optional = true }
+base64 = { version = "0.22", optional = true }
+
+
 [dev-dependencies]
 # The framing round-trip test drives a real duplex pipe rather than asserting
 # on a string, because the bug this protocol keeps hitting is at the seam
 # between the typed value and the bytes, not inside serde.
-tokio = { version = "1", features = ["io-util", "macros", "rt"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
+
+[package.metadata.docs.rs]
+all-features = true
