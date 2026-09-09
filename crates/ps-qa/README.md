@@ -278,10 +278,15 @@ file, line and column rather than degrading to empty in silence.
 **`tests/ps-qa/*.ron`** — the checks. A check is a precondition, an action and
 an assertion with no behaviour of its own, so it is data: editing a selector is
 an edit and a re-run, not a recompile. Found by `--checks`, or
-`tests/ps-qa/`. Files are read in name order for manifests and focused runs.
-A full execution groups non-destructive checks by surface to avoid repeated
-navigation, then runs destructive checks last. The report retains each check's
-stable id, so optimized run order cannot be mistaken for source order.
+`tests/ps-qa/`. Files are read in name order, and checks run in the order they
+are declared: a sequence written as steps runs as steps. The only thing that
+moves is the destructive tail, which runs last so a check that deletes fixture
+state cannot pull it out from under a later one.
+
+A check with no `open` runs on whatever the previous check left in front of it,
+which is how a sequence inside one file is written. Across files that is a
+dependency nobody declared, so the first check of a file must say which surface
+it starts on whenever an earlier file navigated somewhere.
 
 `reconcile` decodes the emitted TOON directly, including nested control rows
 with per-control check arrays. Do not flatten or scrape that report before

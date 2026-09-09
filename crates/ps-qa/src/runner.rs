@@ -1024,46 +1024,49 @@ async fn run_component(
     run_qa(&mut client, selector, checks_dir).await
 }
 
+/// The order a run executes in: the order the files declare.
+///
+/// This used to bucket every check by the surface its `open` names, stable-sort
+/// by that bucket, and let a check with no `open` inherit the previous check's
+/// bucket -- across every file at once. Three things came of that, on four
+/// sites:
+///
+/// - a group written as a sequence was interleaved with another group that
+///   happened to name a different surface, so steps ran between steps;
+/// - a check with no `open`, first in its file, inherited a surface set in a
+///   file it has no relationship with, and measured a page it had never
+///   navigated to. It passed;
+/// - a suite could not declare a second surface at all without its existing
+///   sequences coming apart.
+///
+/// The bucketing bought mount amortization. It cost the one property a suite of
+/// ordered checks needs, which is that the order is the one somebody wrote
+/// down, and a check that reads correctly next to its neighbours ran somewhere
+/// else. Files in name order, checks in declaration order, and nothing moves
+/// but the destructive tail.
+///
+/// Destructive checks still go last, and that is not an optimization: a
+/// sequence that deletes fixture state a later surface needs makes an ordered
+/// shared run conflict with itself. `sort_by_key` is stable, so their own
+/// relative order is the declared one too.
+fn ordered_checks<'a>(all: &'a [qa::Check], group: Option<&str>) -> Vec<&'a qa::Check> {
+    // A group *or* one check's id, so chasing a single failure does not mean
+    // re-running its neighbours against the real app every time.
+    let mut selected: Vec<&qa::Check> = all
+        .iter()
+        .filter(|check| group.is_none_or(|want| check.group == want || check.id == want))
+        .collect();
+    selected.sort_by_key(|check| check.destructive);
+    selected
+}
+
 async fn run_qa(
     client: &mut Client,
     group: Option<&str>,
     checks_dir: Option<&std::path::Path>,
 ) -> Result<usize> {
     let all = qa::checks(checks_dir).map_err(|error| eyre!(error))?;
-    // A group *or* one check's id, so chasing a single failure does not mean
-    // re-running its neighbours against the real app every time.
-    // Stable surface buckets: keep dependent checks in manifest order while
-    // avoiding repeated remounts of the same large application pane. The
-    // application profile owns the surface openers; an unknown plain opener is
-    // the configured dynamic document, while role-qualified openers stay in
-    // the current bucket because they open a dialog within that surface.
-    let surfaces = reach::surfaces();
-    let dynamic = surfaces
-        .iter()
-        .position(|surface| surface.opener == reach::DYNAMIC_DOCUMENT)
-        .unwrap_or(0);
-    let mut affinity = dynamic;
-    let mut selected: Vec<(usize, &qa::Check)> = Vec::new();
-    for check in &all {
-        if let Some(opener) = check.open.as_deref() {
-            if let Some(index) = surfaces
-                .iter()
-                .position(|surface| surface.opener.eq_ignore_ascii_case(opener))
-            {
-                affinity = index;
-            } else if !opener.contains(':') {
-                affinity = dynamic;
-            }
-        }
-        if group.is_none_or(|want| check.group == want || check.id == want) {
-            selected.push((affinity, check));
-        }
-    }
-    // Surface affinity amortizes large retained-pane mounts. Destructive
-    // sequences outrank that optimization: deleting fixture state before a
-    // later surface uses it makes an ordered shared sweep conflict with itself.
-    selected.sort_by_key(|(surface, check)| (check.destructive, *surface));
-    let selected: Vec<&qa::Check> = selected.into_iter().map(|(_, check)| check).collect();
+    let selected = ordered_checks(&all, group);
     if selected.is_empty() {
         let mut names: Vec<String> = all
             .iter()
@@ -5861,11 +5864,12 @@ mod tests {
         declared_outcome_timeout, duplicate_dom_ids, generated_dom_id, hover_signature_counts,
         inventory_class, is_pagination_control, measure_ink, name_matches,
         named_document_is_active, named_document_is_active_with_permanent,
-        named_document_opener_for, outcome_check_ids, outcome_verdict, pagination_advanced,
-        painted_bounds, painted_named, pixels_change, pixels_hold, require_transparent_window_tint,
-        resolved_action_target, rgb_pixels_hold, saved_control_node, saved_controls,
-        selector_matches_node, settle_for_outcome, setup_value_landed, stable_arrival,
-        subject_belongs_to_scope, validate_surface_filter_against,
+        named_document_opener_for, ordered_checks, outcome_check_ids, outcome_verdict,
+        pagination_advanced, painted_bounds, painted_named, pixels_change, pixels_hold,
+        require_transparent_window_tint, resolved_action_target, rgb_pixels_hold,
+        saved_control_node, saved_controls, selector_matches_node, settle_for_outcome,
+        setup_value_landed, stable_arrival, subject_belongs_to_scope,
+        validate_surface_filter_against,
     };
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
@@ -6630,6 +6634,89 @@ mod tests {
         assert_eq!(
             declared_outcome_timeout(&check),
             Duration::from_millis(1_700)
+        );
+    }
+
+    /// Checks run in the order the files declare them.
+    ///
+    /// `old_order` below is the surface bucketing this replaced, written out
+    /// because the point is what it did to a sequence: two groups, each written
+    /// as ordered steps against its own surface, come back interleaved. Every
+    /// step still runs, and every one of them runs somewhere else.
+    #[test]
+    fn a_declared_sequence_is_not_reordered_by_the_surface_it_names() {
+        fn old_order<'a>(all: &'a [Check], surfaces: &[&str]) -> Vec<&'a str> {
+            let mut affinity = 0;
+            let mut selected: Vec<(usize, &Check)> = Vec::new();
+            for check in all {
+                if let Some(opener) = check.open.as_deref()
+                    && let Some(index) = surfaces.iter().position(|surface| *surface == opener)
+                {
+                    affinity = index;
+                }
+                selected.push((affinity, check));
+            }
+            selected.sort_by_key(|(surface, check)| (check.destructive, *surface));
+            selected
+                .into_iter()
+                .map(|(_, check)| check.id.as_str())
+                .collect()
+        }
+
+        let step = |id: &str, open: Option<&str>| {
+            let mut check = check(id, Some("Act"), "Result");
+            check.open = open.map(str::to_owned);
+            check
+        };
+        // Two sequences, each written as steps: open the surface, then act on
+        // what the previous step left behind.
+        let mut teardown = step("reset-fixtures", Some("Settings"));
+        teardown.destructive = true;
+        let all = [
+            step("settings-open", Some("Settings")),
+            step("settings-edit", None),
+            step("registry-open", Some("Registry")),
+            step("registry-publish", None),
+            step("settings-save", Some("Settings")),
+            teardown,
+        ];
+
+        assert_eq!(
+            old_order(&all, &["Settings", "Registry"]),
+            [
+                "settings-open",
+                "settings-edit",
+                "settings-save",
+                "registry-open",
+                "registry-publish",
+                "reset-fixtures",
+            ],
+            "the bucketing ran a Settings step between the two Registry steps"
+        );
+
+        assert_eq!(
+            ordered_checks(&all, None)
+                .into_iter()
+                .map(|check| check.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "settings-open",
+                "settings-edit",
+                "registry-open",
+                "registry-publish",
+                "settings-save",
+                "reset-fixtures",
+            ],
+            "declaration order, with the destructive tail last"
+        );
+
+        assert_eq!(
+            ordered_checks(&all, Some("registry-publish"))
+                .into_iter()
+                .map(|check| check.id.as_str())
+                .collect::<Vec<_>>(),
+            ["registry-publish"],
+            "one check by id still runs alone"
         );
     }
 
