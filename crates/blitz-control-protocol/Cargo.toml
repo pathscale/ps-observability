@@ -64,6 +64,7 @@ capture = [
     "blitz-shell/debug-control",
 ]
 server = ["dep:tokio"]
+client = ["dep:eyre", "dep:tokio"]
 
 [dependencies]
 endpoint-libs.workspace = true
@@ -107,6 +108,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ], optional = true }
+eyre = { version = "0.6", optional = true }
 
 [dev-dependencies]
 # The framing round-trip test drives a real duplex pipe rather than asserting
