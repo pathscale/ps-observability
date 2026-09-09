@@ -10,6 +10,7 @@ use eyre::{Result, bail};
 
 use crate::inspector::{Client, inspect};
 use crate::paint_color::{Rgba, composite, contrast_ratio, luminance, parse};
+use crate::target::{selector_matches_node, unmatched_selector_reason};
 
 /// Print the resolved foreground, background, opacity, and visibility of
 /// matching painted boxes, largest first.
@@ -125,6 +126,12 @@ pub(crate) async fn contrast(
     control_ratio: f64,
 ) -> Result<()> {
     let (semantic, elapsed) = inspect(client).await?;
+    // Reject a selector this tree cannot answer before measuring anything.
+    // Silently auditing nothing and calling it a clean page is the worst of the
+    // three available outcomes.
+    if let Some(reason) = unmatched_selector_reason(&semantic.nodes, want) {
+        bail!("{want:?} selects nothing in this document: {reason}");
+    }
     let answer = client
         .diagnostics(&DiagnosticsRequest::Snapshot(SnapshotRequest {
             include_dom: false,
@@ -287,10 +294,20 @@ fn computed_styles(value: Option<&serde_json::Value>) -> HashMap<u64, serde_json
         .unwrap_or_default()
 }
 
+/// The subject of a contrast audit is a selector, not a substring.
+///
+/// This used to be `name.contains(want) || role.contains(want)`, which is not
+/// the grammar every check is written in. `link:crates.vip` therefore matched
+/// nothing at all: no name contains the literal text `link:crates.vip` and no
+/// role does either. The audit then reported "no visible painted node matched",
+/// which reads as a page whose text does not paint rather than as a selector
+/// the tool never parsed. Going through the one selector implementation is what
+/// makes `role:name`, `#id` and `@slot` mean here what they mean everywhere
+/// else.
 fn auditable(node: &SemanticNode, want: &str) -> bool {
     !node.name.is_empty()
         && (node.enabled || !is_interactive(&node.role))
-        && (want.is_empty() || node.name.contains(want) || node.role.contains(want))
+        && (want.is_empty() || selector_matches_node(node, want))
         && node.visible
         && node
             .bounds
