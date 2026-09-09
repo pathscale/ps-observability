@@ -48,11 +48,15 @@ use crate::{
 
 /// How many polls an action gets to settle before it is reported as unsettled.
 ///
-/// DOM event handlers enqueue a reactive framework's work on the document poll
+/// DOM event handlers enqueue a reactive framework.s work on the document poll
 /// hook. Acknowledging before that hook runs makes the next `Inspect` observe
 /// the tree from before the click, and a tight harness loop keeps reading that
 /// stale tree until it disconnects.
-const MAX_SETTLE_POLLS: usize = 512;
+///
+/// Timers and animation frames remain asynchronous and are observed normally.
+/// A poll hook that stays runnable is different: reporting the exhaustion lets
+/// a caller fail the interaction instead of compensating with a sleep.
+const MAX_SETTLE_POLLS: usize = 100;
 
 /// One document, driven in process.
 ///
