@@ -716,16 +716,40 @@ pub fn verdict(
              * would reintroduce the false negative. Only this arm, which asks
              * whether something went away, needs to hear that it did.
              */
+            /*
+             * And a position, because a box is not a place on the screen.
+             *
+             * A responsive composition routinely carries two copies of the same
+             * control: the desktop one, and a narrow duplicate the layout parks
+             * outside the window rather than removing. The parked copy is
+             * `visible`, has a full-size box, and is at x=-1180. Judging it by
+             * geometry alone reported every dialog with such a mirror as "still
+             * on screen; it did not close" no matter how correctly it closed,
+             * which made this expectation unusable for the whole pattern.
+             *
+             * `offscreen` is the predicate the driving side already uses to
+             * decide that pressing a control would land on nothing. A control
+             * nothing can be aimed at is not on screen for this verdict either.
+             */
             let on_screen: Vec<&SemanticNode> = found
                 .iter()
                 .copied()
-                .filter(|node| node.visible && paints(node))
+                .filter(|node| {
+                    node.visible
+                        && paints(node)
+                        && !node.bounds.is_some_and(|bounds| {
+                            crate::target::offscreen(
+                                bounds,
+                                crate::target::viewport_for_node_in(after, node.id),
+                            )
+                        })
+                })
                 .collect();
             if let Some(node) = on_screen.first() {
                 let b = node.bounds.unwrap_or([0.0; 4]);
                 return Err(format!(
-                    "{:?} is still on screen at {:.0}x{:.0}; it did not close",
-                    check.subject, b[2], b[3]
+                    "{:?} is still on screen at {:.0}x{:.0} at {:.0},{:.0}; it did not close",
+                    check.subject, b[2], b[3], b[0], b[1]
                 ));
             }
         }
@@ -1458,6 +1482,60 @@ mod tests {
             bounds: Some([0.0, 0.0, width, height]),
             slot: None,
         }
+    }
+
+    /// A hidden mirror copy must not keep a closed control "on screen".
+    ///
+    /// The responsive pattern is one desktop control plus a narrow duplicate
+    /// the layout parks outside the window. The duplicate is `visible`, keeps a
+    /// full-size box, and sits at a negative x. Judging `Vanishes` on geometry
+    /// and the flag alone reported the dialog as never closing, whatever the
+    /// component did, so the expectation could not be used at all on any site
+    /// built that way.
+    #[test]
+    fn a_parked_duplicate_is_not_a_control_that_stayed_open() {
+        let mut check = parse("");
+        check.click = None;
+        check.expect = Expect::Vanishes;
+        check.subject = "Delete project".into();
+
+        let main = SemanticNode {
+            role: "main".into(),
+            bounds: Some([0.0, 58.0, 1280.0, 842.0]),
+            ..painted_node(1, "", 1280.0, 842.0)
+        };
+        let closed = SemanticNode {
+            parent: Some(1),
+            visible: false,
+            bounds: Some([200.0, 200.0, 420.0, 180.0]),
+            ..painted_node(2, "Delete project", 420.0, 180.0)
+        };
+        // The narrow duplicate: on the wire it is indistinguishable from the
+        // desktop dialog except for where the layout put it.
+        let parked = SemanticNode {
+            parent: Some(1),
+            bounds: Some([-1180.0, 200.0, 420.0, 180.0]),
+            ..painted_node(3, "Delete project", 420.0, 180.0)
+        };
+
+        assert!(
+            verdict(&check, &[], &[main.clone(), closed.clone(), parked.clone()]).is_ok(),
+            "a control nothing can be aimed at is not on screen"
+        );
+
+        // The expectation still has teeth: the same dialog inside the window is
+        // a dialog that did not close.
+        let open = SemanticNode {
+            bounds: Some([200.0, 200.0, 420.0, 180.0]),
+            ..parked
+        };
+        let error = verdict(&check, &[], &[main, closed, open])
+            .expect_err("a dialog in the window did not close");
+        assert!(error.contains("did not close"), "{error}");
+        assert!(
+            error.contains("at 200,200"),
+            "the position is reported: {error}"
+        );
     }
 
     #[test]
