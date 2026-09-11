@@ -72,6 +72,8 @@ pub struct SurfaceSpec {
     pub opener: String,
     /// A control unique to this surface, used to prove it is in front and to
     /// scope coverage to its semantic subtree.
+    /// Accepts the same selectors as check subjects, for example `link:version`
+    /// or `#dashboard`. An unqualified name matches text in any semantic role.
     #[serde(default)]
     pub marker: Option<String>,
     /// A text field whose query causes this surface to mount deferred rows.

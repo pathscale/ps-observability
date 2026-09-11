@@ -2,6 +2,47 @@
 
 use std::process::Command;
 
+/// Both directions matter: measuring before the click rejects a repair and
+/// accepts a regression. This drives the actual renderer and shipped CLI.
+#[test]
+#[ignore = "requires QA_HOST pointing to a font-enabled chuzz-headless build"]
+fn paint_verdict_uses_the_state_after_the_action() {
+    let host = std::env::var_os("QA_HOST").expect("set QA_HOST to chuzz-headless");
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/paint-action-fixture");
+    for (group, success, verdict) in [
+        ("drag", true, "pointer-drag-commits"),
+        ("cancel", true, "pointer-drag-cancels"),
+        ("gridcell", true, "explicit-gridcell-activates"),
+        ("restore", true, "restored-contrast-passes"),
+        ("break", false, "broken-contrast-fails"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ps-qa"))
+            .arg("--app")
+            .arg(fixture.join("ps-qa.ron"))
+            .arg("qa-hosted")
+            .arg(group)
+            .arg("--host")
+            .arg(&host)
+            .arg("--page")
+            .arg(fixture.join("page.html"))
+            .arg("--checks")
+            .arg(fixture.join("checks"))
+            .output()
+            .expect("run ps-qa against native fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), success, "{stdout}\n{stderr}");
+        assert!(stdout.contains(verdict), "{stdout}\n{stderr}");
+        if !success {
+            assert!(
+                stdout.contains("below their contrast floor"),
+                "{stdout}\n{stderr}"
+            );
+        }
+    }
+}
+
 #[test]
 fn component_sweep_without_profile_returns_a_clear_error() {
     let working_directory = std::env::temp_dir().join(format!(

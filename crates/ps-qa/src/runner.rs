@@ -37,7 +37,7 @@ use crate::computed_style::{
 use crate::diagnostics::{dom, metrics, nodes, panes, spill, transcript};
 use crate::inspector::{Client, inspect, inspect_subtree};
 use crate::interaction::{
-    click_named, hover_over, press_key, scroll, scroll_events, type_keys, type_text,
+    click_named, hover_over, pointer_drag, press_key, scroll, scroll_events, type_keys, type_text,
 };
 use crate::layout_report::layout;
 use crate::target::{
@@ -1734,26 +1734,6 @@ async fn run_qa(
         // pre-action state and paid for an immediately discarded snapshot.
         let (before, _) = inspect(client).await?;
 
-        if open_error.is_none() && check.expect == qa::Expect::OpaqueBackground {
-            pixel_outcome = Some(opaque_background(client, &check.subject).await);
-        } else if open_error.is_none() && check.expect == qa::Expect::TransparentBackground {
-            pixel_outcome = Some(transparent_background(client, &check.subject).await);
-        } else if open_error.is_none() && check.expect == qa::Expect::FullOpacity {
-            pixel_outcome = Some(full_opacity(client, &check.subject).await);
-        } else if open_error.is_none() && check.expect == qa::Expect::TransparentWindowTint {
-            pixel_outcome = Some(transparent_window_tint(client).await);
-        } else if open_error.is_none() && check.expect == qa::Expect::VisibleInk {
-            pixel_outcome = Some(visible_ink(client, &check.subject).await);
-        } else if open_error.is_none() && check.expect == qa::Expect::InteriorInk {
-            pixel_outcome = Some(interior_ink(client, &check.subject).await);
-        } else if open_error.is_none() && check.expect == qa::Expect::Contrast {
-            pixel_outcome = Some(
-                paint_audit::contrast(client, &check.subject, 4.5, 3.0)
-                    .await
-                    .map_err(|error| error.to_string()),
-            );
-        }
-
         let before_font_size = if open_error.is_none() && check.expect == qa::Expect::FontSizeGrows
         {
             match font_size(client, &check.subject).await {
@@ -1826,6 +1806,7 @@ async fn run_qa(
         let mut check_started = (check.click.is_none()
             && check.text.is_none()
             && check.key.is_none()
+            && check.pointer_drag.is_none()
             && check.scroll_over.is_none())
         .then(Instant::now);
 
@@ -1846,6 +1827,7 @@ async fn run_qa(
         let drives_action = check.click.is_some()
             || check.text.is_some()
             || check.key.is_some()
+            || check.pointer_drag.is_some()
             || check.scroll_over.is_some();
         let action_paint_armed = if drives_action && !live_paint_expect {
             client.arm_paint_events().await.unwrap_or(false)
@@ -1924,6 +1906,23 @@ async fn run_qa(
         }
 
         if action_error.is_none()
+            && let Some(drag) = &check.pointer_drag
+        {
+            check_started = Some(Instant::now());
+            if let Err(error) = pointer_drag(
+                client,
+                &drag.from,
+                drag.dx,
+                drag.dy,
+                drag.steps,
+                drag.cancel,
+            )
+            .await
+            {
+                action_error = Some(format!("could not drag {:?}: {error}", drag.from));
+            }
+        }
+        if action_error.is_none()
             && let Some(key) = check.key.as_deref()
         {
             check_started = Some(Instant::now());
@@ -1974,6 +1973,28 @@ async fn run_qa(
          * frame committed between the action and the settle loop is not
          * discarded by a second arm.
          */
+        // These verdicts describe the resulting paint, so read them after input.
+        // Measuring before a theme toggle judged the previous theme instead.
+        if action_error.is_none() && check.expect == qa::Expect::OpaqueBackground {
+            pixel_outcome = Some(opaque_background(client, &check.subject).await);
+        } else if action_error.is_none() && check.expect == qa::Expect::TransparentBackground {
+            pixel_outcome = Some(transparent_background(client, &check.subject).await);
+        } else if action_error.is_none() && check.expect == qa::Expect::FullOpacity {
+            pixel_outcome = Some(full_opacity(client, &check.subject).await);
+        } else if action_error.is_none() && check.expect == qa::Expect::TransparentWindowTint {
+            pixel_outcome = Some(transparent_window_tint(client).await);
+        } else if action_error.is_none() && check.expect == qa::Expect::VisibleInk {
+            pixel_outcome = Some(visible_ink(client, &check.subject).await);
+        } else if action_error.is_none() && check.expect == qa::Expect::InteriorInk {
+            pixel_outcome = Some(interior_ink(client, &check.subject).await);
+        } else if action_error.is_none() && check.expect == qa::Expect::Contrast {
+            pixel_outcome = Some(
+                paint_audit::contrast(client, &check.subject, 4.5, 3.0)
+                    .await
+                    .map_err(|error| error.to_string()),
+            );
+        }
+
         let transport_timed_out = action_error
             .as_deref()
             .is_some_and(|error| error.contains("inspector did not answer within"));
@@ -5790,10 +5811,16 @@ pub async fn run() -> Result<()> {
             nodes(&mut client).await?;
             type_keys(&mut client, count as usize, &name).await?;
         }
-        // Wheel events go to whatever the document last saw hovered, which an
-        // injected pointer move does not reliably set, so they scroll nothing.
-        // This asks the node's own scroll container to move, which is what
-        // `scroll` should have been able to do all along.
+        cli::Command::PointerDrag {
+            name,
+            dx,
+            dy,
+            steps,
+            cancel,
+        } => {
+            pointer_drag(&mut client, &name, dx, dy, steps, cancel).await?;
+        }
+        // Direct container scrolling, retained for existing diagnostic commands.
         cli::Command::Drag { name, dy, steps } => {
             let fallback = reach::profile()
                 .transcript_region
@@ -6615,6 +6642,7 @@ mod tests {
             expect_count: None,
             covers: Vec::new(),
             press: false,
+            pointer_drag: None,
             settle_after_ms: 0,
             open_timeout_ms: 0,
             outcome_timeout_ms: 0,

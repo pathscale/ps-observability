@@ -392,6 +392,24 @@ pub enum Command {
         name: String,
     },
 
+    /// Drag from a control's painted center using real pointer input.
+    PointerDrag {
+        /// Accessible selector for the drag handle.
+        name: String,
+        /// Horizontal displacement in viewport pixels.
+        #[arg(allow_hyphen_values = true)]
+        dx: f64,
+        /// Vertical displacement in viewport pixels.
+        #[arg(allow_hyphen_values = true)]
+        dy: f64,
+        /// Number of move events between press and release.
+        #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u32).range(1..=240))]
+        steps: u32,
+        /// End with pointercancel to verify that the app abandons the gesture.
+        #[arg(long)]
+        cancel: bool,
+    },
+
     /// Click the first matching visible, enabled node.
     Click {
         /// Match the control whose accessible name contains this. Omit when
