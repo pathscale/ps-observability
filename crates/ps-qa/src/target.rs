@@ -205,13 +205,15 @@ pub(crate) async fn locate_control(
              * thing a person actually hits, and the only way to press a control
              * the way its own markup intends.
              *
-             * A name or `role:name` still goes through the gate. Those are
-             * descriptions rather than identities, and matching them against
-             * every generic node in a document would make one ambiguous.
+             * An explicit `role:name` is also an authored target. Calendar
+             * buttons expose `gridcell`, which is not necessarily interactive
+             * in a generic inventory but is intentionally addressed by that
+             * selector. Bare names still use the interactive-role gate.
              */
             .filter(|n| {
                 selector_dom_id(want).is_some()
                     || selector_slot(want).is_some()
+                    || selector_role(want).is_some()
                     || roles.contains(&"*")
                     || roles.is_empty() && reach::interactive(n)
                     || roles.contains(&n.role.as_str())

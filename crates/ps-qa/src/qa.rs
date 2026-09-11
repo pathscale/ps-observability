@@ -347,6 +347,18 @@ pub enum Expect {
     NameChanges,
 }
 
+/// A pointer gesture starting at a named control's painted center.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PointerDrag {
+    pub from: String,
+    pub dx: f64,
+    pub dy: f64,
+    pub steps: u32,
+    #[serde(default)]
+    pub cancel: bool,
+}
+
 /// One thing that must be true of the running panel.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -506,6 +518,9 @@ pub struct Check {
     /// intend to test hit-testing.
     #[serde(default)]
     pub press: bool,
+    /// Drag a control through real pointer input, optionally cancelling it.
+    #[serde(default)]
+    pub pointer_drag: Option<PointerDrag>,
     /// Optional unmeasured quiet window after this verdict.
     ///
     /// Use this only when an application paints optimistically and then begins
@@ -1640,6 +1655,25 @@ fn action_description(check: &Check) -> String {
             action.push_str(&format!(", {typed}"));
         }
     }
+    if let Some(drag) = &check.pointer_drag {
+        let description = format!(
+            "drag {:?} by {},{} in {} steps{}",
+            drag.from,
+            drag.dx,
+            drag.dy,
+            drag.steps,
+            if drag.cancel {
+                " and cancel"
+            } else {
+                " and release"
+            }
+        );
+        if action == "observe only" {
+            action = description;
+        } else {
+            action.push_str(&format!(", {description}"));
+        }
+    }
     if let (Some(key), Some(target)) = (
         &check.key,
         check.key_on.as_ref().or(check.type_into.as_ref()),
@@ -2172,6 +2206,7 @@ mod tests {
             expect_count: None,
             covers: Vec::new(),
             press: false,
+            pointer_drag: None,
             settle_after_ms: 0,
             open_timeout_ms: 0,
             outcome_timeout_ms: 0,

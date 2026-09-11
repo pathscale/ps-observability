@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 
+use crate::target::selector_matches_node;
 use blitz_control_protocol::SemanticNode;
 
 /// A surface the sweep must visit, named by the control that opens it.
@@ -327,7 +328,9 @@ fn on_surface_for_profile(
     let Some(marker) = surface.marker.as_deref() else {
         return true;
     };
-    nodes.iter().any(|n| onscreen(n) && n.name.contains(marker))
+    nodes
+        .iter()
+        .any(|n| onscreen(n) && selector_matches_node(n, marker))
 }
 
 /// The controls that belong to the surface in front, by ancestry.
@@ -355,7 +358,7 @@ pub fn on_surface_subtree(nodes: &[SemanticNode], surface: &Surface) -> Vec<u64>
     let by_id: HashMap<u64, &SemanticNode> = nodes.iter().map(|n| (n.id, n)).collect();
     let Some(anchor) = nodes
         .iter()
-        .find(|n| onscreen(n) && n.name.contains(marker))
+        .find(|n| onscreen(n) && selector_matches_node(n, marker))
     else {
         return Vec::new();
     };

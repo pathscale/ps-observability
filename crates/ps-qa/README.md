@@ -82,6 +82,18 @@ fails, so it drops into CI unchanged.
 `--trace` prints the node each check activates, which is how you tell "the
 control is broken" from "the check pressed the wrong thing".
 
+Paint assertions such as `Contrast`, `FullOpacity`, and `OpaqueBackground`
+describe the state after a check's input. A check that toggles a theme and asks
+for contrast measures the resulting theme. The native CLI regression verifies
+both a repair that must pass and a contrast regression that must fail:
+
+```sh
+QA_HOST=/absolute/path/to/chuzz-headless cargo test -p ps-qa --test cli \
+  paint_verdict_uses_the_state_after_the_action -- --ignored
+```
+
+Use a font-enabled host for this test; it renders real text.
+
 ### Diagnosing, without writing a check
 
 ```sh
@@ -89,6 +101,8 @@ ps-qa layout "<name>"     # live boxes: x, y, w, h per matching node
 ps-qa dom "<name>" 6      # attributes plus the ancestor chain
 ps-qa paint "<name>"      # the colours the renderer resolved
 ps-qa press "<name>"      # a real pointer: move, down, up
+ps-qa pointer-drag "button:Drag handle" 60 30 # viewport-pixel displacement
+ps-qa pointer-drag "button:Drag handle" 60 30 --cancel # abandon the gesture
 ps-qa find "<name>" --role button # semantic matches and their node ids
 ps-qa click --id 1842     # activate one exact semantic node
 ps-qa click "<name>"      # activate the first matching semantic node
@@ -105,6 +119,13 @@ is the difference between "your selector" and "your page".
 use semantic activation by default: resolve a name with `find`, retain the node
 id, and act on that id. When repeated rows intentionally share an accessible
 name, `click --id` selects the intended row without coordinates.
+
+For repeatable drag outcomes, declare
+`pointer_drag: Some((from: "button:Drag handle", dx: 60.0, dy: 30.0, steps: 3))`
+on a check, then assert the resulting state through `subject` and `expect`.
+Adding `cancel: true` sends pointercancel instead of pointerup. This drives
+pointer capture and movement; the older `drag` diagnostic directly scrolls a
+container and cannot verify draggable controls.
 
 `inventory` navigates, expands, materializes profile-declared deferred rows,
 and hovers configured surfaces with semantic node-id actions, then emits every

@@ -72,6 +72,70 @@ pub(crate) async fn hover_over(client: &mut Client, want: &str) -> Result<bool> 
     Ok(true)
 }
 
+/// Move a real pointer while held; coordinates stay in viewport pixels at any zoom.
+pub(crate) async fn pointer_drag(
+    client: &mut Client,
+    want: &str,
+    dx: f64,
+    dy: f64,
+    steps: u32,
+    cancel: bool,
+) -> Result<()> {
+    if !dx.is_finite() || !dy.is_finite() || steps == 0 || steps > 240 {
+        bail!("pointer drag needs finite offsets and 1..=240 steps");
+    }
+    let (_, bounds) = locate_control(client, want, &[]).await?;
+    let start = (bounds[0] + bounds[2] / 2.0, bounds[1] + bounds[3] / 2.0);
+    let request = |phase, x, y| {
+        AgentControlRequest::Act(AgentAction::Input(InputCommand::Pointer {
+            phase,
+            x,
+            y,
+            button: 0,
+            modifiers: Modifiers::default(),
+        }))
+    };
+    for phase in [PointerPhase::Move, PointerPhase::Down] {
+        client.agent(&request(phase, start.0, start.1)).await?;
+    }
+    let mut position = start;
+    for step in 1..=steps {
+        let fraction = f64::from(step) / f64::from(steps);
+        position = (start.0 + dx * fraction, start.1 + dy * fraction);
+        if let Err(error) = client
+            .agent(&request(PointerPhase::Move, position.0, position.1))
+            .await
+        {
+            // A failed move must not leave the shared host's pointer held down.
+            let _ = client
+                .agent(&request(PointerPhase::Cancel, position.0, position.1))
+                .await;
+            return Err(error);
+        }
+        sleep_pace().await;
+    }
+    client
+        .agent(&request(
+            if cancel {
+                PointerPhase::Cancel
+            } else {
+                PointerPhase::Up
+            },
+            position.0,
+            position.1,
+        ))
+        .await?;
+    println!(
+        "pointer drag {want:?}: {:.1},{:.1} -> {:.1},{:.1} ({})",
+        start.0,
+        start.1,
+        position.0,
+        position.1,
+        if cancel { "cancelled" } else { "released" }
+    );
+    Ok(())
+}
+
 pub(crate) async fn scroll(client: &mut Client, ticks: usize, delta: f64) -> Result<()> {
     // Say what the pace is, every time, before any number is printed.
     //
@@ -275,6 +339,23 @@ pub(crate) fn parse_key_chord(name: &str) -> Result<(String, String, Modifiers)>
     }
 
     let key_name = key_name.ok_or_else(|| eyre!("key chord is empty"))?;
+    if key_name.len() == 1 {
+        let character = key_name.as_bytes()[0];
+        if character.is_ascii_alphabetic() {
+            return Ok((
+                if modifiers.shift {
+                    key_name.to_ascii_uppercase()
+                } else {
+                    key_name.clone()
+                },
+                format!("Key{}", (character as char).to_ascii_uppercase()),
+                modifiers,
+            ));
+        }
+        if character.is_ascii_digit() {
+            return Ok((key_name.clone(), format!("Digit{key_name}"), modifiers));
+        }
+    }
     let (key, code) = match key_name.as_str() {
         "pageup" | "pgup" => ("PageUp", "PageUp"),
         "pagedown" | "pgdn" => ("PageDown", "PageDown"),
@@ -287,11 +368,12 @@ pub(crate) fn parse_key_chord(name: &str) -> Result<(String, String, Modifiers)>
         "tab" => ("Tab", "Tab"),
         "enter" => ("Enter", "Enter"),
         "escape" | "esc" => ("Escape", "Escape"),
-        "1" => ("1", "Digit1"),
-        "2" => ("2", "Digit2"),
+        "delete" | "del" => ("Delete", "Delete"),
+        "backspace" => ("Backspace", "Backspace"),
+        "space" | "spacebar" => (" ", "Space"),
         other => {
             bail!(
-                "unknown key {other:?}: 1, 2, pageup, pagedown, home, end, up, down, left, right, tab, enter, escape"
+                "unknown key {other:?}: letters, digits, pageup, pagedown, home, end, arrows, tab, enter, escape, delete, backspace, space"
             )
         }
     };

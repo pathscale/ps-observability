@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Post-action paint verdict</title>
+<style>
+  body { margin: 0; background: white; color: black; }
+  h1 { width: 400px; height: 80px; background: black; color: black; font: 32px sans-serif; }
+  button { width: 180px; height: 48px; }
+</style>
+<h1 id="result">Readable text</h1>
+<button id="restore">Restore contrast</button>
+<button id="break">Break contrast</button>
+<button id="day" role="gridcell" aria-label="Tuesday, June 24, 2025">24</button>
+<button id="drag" style="position:absolute;left:40px;top:240px">Drag handle</button>
+<script>
+  const result = document.getElementById('result');
+  document.getElementById('restore').addEventListener('click', () => { result.style.color = 'white'; });
+  document.getElementById('break').addEventListener('click', () => { result.style.color = 'black'; });
+  document.getElementById('day').addEventListener('click', () => {
+    result.style.color = 'white';
+    result.textContent = 'Day selected';
+  });
+  const handle = document.getElementById('drag');
+  let start;
+  handle.addEventListener('pointerdown', (event) => {
+    start = { x: event.clientX, y: event.clientY };
+    handle.setPointerCapture(event.pointerId);
+  });
+  handle.addEventListener('pointermove', (event) => {
+    if (!start) return;
+    handle.style.left = `${40 + event.clientX - start.x}px`;
+    handle.style.top = `${240 + event.clientY - start.y}px`;
+  });
+  handle.addEventListener('pointerup', () => {
+    result.style.color = 'white';
+    result.textContent = handle.style.left === '100px' && handle.style.top === '270px'
+      ? 'Drag committed' : 'Wrong drag position';
+    start = null;
+  });
+  handle.addEventListener('pointercancel', () => {
+    handle.style.left = '40px';
+    handle.style.top = '240px';
+    result.style.color = 'white';
+    result.textContent = 'Drag cancelled';
+    start = null;
+  });
+</script>
+</html>

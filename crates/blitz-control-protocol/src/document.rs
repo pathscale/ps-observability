@@ -332,7 +332,7 @@ pub fn snapshot_document(
                         .join(" "),
                 )
             } else {
-                semantic_value(element)
+                semantic_value(element, &inner, id)
             };
             Some(SemanticNode {
                 dom_id: element_attr(element, "id").map(str::to_owned),
@@ -344,7 +344,7 @@ pub fn snapshot_document(
                 enabled: element_attr(element, "disabled").is_none()
                     && element_attr(element, "aria-disabled") != Some("true"),
                 visible,
-                selected: semantic_selected(element),
+                selected: semantic_selected(element, &inner, id),
                 bounds: rect.and_then(|rect| {
                     let bounds = [rect.x, rect.y, rect.width, rect.height];
                     bounds
@@ -1067,7 +1067,14 @@ pub(crate) fn exposed_text(
     Some(normalized)
 }
 
-fn semantic_value(element: &blitz_dom::ElementData) -> Option<String> {
+fn semantic_value(
+    element: &blitz_dom::ElementData,
+    document: &blitz_dom::BaseDocument,
+    id: blitz_dom::NodeId,
+) -> Option<String> {
+    if element.name.local.as_ref() == "select" {
+        return Some(document.select_value(id));
+    }
     element
         .text_input_data()
         .map(|input| input.editor.text().to_string())
@@ -1080,7 +1087,14 @@ fn semantic_value(element: &blitz_dom::ElementData) -> Option<String> {
         .or_else(|| element_attr(element, "value").map(str::to_string))
 }
 
-pub(crate) fn semantic_selected(element: &blitz_dom::ElementData) -> bool {
+pub(crate) fn semantic_selected(
+    element: &blitz_dom::ElementData,
+    document: &blitz_dom::BaseDocument,
+    id: blitz_dom::NodeId,
+) -> bool {
+    if element.name.local.as_ref() == "option" {
+        return document.option_is_selected(id);
+    }
     /*
      * A real checkbox answers from its live state, not from its markup.
      *
@@ -1399,7 +1413,7 @@ pub fn inspect_document(
                     .is_some_and(|rect| rect.width > 0.0 && rect.height > 0.0);
             let role = semantic_role(element);
             let name = semantic_name(element, node, &role, &inner, id, &labels);
-            let value = semantic_value(element);
+            let value = semantic_value(element, &inner, id);
             Some(SemanticNode {
                 dom_id: element_attr(element, "id").map(str::to_owned),
                 id: id.as_u64(),
@@ -1410,7 +1424,7 @@ pub fn inspect_document(
                 enabled: element_attr(element, "disabled").is_none()
                     && element_attr(element, "aria-disabled") != Some("true"),
                 visible,
-                selected: semantic_selected(element),
+                selected: semantic_selected(element, &inner, id),
                 bounds,
                 slot: element_attr(element, "data-slot").map(str::to_owned),
             })
@@ -3063,7 +3077,11 @@ mod runtime_tests {
         let inner = document.inner();
         let selected = |selector: &str| {
             let id = inner.query_selector(selector).unwrap().unwrap();
-            semantic_selected(inner.get_node(id).unwrap().element_data().unwrap())
+            semantic_selected(
+                inner.get_node(id).unwrap().element_data().unwrap(),
+                &inner,
+                id,
+            )
         };
 
         assert!(selected("#pressed"));
