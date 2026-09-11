@@ -15,6 +15,7 @@ fn paint_verdict_uses_the_state_after_the_action() {
         ("cancel", true, "pointer-drag-cancels"),
         ("gridcell", true, "explicit-gridcell-activates"),
         ("restore", true, "restored-contrast-passes"),
+        ("restore-later", true, "delayed-contrast-passes"),
         ("break", false, "broken-contrast-fails"),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_ps-qa"))

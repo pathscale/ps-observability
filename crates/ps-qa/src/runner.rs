@@ -1989,9 +1989,13 @@ async fn run_qa(
             pixel_outcome = Some(interior_ink(client, &check.subject).await);
         } else if action_error.is_none() && check.expect == qa::Expect::Contrast {
             pixel_outcome = Some(
-                paint_audit::contrast(client, &check.subject, 4.5, 3.0)
-                    .await
-                    .map_err(|error| error.to_string()),
+                wait_for_contrast(
+                    client,
+                    check,
+                    check_started.unwrap_or_else(Instant::now),
+                    action_paint_armed,
+                )
+                .await,
             );
         }
 
@@ -2390,6 +2394,53 @@ const FULL_DOCUMENT_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 /// its backend read was still running. QA is an interactive contract: a result
 /// that cannot paint inside one second is reported as slow rather than making
 /// every later check wait behind it.
+async fn wait_for_contrast(
+    client: &mut Client,
+    check: &qa::Check,
+    started: Instant,
+    event_driven: bool,
+) -> std::result::Result<(), String> {
+    let deadline = started + declared_outcome_timeout(check);
+    let stable_for = Duration::from_millis(check.stable_for_ms);
+    let mut passing_since = None;
+    loop {
+        let verdict = paint_audit::contrast_verdict(client, &check.subject)
+            .await
+            .map_err(|error| error.to_string());
+        let now = Instant::now();
+        if verdict.is_ok() {
+            let since = *passing_since.get_or_insert(now);
+            if now.duration_since(since) >= stable_for {
+                return Ok(());
+            }
+        } else {
+            passing_since = None;
+        }
+        if now >= deadline {
+            return verdict.and_then(|()| {
+                Err(format!(
+                    "contrast did not remain above its floor for {}ms within the outcome window",
+                    stable_for.as_millis()
+                ))
+            });
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let wait = passing_since.map_or(remaining, |since| {
+            stable_for
+                .saturating_sub(now.duration_since(since))
+                .min(remaining)
+        });
+        if event_driven {
+            client
+                .wait_for_paint(wait)
+                .await
+                .map_err(|error| error.to_string())?;
+        } else {
+            tokio::time::sleep(wait.min(Duration::from_millis(25))).await;
+        }
+    }
+}
+
 async fn settle_for_outcome(
     client: &mut Client,
     check: &qa::Check,
