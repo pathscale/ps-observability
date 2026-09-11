@@ -30,6 +30,16 @@
         expect: Contrast,
     ),
     (
+        id: "delayed-contrast-passes",
+        group: "restore-later",
+        what: "contrast waits for the action's rendered result and verifies it stays readable",
+        click: Some("button:Restore contrast after transition"),
+        subject: "heading:Readable text",
+        expect: Contrast,
+        stable_for_ms: 150,
+        outcome_timeout_ms: 1000,
+    ),
+    (
         id: "broken-contrast-fails",
         group: "break",
         what: "making previously readable text black on black fails",

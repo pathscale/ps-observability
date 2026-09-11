@@ -10,12 +10,16 @@
 <h1 id="result">Readable text</h1>
 <button id="restore">Restore contrast</button>
 <button id="break">Break contrast</button>
+<button id="restore-later">Restore contrast after transition</button>
 <button id="day" role="gridcell" aria-label="Tuesday, June 24, 2025">24</button>
 <button id="drag" style="position:absolute;left:40px;top:240px">Drag handle</button>
 <script>
   const result = document.getElementById('result');
   document.getElementById('restore').addEventListener('click', () => { result.style.color = 'white'; });
   document.getElementById('break').addEventListener('click', () => { result.style.color = 'black'; });
+  document.getElementById('restore-later').addEventListener('click', () => {
+    setTimeout(() => { result.style.color = 'white'; }, 120);
+  });
   document.getElementById('day').addEventListener('click', () => {
     result.style.color = 'white';
     result.textContent = 'Day selected';

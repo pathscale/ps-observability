@@ -84,8 +84,11 @@ control is broken" from "the check pressed the wrong thing".
 
 Paint assertions such as `Contrast`, `FullOpacity`, and `OpaqueBackground`
 describe the state after a check's input. A check that toggles a theme and asks
-for contrast measures the resulting theme. The native CLI regression verifies
-both a repair that must pass and a contrast regression that must fail:
+for contrast measures the resulting theme. Contrast waits within the declared
+`outcome_timeout_ms` for transition frames to become readable and honors
+`stable_for_ms` when the check requires sustained contrast. The native CLI
+regression verifies immediate and delayed repairs, and a persistent contrast
+regression that must fail:
 
 ```sh
 QA_HOST=/absolute/path/to/chuzz-headless cargo test -p ps-qa --test cli \

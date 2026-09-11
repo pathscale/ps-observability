@@ -125,6 +125,22 @@ pub(crate) async fn contrast(
     text_ratio: f64,
     control_ratio: f64,
 ) -> Result<()> {
+    measure_contrast(client, want, text_ratio, control_ratio, true).await
+}
+
+/// A quiet sample for outcome settling; intermediate transition frames are not
+/// final failures and should not flood the CLI report.
+pub(crate) async fn contrast_verdict(client: &mut Client, want: &str) -> Result<()> {
+    measure_contrast(client, want, 4.5, 3.0, false).await
+}
+
+async fn measure_contrast(
+    client: &mut Client,
+    want: &str,
+    text_ratio: f64,
+    control_ratio: f64,
+    report: bool,
+) -> Result<()> {
     let (semantic, elapsed) = inspect(client).await?;
     // Reject a selector this tree cannot answer before measuring anything.
     // Silently auditing nothing and calling it a clean page is the worst of the
@@ -261,17 +277,21 @@ pub(crate) async fn contrast(
     }
 
     failures.sort_by(|a, b| a.0.total_cmp(&b.0));
-    println!(
-        "audited {audited} named painted nodes in {elapsed:.1}ms; text {text_ratio:.2}:1, controls {control_ratio:.2}:1"
-    );
+    if report {
+        println!(
+            "audited {audited} named painted nodes in {elapsed:.1}ms; text {text_ratio:.2}:1, controls {control_ratio:.2}:1"
+        );
+    }
     if audited == 0 {
         bail!("no visible painted node matched {want:?}");
     }
-    for (ratio, required, id, role, name) in failures.iter().take(80) {
-        println!("  {ratio:>5.2}:1 < {required:.2}:1  {id:>11}  {role:<12} {name}");
-    }
-    if failures.len() > 80 {
-        println!("... and {} more", failures.len() - 80);
+    if report {
+        for (ratio, required, id, role, name) in failures.iter().take(80) {
+            println!("  {ratio:>5.2}:1 < {required:.2}:1  {id:>11}  {role:<12} {name}");
+        }
+        if failures.len() > 80 {
+            println!("... and {} more", failures.len() - 80);
+        }
     }
     if !failures.is_empty() {
         bail!(
@@ -279,7 +299,9 @@ pub(crate) async fn contrast(
             failures.len()
         );
     }
-    println!("all named painted text meets the contrast floor");
+    if report {
+        println!("all named painted text meets the contrast floor");
+    }
     Ok(())
 }
 
