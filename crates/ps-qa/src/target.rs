@@ -237,6 +237,15 @@ pub(crate) async fn locate_control(
         // disabled. Filtering it first let a longer enabled substring steal
         // the action (`Send` became “Parse … before sending”).
         candidates.retain(|(node, _)| node.enabled);
+        /*
+         * Headless mode may keep a zero-area control as a last-resort target
+         * when missing fonts collapse its label. That fallback must not beat
+         * a visible, painted control with the same accessible name. Responsive
+         * components commonly retain a hidden mobile copy beside the visible
+         * desktop control; tree order alone otherwise selects the hidden copy
+         * and the runtime correctly rejects the click as not interactable.
+         */
+        prioritize_actionable_candidates(&mut candidates);
         // Prefer the modal in front, then the active surface, then global
         // chrome. Retained panes can keep enabled, painted controls with the
         // same name; tree order is not a statement about which one owns the
@@ -350,6 +359,10 @@ pub(crate) async fn locate_control(
         "{want:?} is still off-screen at {:?} after four semantic reveal attempts",
         target.1
     )
+}
+
+fn prioritize_actionable_candidates(candidates: &mut [(&SemanticNode, [f64; 4])]) {
+    candidates.sort_by_key(|(node, _)| (!node.visible, painted_bounds(node).is_none()));
 }
 fn selector_slot(selector: &str) -> Option<&str> {
     selector.strip_prefix('@')
@@ -509,6 +522,26 @@ mod tests {
         let save = node(None, "Save settings");
         assert!(!selector_matches_node(&save, "button"));
         assert!(selector_matches_node(&save, "save"));
+    }
+
+    #[test]
+    fn a_visible_painted_copy_precedes_a_hidden_headless_fallback() {
+        let mut hidden = node(None, "Next page");
+        hidden.visible = false;
+        hidden.bounds = Some([0.0, 0.0, 0.0, 0.0]);
+
+        let mut desktop = node(None, "Next page");
+        desktop.id = 2;
+        desktop.bounds = Some([1200.0, 400.0, 48.0, 48.0]);
+
+        let mut candidates = vec![
+            (&hidden, hidden.bounds.expect("hidden bounds")),
+            (&desktop, desktop.bounds.expect("desktop bounds")),
+        ];
+        prioritize_actionable_candidates(&mut candidates);
+
+        assert_eq!(candidates[0].0.id, desktop.id);
+        assert_eq!(candidates[1].0.id, hidden.id);
     }
 
     /// The audit's old predicate is written out here because the point is that
