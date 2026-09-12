@@ -240,28 +240,6 @@ fn find_text_field<'a>(nodes: &'a [SemanticNode], want: &str) -> Option<&'a Sema
     fields.into_iter().find(matches_name)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_text_field_role;
-
-    #[test]
-    fn editable_aria_roles_are_literal_text_targets() {
-        for role in [
-            "textbox",
-            "textarea",
-            "input",
-            "combobox",
-            "searchbox",
-            "spinbutton",
-        ] {
-            assert!(is_text_field_role(role), "{role}");
-        }
-        for role in ["button", "listbox", "option", "slider"] {
-            assert!(!is_text_field_role(role), "{role}");
-        }
-    }
-}
-
 /// Drive real key events into a focused text field and price them.
 ///
 /// Typing is the interaction the composer autosizes on: it writes
@@ -533,4 +511,26 @@ fn report_frames(
     report::show("before", before);
     report::show("after", after);
     report::show_delta(before, after, actions);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_text_field_role;
+
+    #[test]
+    fn editable_aria_roles_are_literal_text_targets() {
+        for role in [
+            "textbox",
+            "textarea",
+            "input",
+            "combobox",
+            "searchbox",
+            "spinbutton",
+        ] {
+            assert!(is_text_field_role(role), "{role}");
+        }
+        for role in ["button", "listbox", "option", "slider"] {
+            assert!(!is_text_field_role(role), "{role}");
+        }
+    }
 }
