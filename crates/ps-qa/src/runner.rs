@@ -4459,9 +4459,11 @@ async fn run_inventory(
                 continue;
             }
         };
-        let mine: std::collections::HashSet<u64> = reach::on_surface_subtree(&tree.nodes, surface)
-            .into_iter()
-            .collect();
+        let mine: std::collections::HashSet<u64> =
+            reach::inventory_surface_subtree(&tree.nodes, surface)
+                .map_err(eyre::Report::msg)?
+                .into_iter()
+                .collect();
         let components: Vec<_> = tree
             .nodes
             .iter()
@@ -6450,6 +6452,7 @@ mod tests {
             name: "settings".into(),
             opener: "Settings".into(),
             marker: Some("Search settings".into()),
+            inventory_root: None,
             reveal_with: Some("Search settings".into()),
         };
 
@@ -7039,6 +7042,7 @@ mod tests {
             name: "settings".into(),
             opener: "Settings".into(),
             marker: Some("Search settings".into()),
+            inventory_root: None,
             reveal_with: None,
         }];
         assert!(validate_surface_filter_against(Some("Settings"), &surfaces).is_ok());
@@ -7148,6 +7152,7 @@ mod tests {
             name: "project".into(),
             opener: crate::reach::DYNAMIC_DOCUMENT.into(),
             marker: Some("Send".into()),
+            inventory_root: None,
             reveal_with: None,
         };
         let nodes = [component("Send", true, true)];
