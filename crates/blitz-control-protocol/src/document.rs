@@ -180,12 +180,7 @@ pub(crate) fn capture_document_with_surface(
                     &format!("node {id} has a zero-sized box, so there is nothing to capture"),
                 ));
             }
-            (
-                f64::from(rect.x),
-                f64::from(rect.y),
-                f64::from(rect.width),
-                f64::from(rect.height),
-            )
+            (rect.x, rect.y, rect.width, rect.height)
         }
     };
 

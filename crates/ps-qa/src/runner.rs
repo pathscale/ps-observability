@@ -97,6 +97,33 @@ async fn wait_for_arrival(
     }
 }
 
+/// Wait for a preparation marker that is actually on screen.
+///
+/// Ordinary destination matching permits retained, hidden geometry because
+/// some callers are proving layout rather than visibility. A prepared state is
+/// different: the measured action must be timed from the state a person can
+/// see, otherwise an already-retained carousel page satisfies the precondition
+/// before the preparation click has taken effect.
+async fn wait_for_visible_arrival(
+    client: &mut Client,
+    want_here: &str,
+    within: Duration,
+) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut painted_streak = 0;
+    loop {
+        let (tree, _) = inspect(client).await?;
+        let arrived = arrival_anchor(&tree.nodes, None, want_here).is_some();
+        if stable_arrival(&mut painted_streak, arrived) {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 fn arrival_sample_matches(
     nodes: &[SemanticNode],
     destination: Option<&reach::Surface>,
@@ -1521,13 +1548,25 @@ async fn run_qa(
                 };
                 open_error = Some(format!("could not prepare {want:?}: {error}{nearby}"));
             }
-            if let Some(next) = check
-                .click
-                .as_deref()
-                .or(check.type_into.as_deref())
-                .or(check.key_on.as_deref())
+            if open_error.is_none()
+                && let Some(until) = check.prepare_until.as_deref()
+                && !wait_for_visible_arrival(client, until, check_timeout(900)).await?
+            {
+                open_error = Some(format!(
+                    "preparing {want:?} did not render the declared precondition {until:?}"
+                ));
+            }
+            if open_error.is_none()
+                && let Some(next) = check
+                    .click
+                    .as_deref()
+                    .or(check.type_into.as_deref())
+                    .or(check.key_on.as_deref())
             {
                 let _ = wait_for_arrival(client, None, next, check_timeout(900)).await?;
+            }
+            if open_error.is_none() && check.prepare_wait_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(check.prepare_wait_ms)).await;
             }
         }
 
@@ -6699,6 +6738,8 @@ mod tests {
             prepare_unless: None,
             prepare_press: false,
             prepare_key: None,
+            prepare_wait_ms: 0,
+            prepare_until: None,
             hover: None,
             hover_unless: None,
             after_prepare_hover: None,
