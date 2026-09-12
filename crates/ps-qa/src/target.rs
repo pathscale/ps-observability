@@ -121,6 +121,7 @@ pub(crate) fn viewport_for_node(snapshot: &AgentSnapshot, node_id: u64) -> (f64,
 
 pub(crate) fn viewport_for_node_in(nodes: &[SemanticNode], node_id: u64) -> (f64, f64) {
     let mut cursor = Some(node_id);
+    let mut root_bounds = None;
     for _ in 0..32 {
         let Some(id) = cursor else { break };
         let Some(node) = nodes.iter().find(|node| node.id == id) else {
@@ -131,7 +132,13 @@ pub(crate) fn viewport_for_node_in(nodes: &[SemanticNode], node_id: u64) -> (f64
         {
             return (bounds[1], bounds[1] + bounds[3]);
         }
+        if node.parent.is_none() {
+            root_bounds = node.bounds;
+        }
         cursor = node.parent;
+    }
+    if let Some(bounds) = root_bounds {
+        return (bounds[1], bounds[1] + bounds[3]);
     }
     viewport_of_nodes(nodes)
 }
@@ -303,11 +310,36 @@ pub(crate) async fn locate_control(
         return Ok((id, bounds));
     }
 
-    if cli::trace() {
-        println!("        {want:?} is off-screen at {bounds:?}, scrolling it in");
-    }
     let mut target = (id, bounds);
     let mut latest = snapshot;
+
+    /*
+     * A hosted page can advertise its control socket after the first layout
+     * while web fonts and responsive containers are still settling. Do not
+     * turn that transient box into a scroll: fixed chrome can begin one frame
+     * below the window and move into place without any user input. A short
+     * arrival window keeps genuine below-the-fold controls on the reveal path
+     * while letting initial layout finish on its own.
+     */
+    for _ in 0..4 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let (settled, _) = inspect(client).await?;
+        if let Some(found) = pick(&settled) {
+            target = found;
+            let viewport = viewport_for_node(&settled, target.0);
+            if !offscreen(target.1, viewport) {
+                return Ok(target);
+            }
+        }
+        latest = settled;
+    }
+
+    if cli::trace() {
+        println!(
+            "        {want:?} is off-screen at {:?}, scrolling it in",
+            target.1
+        );
+    }
     for _ in 0..4 {
         for node_id in reach::reveal_chain(&latest.nodes, target.0) {
             client
@@ -361,8 +393,15 @@ pub(crate) async fn locate_control(
     )
 }
 
-fn prioritize_actionable_candidates(candidates: &mut [(&SemanticNode, [f64; 4])]) {
-    candidates.sort_by_key(|(node, _)| (!node.visible, painted_bounds(node).is_none()));
+fn prioritize_actionable_candidates(candidates: &mut Vec<(&SemanticNode, [f64; 4])>) {
+    let has_visible_painted = candidates
+        .iter()
+        .any(|(node, _)| node.visible && painted_bounds(node).is_some());
+    if has_visible_painted {
+        candidates.retain(|(node, _)| node.visible && painted_bounds(node).is_some());
+    } else {
+        candidates.sort_by_key(|(node, _)| (!node.visible, painted_bounds(node).is_none()));
+    }
 }
 fn selector_slot(selector: &str) -> Option<&str> {
     selector.strip_prefix('@')
@@ -525,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn a_visible_painted_copy_precedes_a_hidden_headless_fallback() {
+    fn a_visible_painted_copy_excludes_a_hidden_headless_fallback() {
         let mut hidden = node(None, "Next page");
         hidden.visible = false;
         hidden.bounds = Some([0.0, 0.0, 0.0, 0.0]);
@@ -540,8 +579,8 @@ mod tests {
         ];
         prioritize_actionable_candidates(&mut candidates);
 
+        assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0.id, desktop.id);
-        assert_eq!(candidates[1].0.id, hidden.id);
     }
 
     /// The audit's old predicate is written out here because the point is that

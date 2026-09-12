@@ -1,7 +1,7 @@
 [package]
 name = "blitz-control-protocol"
 description = "The Blitz agent-control and diagnostics surface: one vocabulary, one core, two transports"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

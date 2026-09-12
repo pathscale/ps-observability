@@ -300,12 +300,16 @@ impl Drop for HostProcess {
 /// always present, and it is never the small control a check is hovering.
 async fn away_target(client: &mut Client) -> Result<Option<u64>> {
     let (snapshot, _) = inspect(client).await?;
-    Ok(snapshot
-        .nodes
+    Ok(away_target_in(&snapshot.nodes))
+}
+
+fn away_target_in(nodes: &[SemanticNode]) -> Option<u64> {
+    nodes
         .iter()
-        .filter_map(|node| node.bounds.map(|b| (node.id, b[2] * b[3])))
+        .filter(|node| node.visible)
+        .filter_map(|node| painted_bounds(node).map(|b| (node.id, b[2] * b[3])))
         .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(id, _)| id))
+        .map(|(id, _)| id)
 }
 
 /// Move the pointer to the document root and let authored hover state settle.
@@ -5938,9 +5942,9 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::{
         InventoryClass, OutcomeStability, accumulated_hover_signatures, arrival_sample_matches,
-        arrived_without_navigation, assess_pixel_change, capture_node_id, declared_open_timeout,
-        declared_outcome_timeout, duplicate_dom_ids, generated_dom_id, hover_signature_counts,
-        inventory_class, is_pagination_control, measure_ink, name_matches,
+        arrived_without_navigation, assess_pixel_change, away_target_in, capture_node_id,
+        declared_open_timeout, declared_outcome_timeout, duplicate_dom_ids, generated_dom_id,
+        hover_signature_counts, inventory_class, is_pagination_control, measure_ink, name_matches,
         named_document_is_active, named_document_is_active_with_permanent,
         named_document_opener_for, ordered_checks, outcome_check_ids, outcome_verdict,
         pagination_advanced, painted_bounds, painted_named, pixels_change, pixels_hold,
@@ -6050,8 +6054,14 @@ mod tests {
 
     #[test]
     fn surface_content_uses_main_viewport_while_chrome_uses_the_window() {
+        let mut root = component("", true, true);
+        root.id = 9;
+        root.role = "generic".into();
+        root.bounds = Some([0.0, 0.0, 1344.0, 960.0]);
+
         let mut main = component("", true, true);
         main.id = 10;
+        main.parent = Some(root.id);
         main.role = "main".into();
         main.bounds = Some([0.0, 58.0, 1344.0, 842.0]);
 
@@ -6062,14 +6072,15 @@ mod tests {
 
         let mut chrome = component("Project tab", true, true);
         chrome.id = 12;
+        chrome.parent = Some(root.id);
         chrome.bounds = Some([20.0, 15.0, 120.0, 35.0]);
 
         let snapshot = AgentSnapshot {
-            nodes: vec![main, content, chrome],
+            nodes: vec![root, main, content, chrome],
             ..AgentSnapshot::default()
         };
         assert_eq!(viewport_for_node(&snapshot, 11), (58.0, 900.0));
-        assert_eq!(viewport_for_node(&snapshot, 12), (0.0, 900.0));
+        assert_eq!(viewport_for_node(&snapshot, 12), (0.0, 960.0));
     }
 
     #[test]
@@ -6434,6 +6445,19 @@ mod tests {
             accumulated_hover_signatures(&baseline, &after_leak).len(),
             1
         );
+    }
+
+    #[test]
+    fn pointer_parking_ignores_a_larger_retained_hidden_surface() {
+        let mut visible = component("Active page", true, true);
+        visible.id = 41;
+        visible.bounds = Some([0.0, 0.0, 800.0, 600.0]);
+
+        let mut retained = component("Previous page", true, false);
+        retained.id = 42;
+        retained.bounds = Some([0.0, 0.0, 1600.0, 1200.0]);
+
+        assert_eq!(away_target_in(&[retained, visible]), Some(41));
     }
 
     #[test]
