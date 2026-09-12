@@ -924,6 +924,7 @@ mod tests {
         let surface = Surface {
             name: "settings".into(),
             opener: "Settings".into(),
+            via: vec![],
             marker: Some("Search settings".into()),
             inventory_root: None,
             reveal_with: None,
@@ -1027,6 +1028,7 @@ mod tests {
         let surface = Surface {
             name: "deep".to_owned(),
             opener: "Deep".to_owned(),
+            via: vec![],
             marker: Some("Surface marker".to_owned()),
             inventory_root: None,
             reveal_with: None,
@@ -1061,6 +1063,7 @@ mod tests {
         let surface = Surface {
             name: "home".into(),
             opener: "PathScale".into(),
+            via: vec![],
             marker: Some("Page 1".into()),
             inventory_root: Some("#surface-root".into()),
             reveal_with: None,
@@ -1083,6 +1086,7 @@ mod tests {
         let surface = Surface {
             name: "home".into(),
             opener: "PathScale".into(),
+            via: vec![],
             marker: Some("Page 1".into()),
             inventory_root: Some("#missing".into()),
             reveal_with: None,

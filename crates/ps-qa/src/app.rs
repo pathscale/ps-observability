@@ -70,6 +70,13 @@ pub struct SurfaceSpec {
     /// first user-named document, resolved at run time when fixture names are
     /// not stable.
     pub opener: String,
+    /// Controls that must be activated, in order, before `opener` exists.
+    ///
+    /// This keeps nested navigation in application data. For example, a
+    /// component lab may require `Components`, then `Surfaces`, before its
+    /// final `Complete Coverage` link is mounted.
+    #[serde(default)]
+    pub via: Vec<String>,
     /// A control unique to this surface, used to prove it is in front and to
     /// scope coverage to its semantic subtree.
     /// Accepts the same selectors as check subjects, for example `link:version`
@@ -334,6 +341,7 @@ mod tests {
             surfaces: vec![SurfaceSpec {
                 name: "dashboard".to_owned(),
                 opener: "Dashboard".to_owned(),
+                via: vec!["Products".to_owned()],
                 marker: Some("Overview heading".to_owned()),
                 inventory_root: Some("#surface-root".to_owned()),
                 reveal_with: Some("Search dashboard".to_owned()),
@@ -362,6 +370,7 @@ mod tests {
         let text = ron::to_string(&profile).expect("serialises");
         let back: AppProfile = ron::from_str(&text).expect("parses");
         assert_eq!(back.surfaces.len(), 1);
+        assert_eq!(back.surfaces[0].via, ["Products"]);
         assert_eq!(
             back.surfaces[0].inventory_root.as_deref(),
             Some("#surface-root")

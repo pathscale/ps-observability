@@ -4661,6 +4661,17 @@ async fn run_inventory(
 }
 
 /// Navigate to a surface, and say whether it opened.
+async fn click_surface_path(
+    client: &mut Client,
+    surface: &reach::Surface,
+    opener: &str,
+) -> Result<()> {
+    for step in surface.via.iter().map(String::as_str).chain([opener]) {
+        click_named_quiet(client, step).await?;
+    }
+    Ok(())
+}
+
 async fn open_surface(client: &mut Client, surface: &reach::Surface) -> Result<bool> {
     if surface.opener.is_empty() {
         return Ok(true);
@@ -4751,7 +4762,7 @@ async fn open_surface(client: &mut Client, surface: &reach::Surface) -> Result<b
                 node_id: id,
             }))
             .await?;
-    } else if click_named_quiet(client, &opener).await.is_err() {
+    } else if click_surface_path(client, surface, &opener).await.is_err() {
         return Ok(false);
     }
     if settle_on(client, surface).await? {
@@ -4767,7 +4778,7 @@ async fn open_surface(client: &mut Client, surface: &reach::Surface) -> Result<b
     if let Some(home) = reach::profile().home_opener.as_deref() {
         let _ = click_named_quiet(client, home).await;
     }
-    if click_named_quiet(client, &opener).await.is_err() {
+    if click_surface_path(client, surface, &opener).await.is_err() {
         return Ok(false);
     }
     settle_on(client, surface).await
@@ -6451,6 +6462,7 @@ mod tests {
         let settings = SurfaceSpec {
             name: "settings".into(),
             opener: "Settings".into(),
+            via: vec![],
             marker: Some("Search settings".into()),
             inventory_root: None,
             reveal_with: Some("Search settings".into()),
@@ -7041,6 +7053,7 @@ mod tests {
         let surfaces = [SurfaceSpec {
             name: "settings".into(),
             opener: "Settings".into(),
+            via: vec![],
             marker: Some("Search settings".into()),
             inventory_root: None,
             reveal_with: None,
@@ -7151,6 +7164,7 @@ mod tests {
         let project = SurfaceSpec {
             name: "project".into(),
             opener: crate::reach::DYNAMIC_DOCUMENT.into(),
+            via: vec![],
             marker: Some("Send".into()),
             inventory_root: None,
             reveal_with: None,
