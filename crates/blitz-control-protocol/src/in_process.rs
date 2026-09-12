@@ -39,7 +39,7 @@ use keyboard_types::{Code, Key};
 
 use crate::document::{
     activate_agent_node, control_error, debug_error, hover_agent_node, inspect_document, key_event,
-    keyboard_modifiers, pointer_coords, pointer_event, resolve_agent_node,
+    keyboard_modifiers, resolve_agent_node,
 };
 use crate::{
     AgentAction, AgentControlRequest, DebugError, DebugResponse, InputCommand, KeyPhase,
@@ -178,7 +178,7 @@ impl DocumentControl {
                 let mut events = Vec::new();
                 document
                     .inner_mut()
-                    .scroll_to_node_with_events(node_id, |event| events.push(event));
+                    .scroll_to_node_centered_with_events(node_id, |event| events.push(event));
                 for event in events {
                     document.dispatch_dom_event(event);
                 }
@@ -246,7 +246,8 @@ impl DocumentControl {
                     PointerPhase::Up | PointerPhase::Cancel => self.buttons.remove(button.into()),
                     PointerPhase::Move => {}
                 }
-                let event = pointer_event(
+                let event = crate::document::pointer_event_for_document(
+                    document,
                     self.pointer,
                     button,
                     self.buttons,
@@ -267,7 +268,7 @@ impl DocumentControl {
             } => {
                 let event = BlitzWheelEvent {
                     delta: BlitzWheelDelta::Pixels(delta_x, delta_y),
-                    coords: pointer_coords(self.pointer),
+                    coords: crate::document::pointer_coords_for_document(document, self.pointer),
                     buttons: self.buttons,
                     mods: keyboard_modifiers(modifiers),
                     element: Point::default(),

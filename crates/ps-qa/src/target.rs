@@ -82,6 +82,9 @@ pub(crate) fn name_matches(name: &str, pattern: &str) -> bool {
 /// `cover` already read it this way; `open_named` and `press_named` did not,
 /// which is the bug the two helpers below exist to close.
 pub(crate) fn viewport_of(snapshot: &AgentSnapshot) -> (f64, f64) {
+    if let Some(bounds) = snapshot.viewport {
+        return (bounds[1], bounds[1] + bounds[3]);
+    }
     viewport_of_nodes(&snapshot.nodes)
 }
 
@@ -100,6 +103,18 @@ pub(crate) fn viewport_of_nodes(nodes: &[SemanticNode]) -> (f64, f64) {
      * Taking the top of the window keeps the below-the-fold case, which is what
      * this bound is actually for, without swallowing the header.
      */
+    let window = nodes
+        .iter()
+        .filter(|node| node.parent.is_none())
+        .filter_map(|node| node.bounds)
+        .max_by(|a, b| {
+            (a[2] * a[3])
+                .partial_cmp(&(b[2] * b[3]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    if let Some(bounds) = window {
+        return (bounds[1], bounds[1] + bounds[3]);
+    }
     let bottom = nodes
         .iter()
         .filter(|node| node.role == "main")
@@ -116,12 +131,18 @@ pub(crate) fn viewport_of_nodes(nodes: &[SemanticNode]) -> (f64, f64) {
 /// scroll coordinates as window-visible sends pointer events behind the tab
 /// strip instead of revealing the row inside its panel.
 pub(crate) fn viewport_for_node(snapshot: &AgentSnapshot, node_id: u64) -> (f64, f64) {
-    viewport_for_node_in(&snapshot.nodes, node_id)
+    let inferred = viewport_for_node_in(&snapshot.nodes, node_id);
+    if let Some(bounds) = snapshot.viewport {
+        let window = (bounds[1], bounds[1] + bounds[3]);
+        return (inferred.0.max(window.0), inferred.1.min(window.1));
+    }
+    inferred
 }
 
 pub(crate) fn viewport_for_node_in(nodes: &[SemanticNode], node_id: u64) -> (f64, f64) {
     let mut cursor = Some(node_id);
     let mut root_bounds = None;
+    let mut main_bounds = None;
     for _ in 0..32 {
         let Some(id) = cursor else { break };
         let Some(node) = nodes.iter().find(|node| node.id == id) else {
@@ -130,7 +151,7 @@ pub(crate) fn viewport_for_node_in(nodes: &[SemanticNode], node_id: u64) -> (f64
         if node.role == "main"
             && let Some(bounds) = node.bounds
         {
-            return (bounds[1], bounds[1] + bounds[3]);
+            main_bounds = Some(bounds);
         }
         if node.parent.is_none() {
             root_bounds = node.bounds;
@@ -138,7 +159,11 @@ pub(crate) fn viewport_for_node_in(nodes: &[SemanticNode], node_id: u64) -> (f64
         cursor = node.parent;
     }
     if let Some(bounds) = root_bounds {
-        return (bounds[1], bounds[1] + bounds[3]);
+        let window = (bounds[1], bounds[1] + bounds[3]);
+        if let Some(main) = main_bounds {
+            return (window.0.max(main[1]), window.1.min(main[1] + main[3]));
+        }
+        return window;
     }
     viewport_of_nodes(nodes)
 }

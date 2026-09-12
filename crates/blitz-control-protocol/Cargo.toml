@@ -73,7 +73,7 @@ serde_json.workspace = true
 schemars.workspace = true
 
 # The core, and nothing else, reaches for these.
-blitz-dom = { package = "ps-blitz-dom", version = "^0.4.8", optional = true }
+blitz-dom = { package = "ps-blitz-dom", version = "^0.4.9", optional = true }
 # Naming stylo directly: the computed-style reader and the visibility check read
 # `style::values::computed`, and blitz-dom does not re-export it. The version is
 # the one blitz-dom resolves, so cargo unifies them instead of putting two
@@ -83,8 +83,8 @@ style = { version = "0.20.0", package = "stylo", optional = true }
 # `yeslogic-fontconfig-sys` system library, so enabling it here would decide
 # that every consumer needs one installed, including a headless one that reads
 # no font catalogue. An application that wants the machine's fonts asks itself.
-blitz-script = { package = "ps-blitz-script", version = "^0.4.8", optional = true }
-blitz-traits = { package = "ps-blitz-traits", version = "^0.4.8", optional = true }
+blitz-script = { package = "ps-blitz-script", version = "^0.4.9", optional = true }
+blitz-traits = { package = "ps-blitz-traits", version = "^0.4.9", optional = true }
 keyboard-types = { version = "0.7", optional = true }
 
 # Capture. The CPU renderer on purpose: a capture must not need a GPU, a
