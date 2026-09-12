@@ -188,7 +188,8 @@ async fn wait_for_navigation_arrival(
                 .iter()
                 .find(|node| {
                     node.role.eq_ignore_ascii_case("button")
-                        && node.name.eq_ignore_ascii_case(&tab_name)
+                        && (node.name.eq_ignore_ascii_case(document_name)
+                            || node.name.eq_ignore_ascii_case(&tab_name))
                         && node.selected
                         && reach::onscreen(node)
                 })
@@ -2656,7 +2657,7 @@ fn named_document_is_active_with_permanent(
     let tab_name = format!("{want}{want}");
     let exact_document_selected = nodes.iter().any(|node| {
         node.role == "button"
-            && node.name.eq_ignore_ascii_case(&tab_name)
+            && (node.name.eq_ignore_ascii_case(want) || node.name.eq_ignore_ascii_case(&tab_name))
             && node.selected
             && node.visible
             && painted_bounds(node).is_some()
@@ -6999,6 +7000,13 @@ mod tests {
         assert!(!named_document_is_active(&[tab.clone()], "Fixture project"));
         tab.selected = true;
         assert!(named_document_is_active(&[tab.clone()], "Fixture project"));
+
+        let mut undoubled_tab = component("Fixture project", true, true);
+        undoubled_tab.selected = true;
+        assert!(named_document_is_active(
+            &[undoubled_tab],
+            "Fixture project"
+        ));
 
         let permanent_name = "Settings".to_owned();
         let mut permanent = component(&permanent_name, true, true);
