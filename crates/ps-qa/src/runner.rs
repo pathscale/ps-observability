@@ -4013,6 +4013,7 @@ fn outcome_check_ids(node: &SemanticNode, checks: &[qa::Check]) -> Vec<String> {
                 check.type_into.as_deref(),
                 check.key_on.as_deref(),
                 check.scroll_over.as_deref(),
+                check.pointer_drag.as_ref().map(|drag| drag.from.as_str()),
             ]
             .into_iter()
             .flatten()
@@ -4023,10 +4024,14 @@ fn outcome_check_ids(node: &SemanticNode, checks: &[qa::Check]) -> Vec<String> {
                 .any(|selector| selector_matches_node(node, selector));
             let focus_destination = check.expect == qa::Expect::FocusMoves
                 && exact_selector_matches_node(node, &check.subject);
+            let measured_outcome = matches!(
+                check.expect,
+                qa::Expect::ValueChanges | qa::Expect::SelectionChanges | qa::Expect::NameChanges
+            ) && exact_selector_matches_node(node, &check.subject);
             let disabled_outcome = !node.enabled
                 && matches!(check.expect, qa::Expect::Disabled)
                 && coverage_action_matches_node(node, &check.subject);
-            driven || family || focus_destination || disabled_outcome
+            driven || family || focus_destination || measured_outcome || disabled_outcome
         })
         .map(|check| check.id.clone())
         .collect()
@@ -4201,6 +4206,22 @@ fn inventory_outcome_failures(unverified: usize, isolated: usize, required: bool
         unverified.saturating_sub(isolated)
     } else {
         0
+    }
+}
+
+fn inventory_outcome_declared(class: InventoryClass, matched_checks: &[String]) -> bool {
+    class != InventoryClass::Manual
+        && class != InventoryClass::Isolated
+        && !matched_checks.is_empty()
+}
+
+fn inventory_control_unverified(class: InventoryClass, matched_checks: &[String]) -> bool {
+    match class {
+        InventoryClass::Manual => false,
+        // These need a disposable-process lifecycle verdict. Merely naming an
+        // isolated control in the shared suite cannot prove it completed.
+        InventoryClass::Isolated => true,
+        _ => matched_checks.is_empty(),
     }
 }
 
@@ -4491,30 +4512,12 @@ async fn run_inventory(
         let outcome_declared = classes
             .iter()
             .zip(&declared)
-            .filter(|(class, matches)| {
-                matches!(
-                    class,
-                    InventoryClass::Reachable
-                        | InventoryClass::Disabled
-                        | InventoryClass::Unreachable
-                ) && !matches.is_empty()
-            })
+            .filter(|(class, matches)| inventory_outcome_declared(**class, matches))
             .count();
         let unverified = classes
             .iter()
             .zip(&declared)
-            .filter(|(class, matches)| match class {
-                InventoryClass::Reachable | InventoryClass::Disabled => matches.is_empty(),
-                // These must run in disposable processes; declaration in the
-                // shared suite cannot turn them green.
-                InventoryClass::Isolated => true,
-                InventoryClass::Manual
-                | InventoryClass::MissingId
-                | InventoryClass::UnstableId
-                | InventoryClass::DuplicateId
-                | InventoryClass::Anonymous
-                | InventoryClass::Unreachable => false,
-            })
+            .filter(|(class, matches)| inventory_control_unverified(**class, matches))
             .count();
         for (node, matched_checks) in components.iter().zip(&declared) {
             let manual = reach::requires_manual_release_check(&node.name);
@@ -4537,16 +4540,7 @@ async fn run_inventory(
             if !matched_checks.is_empty() {
                 counts[10] += 1;
             }
-            let is_unverified = match class {
-                InventoryClass::Reachable | InventoryClass::Disabled => matched_checks.is_empty(),
-                InventoryClass::Isolated => true,
-                InventoryClass::Manual
-                | InventoryClass::MissingId
-                | InventoryClass::UnstableId
-                | InventoryClass::DuplicateId
-                | InventoryClass::Anonymous
-                | InventoryClass::Unreachable => false,
-            };
+            let is_unverified = inventory_control_unverified(class, matched_checks);
             if is_unverified {
                 counts[11] += 1;
             }
@@ -6075,7 +6069,7 @@ mod tests {
     };
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
-    use crate::qa::{Check, Expect};
+    use crate::qa::{Check, Expect, PointerDrag};
     use crate::target::{
         exact_selector_matches_node, offscreen, retain_exact_candidates, viewport_for_node,
     };
@@ -7290,6 +7284,40 @@ mod tests {
     }
 
     #[test]
+    fn a_control_measured_by_a_state_outcome_receives_coverage_credit() {
+        let mut selection = check(
+            "select-option",
+            Some("option:Beta"),
+            "combobox:Coverage combo box",
+        );
+        selection.expect = Expect::ValueChanges;
+        let mut input = component("Coverage combo box", true, true);
+        input.role = "combobox".into();
+
+        assert_eq!(
+            outcome_check_ids(&input, &[selection]),
+            vec!["select-option"]
+        );
+    }
+
+    #[test]
+    fn pointer_drag_targets_receive_coverage_credit() {
+        let mut drag = check("drag-hue", None, "slider:Hue");
+        drag.expect = Expect::ValueChanges;
+        drag.pointer_drag = Some(PointerDrag {
+            from: "slider:Hue".into(),
+            dx: 20.0,
+            dy: 0.0,
+            steps: 2,
+            cancel: false,
+        });
+        let mut slider = component("Hue", true, true);
+        slider.role = "slider".into();
+
+        assert_eq!(outcome_check_ids(&slider, &[drag]), vec!["drag-hue"]);
+    }
+
+    #[test]
     fn an_explicit_family_selector_credits_repeated_component_rows() {
         let mut check = check("offer-model", Some("Offer Default"), "Offer Default");
         check.covers.push("checkbox:Offer ".into());
@@ -7458,6 +7486,42 @@ mod tests {
         assert_eq!(super::inventory_outcome_failures(1, 1, true), 0);
         assert_eq!(super::inventory_outcome_failures(3, 1, true), 2);
         assert_eq!(super::inventory_outcome_failures(3, 1, false), 0);
+    }
+
+    #[test]
+    fn identity_failures_do_not_hide_missing_outcomes() {
+        let none: Vec<String> = Vec::new();
+        let declared = vec!["save-works".into()];
+
+        for class in [
+            InventoryClass::MissingId,
+            InventoryClass::UnstableId,
+            InventoryClass::DuplicateId,
+            InventoryClass::Anonymous,
+            InventoryClass::Unreachable,
+        ] {
+            assert!(super::inventory_control_unverified(class, &none));
+            assert!(!super::inventory_outcome_declared(class, &none));
+            assert!(!super::inventory_control_unverified(class, &declared));
+            assert!(super::inventory_outcome_declared(class, &declared));
+        }
+
+        assert!(!super::inventory_control_unverified(
+            InventoryClass::Manual,
+            &none
+        ));
+        assert!(!super::inventory_outcome_declared(
+            InventoryClass::Manual,
+            &declared
+        ));
+        assert!(super::inventory_control_unverified(
+            InventoryClass::Isolated,
+            &declared
+        ));
+        assert!(!super::inventory_outcome_declared(
+            InventoryClass::Isolated,
+            &declared
+        ));
     }
 
     /// A bare word is a substring, because that is how a control is recalled.
