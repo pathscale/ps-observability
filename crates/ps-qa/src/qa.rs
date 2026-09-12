@@ -1151,7 +1151,15 @@ pub fn verdict(
             }
         }
         Expect::PaintsNamed => {
-            if !found.iter().any(|node| shows(check, node)) {
+            if !found.iter().any(|node| {
+                shows(check, node)
+                    && !node.bounds.is_some_and(|bounds| {
+                        crate::target::offscreen(
+                            bounds,
+                            crate::target::viewport_for_node_in(after, node.id),
+                        )
+                    })
+            }) {
                 let state = found
                     .iter()
                     .map(|node| {
@@ -2477,6 +2485,32 @@ mod tests {
                 panic!("{selector:?} did not use shared semantics: {error}")
             });
         }
+    }
+
+    #[test]
+    fn paints_named_rejects_a_box_translated_outside_the_viewport() {
+        let node = SemanticNode {
+            dom_id: None,
+            id: 7,
+            parent: None,
+            role: "heading".into(),
+            name: "Drawer outcome".into(),
+            value: None,
+            enabled: true,
+            visible: true,
+            selected: false,
+            bounds: Some([-384.0, 40.0, 336.0, 24.0]),
+            slot: None,
+        };
+        let mut check = parse("");
+        check.subject = "heading:Drawer outcome".into();
+        check.expect = Expect::PaintsNamed;
+
+        assert!(verdict(&check, &[], std::slice::from_ref(&node)).is_err());
+
+        let mut onscreen = node;
+        onscreen.bounds = Some([24.0, 40.0, 336.0, 24.0]);
+        assert!(verdict(&check, &[], &[onscreen]).is_ok());
     }
 
     #[test]
