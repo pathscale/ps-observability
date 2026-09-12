@@ -575,6 +575,13 @@ pub struct AgentSnapshot {
     pub revision: u64,
     pub active_window: Option<String>,
     pub focused_node: Option<u64>,
+    /// The client-space viewport in CSS pixels.
+    ///
+    /// The root and `main` boxes may be as tall as the whole document, so
+    /// their semantic bounds cannot tell an external pointer driver where the
+    /// physical window ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<[f64; 4]>,
     pub nodes: Vec<SemanticNode>,
 }
 

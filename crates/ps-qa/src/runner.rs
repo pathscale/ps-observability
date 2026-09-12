@@ -6124,6 +6124,32 @@ mod tests {
     }
 
     #[test]
+    fn document_height_does_not_expand_the_pointer_viewport() {
+        let mut root = component("", true, true);
+        root.id = 20;
+        root.role = "generic".into();
+        root.bounds = Some([0.0, 0.0, 1344.0, 2200.0]);
+
+        let mut main = component("", true, true);
+        main.id = 21;
+        main.parent = Some(root.id);
+        main.role = "main".into();
+        main.bounds = Some([0.0, 64.0, 1344.0, 2200.0]);
+
+        let mut content = component("Below the fold", true, true);
+        content.id = 22;
+        content.parent = Some(main.id);
+        content.bounds = Some([40.0, 1200.0, 200.0, 40.0]);
+
+        let snapshot = AgentSnapshot {
+            nodes: vec![root, main, content],
+            viewport: Some([0.0, 0.0, 1344.0, 960.0]),
+            ..AgentSnapshot::default()
+        };
+        assert_eq!(viewport_for_node(&snapshot, 22), (64.0, 960.0));
+    }
+
+    #[test]
     fn pixel_stability_reports_a_changed_rendered_pixel() {
         use base64::Engine as _;
 

@@ -27,8 +27,8 @@ use crate::{
 use blitz_dom::Document;
 use blitz_script::ScriptDocument;
 use blitz_traits::events::{
-    BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, DomEvent, DomEventData, KeyState,
-    MouseEventButton, MouseEventButtons, Point, PointerCoords, PointerDetails, UiEvent,
+    BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, KeyState, MouseEventButton,
+    MouseEventButtons, Point, PointerCoords, PointerDetails, UiEvent,
 };
 #[cfg(feature = "capture")]
 use blitz_traits::node_id::NodeId;
@@ -1242,7 +1242,8 @@ pub fn hover_agent_node(
 ) -> Result<(f32, f32), DebugError> {
     let (node_id, position) = resolve_agent_node(document, node_id)?;
     document.handle_pointer_move_to_node(
-        pointer_event(
+        pointer_event_for_document(
+            document,
             position,
             MouseEventButton::Main,
             MouseEventButtons::default(),
@@ -1345,6 +1346,14 @@ pub fn inspect_document(
         return control_error("unknownNode", "the requested root node does not exist");
     }
     let focused_node = inner.get_focussed_node_id().map(|id| id.as_u64());
+    let viewport = inner.viewport();
+    let viewport_scale = viewport.scale_f64();
+    let viewport_bounds = Some([
+        0.0,
+        0.0,
+        viewport.window_size.0 as f64 / viewport_scale,
+        viewport.window_size.1 as f64 / viewport_scale,
+    ]);
     // Built over the whole document even when a subtree was asked for: a label
     // is frequently a sibling of the control rather than a descendant of the
     // node the caller rooted at.
@@ -1428,6 +1437,7 @@ pub fn inspect_document(
         revision,
         active_window: Some("blitz-main".into()),
         focused_node,
+        viewport: viewport_bounds,
         nodes,
     })
 }
@@ -1619,6 +1629,38 @@ pub(crate) fn pointer_event(
         element: Point::default(),
         active_pointers: Default::default(),
     }
+}
+
+/// Build a pointer event from viewport coordinates without losing document
+/// coordinates after scrolling.
+///
+/// Agent input is expressed in the same client-space coordinates as semantic
+/// bounds. DOM `clientX/Y` keep those values, while `pageX/Y` include the
+/// document's current viewport scroll. Treating both as the client position
+/// makes hit testing and component pointer math miss after `ScrollIntoView`.
+pub(crate) fn pointer_event_for_document(
+    document: &ScriptDocument,
+    position: (f32, f32),
+    button: MouseEventButton,
+    buttons: MouseEventButtons,
+    modifiers: KeyboardModifiers,
+) -> BlitzPointerEvent {
+    let mut event = pointer_event(position, button, buttons, modifiers);
+    let scroll = document.inner().viewport_scroll();
+    event.coords.page_x += scroll.x as f32;
+    event.coords.page_y += scroll.y as f32;
+    event
+}
+
+pub(crate) fn pointer_coords_for_document(
+    document: &ScriptDocument,
+    position: (f32, f32),
+) -> PointerCoords {
+    let mut coords = pointer_coords(position);
+    let scroll = document.inner().viewport_scroll();
+    coords.page_x += scroll.x as f32;
+    coords.page_y += scroll.y as f32;
+    coords
 }
 
 pub(crate) struct SemanticCandidate {
@@ -2025,32 +2067,39 @@ pub(crate) fn activate_agent_node(
         .is_some_and(focuses_on_click);
 
     for _ in 0..count {
-        let down = pointer_event(
-            position,
-            MouseEventButton::Main,
-            MouseEventButtons::Primary,
-            KeyboardModifiers::empty(),
-        );
-        let up = pointer_event(
+        let movement = pointer_event_for_document(
+            document,
             position,
             MouseEventButton::Main,
             MouseEventButtons::default(),
             KeyboardModifiers::empty(),
         );
-        for data in [
-            DomEventData::PointerDown(down.clone()),
-            DomEventData::MouseDown(down),
-            DomEventData::PointerUp(up.clone()),
-            DomEventData::MouseUp(up.clone()),
-            DomEventData::Click(up),
+        let down = pointer_event_for_document(
+            document,
+            position,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            KeyboardModifiers::empty(),
+        );
+        let up = pointer_event_for_document(
+            document,
+            position,
+            MouseEventButton::Main,
+            MouseEventButtons::default(),
+            KeyboardModifiers::empty(),
+        );
+        for event in [
+            UiEvent::PointerMove(movement),
+            UiEvent::PointerDown(down),
+            UiEvent::PointerUp(up),
         ] {
-            // A mousedown handler can deliberately replace its own control.
-            // The action already happened; later phases have no surviving
-            // target and must not be retargeted to whatever took its place.
+            // A pointer handler can deliberately replace its own control. The
+            // action already happened; later phases have no surviving target
+            // and must not be retargeted to whatever took its place.
             if document.inner().get_node(node_id).is_none() {
                 break;
             }
-            document.dispatch_dom_event(DomEvent::new(node_id, data));
+            document.handle_ui_event_to_node(event, node_id);
         }
         if focusable && document.inner().get_node(node_id).is_some() {
             document.inner_mut().set_focus_to(node_id);
@@ -2145,6 +2194,19 @@ mod tests {
             error.message.contains("not visible"),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn pointer_coordinates_keep_client_and_page_space_distinct_after_scroll() {
+        let mut document = document();
+        document
+            .inner_mut()
+            .set_viewport_scroll(blitz_dom::Point { x: 17.0, y: 600.0 });
+
+        let coords = pointer_coords_for_document(&document, (24.0, 32.0));
+
+        assert_eq!((coords.client_x, coords.client_y), (24.0, 32.0));
+        assert_eq!((coords.page_x, coords.page_y), (41.0, 632.0));
     }
 }
 
