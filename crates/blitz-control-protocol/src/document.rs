@@ -171,25 +171,21 @@ pub(crate) fn capture_document_with_surface(
         ),
         Some(id) => {
             let inner = script_document.inner();
-            let node = inner
-                .get_node(NodeId::from_u64(id))
+            let rect = inner
+                .get_client_bounding_rect(NodeId::from_u64(id))
                 .ok_or_else(|| debug_error("unknownNode", &format!("no node {id}")))?;
-            let layout = node.final_layout();
-            let position = node.absolute_position(0.0, 0.0);
-            if layout.size.width <= 0.0 || layout.size.height <= 0.0 {
+            if rect.width <= 0.0 || rect.height <= 0.0 {
                 return Err(debug_error(
                     "captureEmpty",
                     &format!("node {id} has a zero-sized box, so there is nothing to capture"),
                 ));
             }
-            let box_ = (
-                f64::from(position.x),
-                f64::from(position.y),
-                f64::from(layout.size.width),
-                f64::from(layout.size.height),
-            );
-            drop(inner);
-            box_
+            (
+                f64::from(rect.x),
+                f64::from(rect.y),
+                f64::from(rect.width),
+                f64::from(rect.height),
+            )
         }
     };
 
@@ -1249,13 +1245,16 @@ pub fn hover_agent_node(
     document: &mut ScriptDocument,
     node_id: u64,
 ) -> Result<(f32, f32), DebugError> {
-    let position = resolve_agent_node(document, node_id)?.1;
-    document.handle_ui_event(UiEvent::PointerMove(pointer_event(
-        position,
-        MouseEventButton::Main,
-        MouseEventButtons::default(),
-        KeyboardModifiers::empty(),
-    )));
+    let (node_id, position) = resolve_agent_node(document, node_id)?;
+    document.handle_pointer_move_to_node(
+        pointer_event(
+            position,
+            MouseEventButton::Main,
+            MouseEventButtons::default(),
+            KeyboardModifiers::empty(),
+        ),
+        node_id,
+    );
     Ok(position)
 }
 
@@ -3445,6 +3444,44 @@ mod runtime_tests {
         assert!(node.width > 0);
         assert!(node.height > 0);
         assert_eq!(node_rgba, expected);
+    }
+
+    #[cfg(feature = "capture")]
+    #[test]
+    fn fixed_node_capture_uses_viewport_coordinates_after_document_scroll() {
+        use blitz_traits::shell::{ColorScheme, Viewport};
+
+        let mut document = ScriptDocument::from_html(
+            "<body style='margin:0;height:1600px'>\
+               <textarea id='target' style='position:fixed;left:24px;top:32px;width:240px;height:96px;background:#18202a'>theme css</textarea>\
+             </body>",
+            DocumentConfig::default(),
+        );
+        document
+            .inner_mut()
+            .set_viewport(Viewport::new(320, 200, 1.0, ColorScheme::Dark));
+        document.inner_mut().resolve(0.0);
+        document
+            .inner_mut()
+            .set_viewport_scroll(blitz_dom::Point { x: 0.0, y: 600.0 });
+        let target = document.inner().query_selector("#target").unwrap().unwrap();
+        let expected = document
+            .inner()
+            .get_client_bounding_rect(target)
+            .expect("the fixed textarea is laid out");
+
+        let image = capture_document(
+            &mut document,
+            crate::CaptureRequest {
+                node_id: Some(target.as_u64()),
+                scale: 1.0,
+            },
+        )
+        .unwrap();
+
+        assert!(expected.width > 0.0 && expected.height > 1.0);
+        assert_eq!(image.width, expected.width.round() as u32);
+        assert_eq!(image.height, expected.height.round() as u32);
     }
 
     #[cfg(feature = "capture")]
