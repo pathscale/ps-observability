@@ -70,12 +70,27 @@ pub struct SurfaceSpec {
     /// first user-named document, resolved at run time when fixture names are
     /// not stable.
     pub opener: String,
+    /// Controls that must be activated, in order, before `opener` exists.
+    ///
+    /// This keeps nested navigation in application data. For example, a
+    /// component lab may require `Components`, then `Surfaces`, before its
+    /// final `Complete Coverage` link is mounted.
+    #[serde(default)]
+    pub via: Vec<String>,
     /// A control unique to this surface, used to prove it is in front and to
     /// scope coverage to its semantic subtree.
     /// Accepts the same selectors as check subjects, for example `link:version`
     /// or `#dashboard`. An unqualified name matches text in any semantic role.
     #[serde(default)]
     pub marker: Option<String>,
+    /// An authored root used only to decide which controls inventory owns.
+    ///
+    /// Outcome polling continues to use `marker`, whose narrower semantic
+    /// subtree excludes unrelated animation. This selector lets inventory
+    /// count global controls that belong to the page but sit outside that
+    /// outcome subtree.
+    #[serde(default)]
+    pub inventory_root: Option<String>,
     /// A text field whose query causes this surface to mount deferred rows.
     ///
     /// ps-qa writes a temporary query and clears it immediately. The
@@ -326,7 +341,9 @@ mod tests {
             surfaces: vec![SurfaceSpec {
                 name: "dashboard".to_owned(),
                 opener: "Dashboard".to_owned(),
+                via: vec!["Products".to_owned()],
                 marker: Some("Overview heading".to_owned()),
+                inventory_root: Some("#surface-root".to_owned()),
                 reveal_with: Some("Search dashboard".to_owned()),
             }],
             permanent_surfaces: vec!["Dashboard".to_owned()],
@@ -353,6 +370,11 @@ mod tests {
         let text = ron::to_string(&profile).expect("serialises");
         let back: AppProfile = ron::from_str(&text).expect("parses");
         assert_eq!(back.surfaces.len(), 1);
+        assert_eq!(back.surfaces[0].via, ["Products"]);
+        assert_eq!(
+            back.surfaces[0].inventory_root.as_deref(),
+            Some("#surface-root")
+        );
         assert_eq!(back.sections, vec!["Records".to_owned()]);
         assert_eq!(back.transcript_region.as_deref(), Some("Message history"));
         assert_eq!(back.document_openers, vec!["QA document".to_owned()]);

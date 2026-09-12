@@ -488,6 +488,57 @@ pub fn on_surface_subtree(nodes: &[SemanticNode], surface: &Surface) -> Vec<u64>
     best
 }
 
+/// The semantic subtree an inventory assigns to a surface.
+///
+/// Most applications use the same marker-derived subtree for interaction
+/// outcomes and inventory. An application whose global page controls are
+/// siblings of that subtree can name one authored root for inventory without
+/// widening outcome polling to unrelated animation.
+pub fn inventory_surface_subtree(
+    nodes: &[SemanticNode],
+    surface: &Surface,
+) -> Result<Vec<u64>, String> {
+    let Some(selector) = surface.inventory_root.as_deref() else {
+        return Ok(on_surface_subtree(nodes, surface));
+    };
+    let roots: Vec<_> = nodes
+        .iter()
+        .filter(|node| selector_matches_node(node, selector))
+        .collect();
+    let root = match roots.as_slice() {
+        [root] => *root,
+        [] => {
+            return Err(format!(
+                "inventory root {selector:?} was not found on surface {:?}",
+                surface.name
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "inventory root {selector:?} matched {} nodes on surface {:?}",
+                roots.len(),
+                surface.name
+            ));
+        }
+    };
+
+    let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+    for node in nodes {
+        if let Some(parent) = node.parent {
+            children.entry(parent).or_default().push(node.id);
+        }
+    }
+    let mut owned = Vec::new();
+    let mut stack = vec![root.id];
+    while let Some(id) = stack.pop() {
+        owned.push(id);
+        if let Some(descendants) = children.get(&id) {
+            stack.extend(descendants.iter().copied());
+        }
+    }
+    Ok(owned)
+}
+
 /// Whether the application reserves this control for its manual release pass.
 ///
 /// The profile owns the exact prefixes and records why each one is manual. The
@@ -873,7 +924,9 @@ mod tests {
         let surface = Surface {
             name: "settings".into(),
             opener: "Settings".into(),
+            via: vec![],
             marker: Some("Search settings".into()),
+            inventory_root: None,
             reveal_with: None,
         };
         let profile = crate::app::AppProfile {
@@ -975,7 +1028,9 @@ mod tests {
         let surface = Surface {
             name: "deep".to_owned(),
             opener: "Deep".to_owned(),
+            via: vec![],
             marker: Some("Surface marker".to_owned()),
+            inventory_root: None,
             reveal_with: None,
         };
         let scope = on_surface_subtree(&nodes, &surface);
@@ -983,6 +1038,62 @@ mod tests {
         assert!(scope.contains(&18));
         assert!(scope.contains(&19));
         assert!(!scope.contains(&21));
+    }
+
+    #[test]
+    fn authored_inventory_root_does_not_widen_outcome_scope() {
+        let mut document = node(1, "generic", "", Some([0.0, 0.0, 800.0, 600.0]));
+        document.dom_id = Some("document".into());
+        let mut app = node(2, "region", "PathScale", Some([0.0, 0.0, 800.0, 600.0]));
+        app.dom_id = Some("surface-root".into());
+        app.parent = Some(1);
+        let mut main = node(3, "main", "", Some([0.0, 0.0, 800.0, 600.0]));
+        main.parent = Some(2);
+        let mut navigation = node(4, "navigation", "", Some([0.0, 0.0, 800.0, 80.0]));
+        navigation.parent = Some(3);
+        let mut marker = node(5, "button", "Page 1", Some([20.0, 20.0, 40.0, 24.0]));
+        marker.parent = Some(4);
+        let mut hero = node(6, "button", "Get started", Some([20.0, 160.0, 120.0, 40.0]));
+        hero.parent = Some(3);
+        let mut chat = node(7, "button", "Open chat", Some([720.0, 520.0, 48.0, 48.0]));
+        chat.parent = Some(2);
+        let mut foreign = node(8, "button", "Browser control", Some([0.0, 0.0, 20.0, 20.0]));
+        foreign.parent = Some(1);
+        let nodes = [document, app, main, navigation, marker, hero, chat, foreign];
+        let surface = Surface {
+            name: "home".into(),
+            opener: "PathScale".into(),
+            via: vec![],
+            marker: Some("Page 1".into()),
+            inventory_root: Some("#surface-root".into()),
+            reveal_with: None,
+        };
+
+        let outcome = on_surface_subtree(&nodes, &surface);
+        assert!(outcome.contains(&5));
+        assert!(!outcome.contains(&6));
+        assert!(!outcome.contains(&7));
+
+        let inventory = inventory_surface_subtree(&nodes, &surface).unwrap();
+        assert!(inventory.contains(&5));
+        assert!(inventory.contains(&6));
+        assert!(inventory.contains(&7));
+        assert!(!inventory.contains(&8));
+    }
+
+    #[test]
+    fn a_missing_authored_inventory_root_is_an_error() {
+        let surface = Surface {
+            name: "home".into(),
+            opener: "PathScale".into(),
+            via: vec![],
+            marker: Some("Page 1".into()),
+            inventory_root: Some("#missing".into()),
+            reveal_with: None,
+        };
+        let error = inventory_surface_subtree(&[], &surface).unwrap_err();
+        assert!(error.contains("#missing"));
+        assert!(error.contains("home"));
     }
 
     #[test]
