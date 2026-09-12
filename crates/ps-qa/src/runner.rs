@@ -1064,6 +1064,11 @@ async fn run_component(
         .nodes
         .iter()
         .filter(|node| reach::operable(node))
+        // A profile's manual controls are deliberately outside native
+        // automation (for example, links that leave the application). The
+        // site-wide inventory already reports them explicitly; counting them
+        // again as uncovered makes a fully reconciled qa-hosted run fail.
+        .filter(|node| !reach::requires_manual_release_check(&node.name))
         .filter(|node| outcome_check_ids(node, &all_checks).is_empty())
         .collect();
 
