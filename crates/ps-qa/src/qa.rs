@@ -414,6 +414,21 @@ pub struct Check {
     /// measure an option selection without depending on an earlier check.
     #[serde(default)]
     pub prepare_key: Option<String>,
+    /// Deliberate interval between [`prepare`](Self::prepare) and the measured action.
+    ///
+    /// This is for contracts whose subject is an interaction during a known
+    /// intermediate state, such as choosing another carousel page while its
+    /// first transition is active. It is not an outcome timeout and is not a
+    /// substitute for waiting on a rendered precondition.
+    #[serde(default)]
+    pub prepare_wait_ms: u64,
+    /// Rendered target that must arrive after [`prepare`](Self::prepare).
+    ///
+    /// Use this when the preparation starts a state change and the measured
+    /// action must be timed from that state, rather than from delivery of its
+    /// input event.
+    #[serde(default)]
+    pub prepare_until: Option<String>,
     /// Hover this node first, if the control is revealed on hover.
     ///
     /// Either a name, or a name and a count: `hover: Some("Trigger")` enters
@@ -763,6 +778,30 @@ fn validate_check(
             file.display(),
             check.id,
             check.subject
+        ));
+    }
+
+    if check.prepare_wait_ms > 0 && check.prepare.is_none() {
+        return Err(format!(
+            "{}: check {:?} declares prepare_wait_ms without a prepare action",
+            file.display(),
+            check.id
+        ));
+    }
+
+    if check.prepare_wait_ms > 0 && check.prepare_until.is_none() {
+        return Err(format!(
+            "{}: check {:?} declares prepare_wait_ms without a rendered prepare_until marker",
+            file.display(),
+            check.id
+        ));
+    }
+
+    if check.prepare_until.is_some() && check.prepare.is_none() {
+        return Err(format!(
+            "{}: check {:?} declares prepare_until without a prepare action",
+            file.display(),
+            check.id
         ));
     }
 
@@ -1954,6 +1993,30 @@ mod tests {
     }
 
     #[test]
+    fn checks_can_time_an_action_inside_a_prepared_intermediate_state() {
+        let check = parse(
+            "prepare:Some(\"Page 6\"),prepare_until:Some(\"region:Page 6\"),prepare_wait_ms:50,",
+        );
+        assert_eq!(check.prepare_wait_ms, 50);
+        assert_eq!(check.prepare_until.as_deref(), Some("region:Page 6"));
+
+        let invalid = parse("prepare_wait_ms:50,");
+        let error = validate_check(&invalid, Path::new("carousel.ron"), &mut HashMap::new())
+            .expect_err("a preparation interval requires a preparation action");
+        assert!(error.contains("prepare_wait_ms without a prepare action"));
+
+        let invalid = parse("prepare:Some(\"Page 6\"),prepare_wait_ms:50,");
+        let error = validate_check(&invalid, Path::new("carousel.ron"), &mut HashMap::new())
+            .expect_err("a timed preparation requires an observed state");
+        assert!(error.contains("without a rendered prepare_until marker"));
+
+        let invalid = parse("prepare_until:Some(\"Page 6\"),");
+        let error = validate_check(&invalid, Path::new("carousel.ron"), &mut HashMap::new())
+            .expect_err("a preparation target requires a preparation action");
+        assert!(error.contains("prepare_until without a prepare action"));
+    }
+
+    #[test]
     fn checks_can_make_preparation_idempotent() {
         let check = parse("prepare:Some(\"Menu\"),prepare_unless:Some(\"menuitem:First\"),");
         assert_eq!(check.prepare.as_deref(), Some("Menu"));
@@ -2187,6 +2250,8 @@ mod tests {
             prepare_unless: None,
             prepare_press: false,
             prepare_key: None,
+            prepare_wait_ms: 0,
+            prepare_until: None,
             hover: None,
             hover_unless: None,
             after_prepare_hover: None,
