@@ -601,6 +601,20 @@ pub struct SemanticNode {
     pub name: String,
     pub value: Option<String>,
     pub enabled: bool,
+    /// Whether the element participates in keyboard focus or native activation.
+    ///
+    /// Role alone cannot answer this for elements such as sortable column
+    /// headers: a plain `<th>` and `<th tabindex="0">` share a role, while only
+    /// the latter is an operable control.
+    #[serde(default)]
+    pub focusable: bool,
+    /// Whether this box is anchored to the window viewport.
+    ///
+    /// Fixed descendants keep their DOM parent even though layout hoists them
+    /// to the viewport. An external driver needs this bit so it does not clip
+    /// a visible fixed control against a scrolled ancestor's content box.
+    #[serde(default)]
+    pub viewport_fixed: bool,
     pub visible: bool,
     pub selected: bool,
     pub bounds: Option<[f64; 4]>,
@@ -1582,6 +1596,8 @@ mod tests {
             name: "Save settings".into(),
             value: None,
             enabled: true,
+            focusable: true,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([1.0, 2.0, 30.0, 20.0]),

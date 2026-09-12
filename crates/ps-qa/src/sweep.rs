@@ -378,6 +378,8 @@ mod tests {
             name: name.to_owned(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([0.0, 0.0, 10.0, 10.0]),

@@ -189,7 +189,20 @@ pub(crate) async fn scroll_events(
     Ok(latencies)
 }
 
-/// The painted textbox whose semantic name mentions `want` on the active layer.
+/// Whether a semantic role accepts literal text entry.
+///
+/// An editable combobox is still a text field. Restricting this to `textbox`
+/// made `type_into` unable to exercise exactly the input side of ComboBox,
+/// even though the protocol's SetValue action already supports its underlying
+/// input element.
+fn is_text_field_role(role: &str) -> bool {
+    matches!(
+        role,
+        "textbox" | "textarea" | "input" | "combobox" | "searchbox" | "spinbutton"
+    )
+}
+
+/// The painted text-entry control whose semantic name mentions `want` on the active layer.
 fn find_text_field<'a>(nodes: &'a [SemanticNode], want: &str) -> Option<&'a SemanticNode> {
     let modal_scope: HashSet<u64> = reach::dismissers(nodes)
         .first()
@@ -207,7 +220,7 @@ fn find_text_field<'a>(nodes: &'a [SemanticNode], want: &str) -> Option<&'a Sema
     let fields: Vec<&SemanticNode> = nodes
         .iter()
         .filter(|node| {
-            matches!(node.role.as_str(), "textbox" | "textarea" | "input")
+            is_text_field_role(node.role.as_str())
                 && node.enabled
                 && node
                     .bounds
@@ -225,6 +238,28 @@ fn find_text_field<'a>(nodes: &'a [SemanticNode], want: &str) -> Option<&'a Sema
         }
     }
     fields.into_iter().find(matches_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_text_field_role;
+
+    #[test]
+    fn editable_aria_roles_are_literal_text_targets() {
+        for role in [
+            "textbox",
+            "textarea",
+            "input",
+            "combobox",
+            "searchbox",
+            "spinbutton",
+        ] {
+            assert!(is_text_field_role(role), "{role}");
+        }
+        for role in ["button", "listbox", "option", "slider"] {
+            assert!(!is_text_field_role(role), "{role}");
+        }
+    }
 }
 
 /// Drive real key events into a focused text field and price them.

@@ -32,14 +32,14 @@
 use blitz_dom::Document as _;
 use blitz_script::ScriptDocument;
 use blitz_traits::events::{
-    BlitzImeEvent, BlitzWheelDelta, BlitzWheelEvent, MouseEventButton, MouseEventButtons, Point,
-    UiEvent,
+    BlitzImeEvent, BlitzInputEvent, BlitzWheelDelta, BlitzWheelEvent, DomEvent, DomEventData,
+    MouseEventButton, MouseEventButtons, Point, UiEvent,
 };
 use keyboard_types::{Code, Key};
 
 use crate::document::{
-    activate_agent_node, control_error, debug_error, hover_agent_node, inspect_document, key_event,
-    keyboard_modifiers, resolve_agent_node,
+    activate_agent_node, control_error, debug_error, element_attr, hover_agent_node,
+    inspect_document, key_event, keyboard_modifiers, resolve_agent_node,
 };
 use crate::{
     AgentAction, AgentControlRequest, DebugError, DebugResponse, InputCommand, KeyPhase,
@@ -346,7 +346,32 @@ pub(crate) fn set_node_value(
         .and_then(|element| element.text_input_data())
         .map(|input| input.editor.text().to_string());
     let Some(current) = current else {
-        return Err(debug_error("notEditable", "node is not a text input"));
+        let is_value_input = document
+            .inner()
+            .get_node(node_id)
+            .and_then(|node| node.element_data())
+            .is_some_and(|element| {
+                element.name.local.as_ref() == "input"
+                    && matches!(
+                        element_attr(element, "type").unwrap_or("text"),
+                        "date" | "datetime-local" | "month" | "time" | "week" | "color"
+                    )
+            });
+        if !is_value_input {
+            return Err(debug_error("notEditable", "node is not a text input"));
+        }
+
+        document.inner_mut().set_focus_to(node_id);
+        document.inner_mut().mutate().set_attribute(
+            node_id,
+            blitz_dom::qual_name!("value"),
+            &value,
+        );
+        document.dispatch_dom_event(DomEvent::new(
+            node_id,
+            DomEventData::Input(BlitzInputEvent { value }),
+        ));
+        return Ok(());
     };
     document.inner_mut().set_focus_to(node_id);
     if let Some(len) = std::num::NonZeroUsize::new(current.len()) {
@@ -390,11 +415,16 @@ mod tests {
                </style>
                <button id="press">Press me</button>
                <input id="field" value="before">
+               <input id="date" type="date" value="2025-01-01">
                <div id="scroller"><div id="tall">tall</div></div>
                <output id="log"></output>
+               <output id="date-log"></output>
                <script>
                  document.getElementById('press').addEventListener('click', () => {
                    document.getElementById('log').textContent = 'pressed';
+                 });
+                 document.getElementById('date').addEventListener('input', event => {
+                   document.getElementById('date-log').textContent = event.target.value;
                  });
                </script>"#,
             DocumentConfig::default(),
@@ -512,6 +542,36 @@ mod tests {
             value, "after",
             "the old contents were appended to rather than replaced"
         );
+    }
+
+    /// Date and time controls expose values to accessibility clients even
+    /// though Blitz does not give them a text editor. They still need the same
+    /// observable SetValue contract as a text box: update the DOM value and
+    /// deliver an input event to the application.
+    #[test]
+    fn setting_a_date_value_updates_the_dom_and_dispatches_input() {
+        let mut document = document();
+        let mut control = DocumentControl::new();
+        let date = node(&mut control, &mut document, "date");
+
+        assert_eq!(
+            control.agent(
+                &mut document,
+                AgentControlRequest::Act(AgentAction::SetValue {
+                    node_id: date,
+                    value: "2025-06-24".into(),
+                }),
+            ),
+            DebugResponse::Ack
+        );
+
+        let value = document
+            .inner()
+            .get_node(blitz_dom::NodeId::from_u64(date))
+            .and_then(|node| node.element_data())
+            .and_then(|element| element_attr(element, "value").map(str::to_owned));
+        assert_eq!(value.as_deref(), Some("2025-06-24"));
+        assert_eq!(text(&document, "#date-log"), "2025-06-24");
     }
 
     /// Focus is a state change the protocol reports back, so this asserts the
