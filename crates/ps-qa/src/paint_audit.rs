@@ -390,6 +390,8 @@ mod tests {
             name: "Task manager prompt".into(),
             value: None,
             enabled: false,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([0.0, 0.0, 200.0, 24.0]),

@@ -334,6 +334,8 @@ pub fn snapshot_document(
                 value,
                 enabled: element_attr(element, "disabled").is_none()
                     && element_attr(element, "aria-disabled") != Some("true"),
+                focusable: focuses_on_click(element),
+                viewport_fixed: viewport_fixed_descendant(&inner, id, layout_node_limit),
                 visible,
                 selected: semantic_selected(element, &inner, id),
                 bounds: rect.and_then(|rect| {
@@ -1205,6 +1207,38 @@ pub(crate) fn layout_chain_is_valid(
     false
 }
 
+/// Whether layout places this node inside a fixed box anchored to the window.
+///
+/// Fixed boxes retain their DOM ancestry, but Blitz reparents their layout box
+/// to the root element. Following layout parents therefore covers every child
+/// in the fixed surface and still excludes CSS fixed boxes whose transformed
+/// ancestor makes them locally positioned.
+pub(crate) fn viewport_fixed_descendant(
+    document: &blitz_dom::BaseDocument,
+    node_id: blitz_dom::NodeId,
+    node_limit: usize,
+) -> bool {
+    use style::properties::generated::longhands::position::computed_value::T as Position;
+
+    let root_element = document.root_element().id;
+    let mut current = Some(node_id);
+    for _ in 0..=node_limit {
+        let Some(id) = current else { return false };
+        let Some(node) = document.get_node(id) else {
+            return false;
+        };
+        if node
+            .primary_styles()
+            .is_some_and(|styles| styles.clone_position() == Position::Fixed)
+            && node.layout_parent.get() == Some(root_element)
+        {
+            return true;
+        }
+        current = node.layout_parent.get();
+    }
+    false
+}
+
 /// Activate the node the caller selected, without asking hit-testing to select
 /// it a second time from a screen coordinate.
 ///
@@ -1404,6 +1438,8 @@ pub fn inspect_document(
                     name: text,
                     value: None,
                     enabled: true,
+                    focusable: false,
+                    viewport_fixed: false,
                     visible: candidate.visible,
                     selected: false,
                     bounds,
@@ -1426,6 +1462,8 @@ pub fn inspect_document(
                 value,
                 enabled: element_attr(element, "disabled").is_none()
                     && element_attr(element, "aria-disabled") != Some("true"),
+                focusable: focuses_on_click(element),
+                viewport_fixed: viewport_fixed_descendant(&inner, id, node_limit),
                 visible,
                 selected: semantic_selected(element, &inner, id),
                 bounds,
@@ -2318,6 +2356,27 @@ mod semantic_tests {
              {:?}",
             names(&nodes, "text")
         );
+    }
+
+    #[test]
+    fn fixed_boxes_are_identified_as_viewport_anchored() {
+        let nodes = tree(
+            "<main style='height:1600px'><button id='flow'>Flow</button>\
+             <section style='position:fixed;top:16px;left:16px'>\
+               <button id='fixed'>Fixed</button>\
+             </section></main>",
+        );
+        let flow = nodes
+            .iter()
+            .find(|node| node.dom_id.as_deref() == Some("flow"))
+            .expect("flow button is inspected");
+        let fixed = nodes
+            .iter()
+            .find(|node| node.dom_id.as_deref() == Some("fixed"))
+            .expect("fixed button is inspected");
+
+        assert!(!flow.viewport_fixed);
+        assert!(fixed.viewport_fixed);
     }
 
     #[test]
@@ -3577,6 +3636,8 @@ mod runtime_tests {
                 name: "Scrollable region".into(),
                 value: None,
                 enabled: true,
+                focusable: false,
+                viewport_fixed: false,
                 visible: true,
                 selected: false,
                 bounds: Some([0.0, 0.0, 100.0, 100.0]),
@@ -3611,6 +3672,8 @@ mod runtime_tests {
                 name: "Readable".into(),
                 value: None,
                 enabled: true,
+                focusable: false,
+                viewport_fixed: false,
                 visible: true,
                 selected: false,
                 bounds: Some([0.0, 0.0, 100.0, 24.0]),

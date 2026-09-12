@@ -339,6 +339,8 @@ pub enum Expect {
     /// than inventing a string value. This follows the activated node id, so a
     /// neighbouring swatch cannot satisfy the verdict.
     SelectionChanges,
+    /// Focus moved to the exact semantic node named by the subject.
+    FocusMoves,
     /// The exact subject node's accessible name changed after the action.
     ///
     /// Use this for status text that reports a completed refresh or re-check.
@@ -826,7 +828,7 @@ fn validate_check(
      */
     if matches!(
         check.expect,
-        Expect::ValueChanges | Expect::NameChanges | Expect::SelectionChanges
+        Expect::ValueChanges | Expect::NameChanges | Expect::SelectionChanges | Expect::FocusMoves
     ) && check.setup_type_into.as_deref() == Some(check.subject.as_str())
         && check.click.is_none()
         && check.text.is_none()
@@ -887,7 +889,7 @@ fn validate_check(
     Ok(())
 }
 
-fn matching<'a>(nodes: &'a [SemanticNode], want: &str) -> Vec<&'a SemanticNode> {
+pub(crate) fn matching<'a>(nodes: &'a [SemanticNode], want: &str) -> Vec<&'a SemanticNode> {
     nodes
         .iter()
         .filter(|node| selector_matches_node(node, want))
@@ -898,7 +900,7 @@ fn matching<'a>(nodes: &'a [SemanticNode], want: &str) -> Vec<&'a SemanticNode> 
 ///
 /// A zero-area box is the failure this exists to catch: present in the tree,
 /// absent from the window.
-fn paints(node: &SemanticNode) -> bool {
+pub(crate) fn paints(node: &SemanticNode) -> bool {
     /*
      * Geometry alone, because `visible` and the renderer disagree.
      *
@@ -1542,6 +1544,11 @@ pub fn verdict(
                 })?;
             selection_changed(before_node.id, before, after)?;
         }
+        Expect::FocusMoves => {
+            return Err(
+                "FocusMoves is evaluated by the live runner with snapshot focus state".to_owned(),
+            );
+        }
         Expect::NameChanges => {
             let before_node = matching(before, &check.subject)
                 .into_iter()
@@ -1776,6 +1783,8 @@ mod tests {
             name: name.into(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([0.0, 0.0, width, height]),
@@ -2298,6 +2307,8 @@ mod tests {
             name: "Output level".into(),
             value: Some(value.into()),
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([0.0, 0.0, 100.0, 20.0]),
@@ -2331,6 +2342,8 @@ mod tests {
             name: name.into(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([0.0, 0.0, 100.0, 24.0]),
@@ -2372,6 +2385,8 @@ mod tests {
             name: "Theme colour".into(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([0.0, 0.0, 20.0, 20.0]),
@@ -2407,6 +2422,8 @@ mod tests {
             name: name.into(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([0.0, 0.0, 100.0, 20.0]),
@@ -2439,6 +2456,8 @@ mod tests {
             name: "Rename project".into(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: bounds.is_some(),
             selected: false,
             bounds,
@@ -2466,6 +2485,8 @@ mod tests {
             name: "Rename project".into(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([10.0, 10.0, 100.0, 20.0]),
@@ -2497,6 +2518,8 @@ mod tests {
             name: "Drawer outcome".into(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([-384.0, 40.0, 336.0, 24.0]),
@@ -2526,6 +2549,8 @@ mod tests {
             name: format!("Theme color {id}"),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([x, y, 20.0, 20.0]),
@@ -2551,6 +2576,8 @@ mod tests {
             name: format!("Theme color {id}"),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([x, y, 20.0, 20.0]),
@@ -2564,6 +2591,8 @@ mod tests {
             name: "Surface colour".into(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([10.0, 10.0, 190.0, 190.0]),
@@ -2604,6 +2633,8 @@ mod tests {
             name: String::new(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some(bounds),
@@ -2633,6 +2664,8 @@ mod tests {
             name: "Save".into(),
             value: None,
             enabled,
+            focusable: true,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds,
@@ -2667,6 +2700,8 @@ mod tests {
             name: "Continue".into(),
             value: None,
             enabled,
+            focusable: true,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds,
@@ -2752,6 +2787,8 @@ mod tests {
             name: "Send".into(),
             value: None,
             enabled: false,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([0.0, 0.0, 20.0, 20.0]),

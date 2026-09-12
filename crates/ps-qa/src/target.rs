@@ -131,6 +131,15 @@ pub(crate) fn viewport_of_nodes(nodes: &[SemanticNode]) -> (f64, f64) {
 /// scroll coordinates as window-visible sends pointer events behind the tab
 /// strip instead of revealing the row inside its panel.
 pub(crate) fn viewport_for_node(snapshot: &AgentSnapshot, node_id: u64) -> (f64, f64) {
+    if snapshot
+        .nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .is_some_and(|node| node.viewport_fixed)
+        && let Some(bounds) = snapshot.viewport
+    {
+        return (bounds[1], bounds[1] + bounds[3]);
+    }
     let inferred = viewport_for_node_in(&snapshot.nodes, node_id);
     if let Some(bounds) = snapshot.viewport {
         let window = (bounds[1], bounds[1] + bounds[3]);
@@ -550,6 +559,8 @@ mod tests {
             name: name.into(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([0.0, 0.0, 20.0, 20.0]),

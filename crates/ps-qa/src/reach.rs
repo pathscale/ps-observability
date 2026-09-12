@@ -192,6 +192,7 @@ pub fn reveal_chain(nodes: &[SemanticNode], target: u64) -> Vec<u64> {
 /// omitting those would make a component audit silently button-only.
 pub fn interactive(node: &SemanticNode) -> bool {
     (node.role == "option" && node.visible)
+        || (node.focusable && matches!(node.role.as_str(), "columnheader" | "rowheader"))
         || matches!(
             node.role.as_str(),
             "button"
@@ -203,12 +204,19 @@ pub fn interactive(node: &SemanticNode) -> bool {
                 | "menuitemradio"
                 | "radio"
                 | "slider"
+                | "searchbox"
                 | "spinbutton"
                 | "switch"
                 | "tab"
+                | "textarea"
                 | "textbox"
                 | "treeitem"
         )
+}
+
+/// Whether a component control can actually be operated in the captured frame.
+pub fn operable(node: &SemanticNode) -> bool {
+    interactive(node) && node.enabled && onscreen(node)
 }
 
 /// Whether pressing this leaves the surface, invalidating the rest of the plan.
@@ -838,6 +846,8 @@ mod tests {
             name: name.to_owned(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds,
@@ -978,8 +988,19 @@ mod tests {
     #[test]
     fn component_inventory_is_not_button_only() {
         for role in [
-            "button", "checkbox", "combobox", "link", "menuitem", "radio", "slider", "switch",
-            "tab", "textbox", "treeitem",
+            "button",
+            "checkbox",
+            "combobox",
+            "link",
+            "menuitem",
+            "radio",
+            "searchbox",
+            "slider",
+            "switch",
+            "tab",
+            "textarea",
+            "textbox",
+            "treeitem",
         ] {
             assert!(interactive(&node(
                 1,
@@ -1005,6 +1026,22 @@ mod tests {
         let mut hidden_option = node(4, "option", "Retained choice", Some([0.0, 0.0, 20.0, 20.0]));
         hidden_option.visible = false;
         assert!(!interactive(&hidden_option));
+
+        let mut sortable_header = node(5, "columnheader", "Name", Some([0.0, 0.0, 80.0, 20.0]));
+        assert!(!interactive(&sortable_header));
+        sortable_header.focusable = true;
+        assert!(interactive(&sortable_header));
+    }
+
+    #[test]
+    fn component_coverage_requires_a_control_to_be_operable_now() {
+        let mut control = node(1, "button", "Action", Some([0.0, 0.0, 80.0, 20.0]));
+        assert!(operable(&control));
+        control.enabled = false;
+        assert!(!operable(&control));
+        control.enabled = true;
+        control.visible = false;
+        assert!(!operable(&control));
     }
 
     #[test]

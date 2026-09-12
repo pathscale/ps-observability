@@ -1053,7 +1053,29 @@ async fn run_component(
     let descriptor = inspector::discover(descriptor_path.to_str())?;
     let mut client = Client::connect(&descriptor.socket_path()).await?;
     client.initialize().await?;
-    run_qa(&mut client, selector, checks_dir).await
+    let baseline = inspect(&mut client).await?.0;
+    let all_checks = qa::checks(checks_dir).map_err(eyre::Report::msg)?;
+    // Baseline controls belong to the application, not to whichever group the
+    // caller chose to execute this time. A Home link may be exercised by the
+    // navigation group while the input group is the current run; restricting
+    // attribution to the selected group made every isolated group fail on the
+    // same shared header even though the full manifest covered it.
+    let uncovered: Vec<&SemanticNode> = baseline
+        .nodes
+        .iter()
+        .filter(|node| reach::operable(node))
+        .filter(|node| outcome_check_ids(node, &all_checks).is_empty())
+        .collect();
+
+    for node in &uncovered {
+        eprintln!(
+            "uncovered component control: id={} role={} name={:?} visible={} enabled={}",
+            node.id, node.role, node.name, node.visible, node.enabled
+        );
+    }
+
+    let failed = run_qa(&mut client, selector, checks_dir).await?;
+    Ok(failed + uncovered.len())
 }
 
 /// The order a run executes in: the order the files declare.
@@ -2096,6 +2118,7 @@ async fn run_qa(
                 client,
                 check,
                 &before.nodes,
+                before.focused_node,
                 action_target.as_deref(),
                 action_node_id,
                 action_paint_armed,
@@ -2136,6 +2159,8 @@ async fn run_qa(
                     &after.nodes,
                     action_target.as_deref(),
                     action_node_id,
+                    before.focused_node,
+                    after.focused_node,
                 )
                 .map_err(|outcome| format!("{error}; rendered outcome also failed: {outcome}")),
                 Some(error) => Err(error),
@@ -2145,6 +2170,8 @@ async fn run_qa(
                     &after.nodes,
                     action_target.as_deref(),
                     action_node_id,
+                    before.focused_node,
+                    after.focused_node,
                 ),
             }
         };
@@ -2267,6 +2294,8 @@ fn outcome_verdict(
     after: &[SemanticNode],
     action_target: Option<&str>,
     action_node_id: Option<u64>,
+    before_focused: Option<u64>,
+    after_focused: Option<u64>,
 ) -> std::result::Result<(), String> {
     if check.expect == qa::Expect::TargetPaints {
         let Some(subject) = action_target else {
@@ -2286,6 +2315,21 @@ fn outcome_verdict(
         && let Some(node_id) = action_node_id
     {
         qa::selection_changed(node_id, before, after)
+    } else if check.expect == qa::Expect::FocusMoves {
+        let destination = qa::matching(after, &check.subject)
+            .into_iter()
+            .find(|node| qa::paints(node))
+            .ok_or_else(|| format!("no painted focus destination matching {:?}", check.subject))?;
+        if after_focused != Some(destination.id) {
+            return Err(format!(
+                "focus ended on {:?}, expected {} for {:?}",
+                after_focused, destination.id, check.subject
+            ));
+        }
+        if before_focused == after_focused {
+            return Err(format!("focus did not move from {:?}", before_focused));
+        }
+        Ok(())
     } else {
         qa::verdict(check, before, after)
     }
@@ -2489,6 +2533,7 @@ async fn settle_for_outcome(
     client: &mut Client,
     check: &qa::Check,
     before: &[SemanticNode],
+    before_focused: Option<u64>,
     action_target: Option<&str>,
     action_node_id: Option<u64>,
     already_armed: bool,
@@ -2527,8 +2572,16 @@ async fn settle_for_outcome(
         };
         iterations += 1;
         let now = tokio::time::Instant::now();
-        let mut passing =
-            outcome_verdict(check, before, &after.nodes, action_target, action_node_id).is_ok();
+        let mut passing = outcome_verdict(
+            check,
+            before,
+            &after.nodes,
+            action_target,
+            action_node_id,
+            before_focused,
+            after.focused_node,
+        )
+        .is_ok();
         let due_for_full_probe =
             last_full_probe.is_none_or(|at| now.duration_since(at) >= FULL_DOCUMENT_PROBE_INTERVAL);
         if !passing && scope.is_some() && due_for_full_probe {
@@ -2544,8 +2597,16 @@ async fn settle_for_outcome(
             // what keeps this from serialising the document every turn.
             after = inspect(client).await?.0;
             last_full_probe = Some(now);
-            passing =
-                outcome_verdict(check, before, &after.nodes, action_target, action_node_id).is_ok();
+            passing = outcome_verdict(
+                check,
+                before,
+                &after.nodes,
+                action_target,
+                action_node_id,
+                before_focused,
+                after.focused_node,
+            )
+            .is_ok();
             scope = if passing {
                 // Navigation can replace the active pane. Adopt that new
                 // subtree when it owns the declared subject; a portal-owned
@@ -3948,6 +4009,7 @@ fn outcome_check_ids(node: &SemanticNode, checks: &[qa::Check]) -> Vec<String> {
                 check.hover.as_ref().map(qa::Hover::target),
                 check.after_prepare_hover.as_ref().map(qa::Hover::target),
                 check.click.as_deref(),
+                check.setup_type_into.as_deref(),
                 check.type_into.as_deref(),
                 check.key_on.as_deref(),
                 check.scroll_over.as_deref(),
@@ -3959,10 +4021,12 @@ fn outcome_check_ids(node: &SemanticNode, checks: &[qa::Check]) -> Vec<String> {
                 .covers
                 .iter()
                 .any(|selector| selector_matches_node(node, selector));
+            let focus_destination = check.expect == qa::Expect::FocusMoves
+                && exact_selector_matches_node(node, &check.subject);
             let disabled_outcome = !node.enabled
                 && matches!(check.expect, qa::Expect::Disabled)
                 && coverage_action_matches_node(node, &check.subject);
-            driven || family || disabled_outcome
+            driven || family || focus_destination || disabled_outcome
         })
         .map(|check| check.id.clone())
         .collect()
@@ -4017,6 +4081,8 @@ fn saved_control_node(control: &SavedControl) -> SemanticNode {
         name: control.name.clone(),
         value: None,
         enabled: !control.classification.contains("disabled"),
+        focusable: false,
+        viewport_fixed: false,
         visible: !control.classification.contains("unreachable"),
         selected: false,
         bounds: Some([0.0, 0.0, 1.0, 1.0]),
@@ -6010,7 +6076,9 @@ mod tests {
     use crate::app::{AppProfile, SurfaceSpec};
     use crate::interaction::parse_key_chord;
     use crate::qa::{Check, Expect};
-    use crate::target::{exact_selector_matches_node, retain_exact_candidates, viewport_for_node};
+    use crate::target::{
+        exact_selector_matches_node, offscreen, retain_exact_candidates, viewport_for_node,
+    };
     use blitz_control_protocol::{AgentSnapshot, CapturedImage, SemanticNode, WindowComposition};
     use std::collections::HashSet;
     use std::time::Duration;
@@ -6099,6 +6167,8 @@ mod tests {
             name: name.into(),
             value: None,
             enabled,
+            focusable: true,
+            viewport_fixed: false,
             visible,
             selected: false,
             bounds: Some([0.0, 0.0, 20.0, 20.0]),
@@ -6161,6 +6231,37 @@ mod tests {
             ..AgentSnapshot::default()
         };
         assert_eq!(viewport_for_node(&snapshot, 22), (64.0, 960.0));
+    }
+
+    #[test]
+    fn fixed_content_uses_the_window_viewport_after_its_dom_parent_scrolls() {
+        let mut root = component("", true, true);
+        root.id = 30;
+        root.role = "generic".into();
+        root.bounds = Some([0.0, -11000.0, 1344.0, 12000.0]);
+
+        let mut main = component("", true, true);
+        main.id = 31;
+        main.parent = Some(root.id);
+        main.role = "main".into();
+        main.bounds = Some([0.0, -10942.0, 1344.0, 11942.0]);
+
+        let mut fixed = component("Return to coverage", true, true);
+        fixed.id = 32;
+        fixed.parent = Some(main.id);
+        fixed.viewport_fixed = true;
+        fixed.bounds = Some([16.0, 16.0, 180.0, 40.0]);
+
+        let snapshot = AgentSnapshot {
+            nodes: vec![root, main, fixed],
+            viewport: Some([0.0, 0.0, 1344.0, 960.0]),
+            ..AgentSnapshot::default()
+        };
+        assert_eq!(viewport_for_node(&snapshot, 32), (0.0, 960.0));
+        assert!(!offscreen(
+            snapshot.nodes[2].bounds.expect("fixed bounds"),
+            viewport_for_node(&snapshot, 32)
+        ));
     }
 
     #[test]
@@ -6667,6 +6768,8 @@ mod tests {
             name: "Saved".into(),
             value: None,
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([0.0, 0.0, 90.0, 24.0]),
@@ -6707,9 +6810,10 @@ mod tests {
             );
 
             let settled = std::time::Instant::now();
-            let (_, error, _) = settle_for_outcome(&mut client, &check, &[], None, None, true)
-                .await
-                .expect("the outcome is judged from the tree");
+            let (_, error, _) =
+                settle_for_outcome(&mut client, &check, &[], None, None, None, true)
+                    .await
+                    .expect("the outcome is judged from the tree");
             assert!(error.is_none(), "{error:?}");
             assert!(
                 settled.elapsed() < budget / 2,
@@ -6739,6 +6843,8 @@ mod tests {
             name: "Filter".into(),
             value: Some(value.into()),
             enabled: true,
+            focusable: false,
+            viewport_fixed: false,
             visible: true,
             selected: false,
             bounds: Some([0.0, 0.0, 240.0, 28.0]),
@@ -7198,7 +7304,7 @@ mod tests {
         check.expect = Expect::NameChanges;
         let before = component("Refresh generation 1", true, true);
         let after = before.clone();
-        assert!(outcome_verdict(&check, &[before], &[after], None, None).is_err());
+        assert!(outcome_verdict(&check, &[before], &[after], None, None, None, None).is_err());
     }
 
     #[test]
@@ -7207,7 +7313,55 @@ mod tests {
         check.expect = Expect::NameChanges;
         let before = component("Refresh generation 1", true, true);
         let after = component("Refresh generation 2", true, true);
-        assert!(outcome_verdict(&check, &[before], &[after], None, None).is_ok());
+        assert!(outcome_verdict(&check, &[before], &[after], None, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn focus_outcome_requires_the_named_destination_and_a_real_move() {
+        let mut check = check("toolbar-next", None, "button:Second tool");
+        check.expect = Expect::FocusMoves;
+        let mut first = component("First tool", true, true);
+        first.role = "button".into();
+        let mut second = component("Second tool", true, true);
+        second.id = 2;
+        second.role = "button".into();
+
+        assert!(
+            outcome_verdict(
+                &check,
+                &[first.clone(), second.clone()],
+                &[first.clone(), second.clone()],
+                None,
+                None,
+                Some(first.id),
+                Some(second.id),
+            )
+            .is_ok()
+        );
+        assert!(
+            outcome_verdict(
+                &check,
+                &[first.clone(), second.clone()],
+                &[first.clone(), second.clone()],
+                None,
+                None,
+                Some(first.id),
+                Some(first.id),
+            )
+            .is_err()
+        );
+        assert!(
+            outcome_verdict(
+                &check,
+                &[first, second.clone()],
+                &[second.clone()],
+                None,
+                None,
+                Some(second.id),
+                Some(second.id),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7230,6 +7384,8 @@ mod tests {
                 &[reset, after_slider],
                 Some("Reset to default"),
                 Some(1),
+                None,
+                None,
             )
             .is_ok()
         );
