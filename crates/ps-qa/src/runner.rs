@@ -3337,8 +3337,20 @@ async fn run_sweep(client: &mut Client, family: Option<&str>) -> Result<usize> {
     }
     println!("clicking {} buttons\n", planned.len());
 
+    let mut occurrences = HashMap::<String, usize>::new();
+    let planned: Vec<(sweep::Case, usize)> = planned
+        .into_iter()
+        .map(|case| {
+            let key = case.name.to_lowercase();
+            let occurrence = occurrences.entry(key).or_insert(0);
+            let planned_occurrence = *occurrence;
+            *occurrence += 1;
+            (case, planned_occurrence)
+        })
+        .collect();
+
     let mut outcomes: Vec<sweep::Outcome> = Vec::new();
-    for case in planned {
+    for (case, occurrence) in planned {
         let (before, _) = inspect(client).await?;
 
         /*
@@ -3354,37 +3366,39 @@ async fn run_sweep(client: &mut Client, family: Option<&str>) -> Result<usize> {
          * from the plan, because a working button re-renders its own row and a
          * stale id is a click on nothing.
          */
-        let Some(node) = before.nodes.iter().find(|node| node.id == case.id) else {
+        let Some(node) = sweep::resolve_case(&case, occurrence, &before.nodes) else {
             // Gone since the plan was made, which a working button often
             // causes: closing one tab removes the close buttons of its
             // neighbours. Not a failure.
             continue;
         };
-        if !node.visible || !node.enabled {
-            continue;
-        }
+        let node_id = node.id;
+        let node_bounds = node.bounds;
         /*
          * Off the viewport is not clickable, and clicking it anyway tests the
          * harness rather than the application. A transcript keeps hundreds of
          * controls at negative coordinates and the panel's lower sections sit
          * below the fold; both reported as failures until they were skipped.
          */
-        if node
-            .bounds
+        if node_bounds
             .is_some_and(|b| b[1] + b[3] < viewport.0 || b[0] + b[2] < 0.0 || b[1] > viewport.1)
         {
             continue;
         }
 
-        if let Err(error) = click_by_id(client, case.id).await {
+        if let Err(error) = click_by_id(client, node_id).await {
             outcomes.push(sweep::Outcome {
                 case,
                 failure: Some(format!("could not be clicked: {error}")),
             });
             continue;
         }
-        let after = settle_sweep_case(client, &case, &before.nodes).await?;
-        let failure = sweep::judge(&case, &before.nodes, &after.nodes);
+        let active_case = sweep::Case {
+            id: node_id,
+            ..case.clone()
+        };
+        let after = settle_sweep_case(client, &active_case, &before.nodes).await?;
+        let failure = sweep::judge(&active_case, &before.nodes, &after.nodes);
         outcomes.push(sweep::Outcome { case, failure });
     }
 

@@ -137,6 +137,29 @@ pub fn cases(
         .collect()
 }
 
+/// Find the same planned control in a fresh semantic tree.
+///
+/// Node ids are renderer-owned and may be recycled when an earlier click
+/// rerenders the page. An id match is therefore only valid while the role and
+/// accessible name still match. If the control was remounted, fall back to its
+/// occurrence among controls with the same name.
+pub fn resolve_case<'a>(
+    case: &Case,
+    occurrence: usize,
+    nodes: &'a [SemanticNode],
+) -> Option<&'a SemanticNode> {
+    if let Some(node) = nodes.iter().find(|node| {
+        node.id == case.id && node.name == case.name && painted_button(node) && node.enabled
+    }) {
+        return Some(node);
+    }
+
+    nodes
+        .iter()
+        .filter(|node| node.name == case.name && painted_button(node) && node.enabled)
+        .nth(occurrence)
+}
+
 /// Whether a button of this name exists in the tree.
 pub fn has_button(nodes: &[SemanticNode], name: &str) -> bool {
     let wanted = name.to_lowercase();
@@ -360,6 +383,44 @@ mod tests {
             bounds: Some([0.0, 0.0, 10.0, 10.0]),
             slot: None,
         }
+    }
+
+    #[test]
+    fn a_recycled_id_cannot_redirect_a_sweep_click() {
+        let mut planned = button("Dismiss coverage notice");
+        planned.id = 7;
+        let case = Case {
+            id: planned.id,
+            name: planned.name.clone(),
+            family: "other",
+            expect: Expectation::Changes,
+        };
+
+        let mut recycled = button("Another action");
+        recycled.id = 7;
+        let mut remounted = planned;
+        remounted.id = 12;
+
+        assert_eq!(
+            resolve_case(&case, 0, &[recycled, remounted]).unwrap().id,
+            12
+        );
+    }
+
+    #[test]
+    fn a_remounted_duplicate_keeps_its_planned_occurrence() {
+        let case = Case {
+            id: 99,
+            name: "Open row".to_owned(),
+            family: "other",
+            expect: Expectation::Changes,
+        };
+        let mut first = button("Open row");
+        first.id = 10;
+        let mut second = button("Open row");
+        second.id = 11;
+
+        assert_eq!(resolve_case(&case, 1, &[first, second]).unwrap().id, 11);
     }
 
     #[test]
