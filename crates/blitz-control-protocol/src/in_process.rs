@@ -110,9 +110,9 @@ impl DocumentControl {
     /// Answer one agent-control request.
     ///
     /// `Inspect` reads the tree. `Act` performs the action, settles the
-    /// synchronous script work it caused, and acknowledges. `Relaunch` and
-    /// `Quit` are refused here on purpose: they are about the process, not the
-    /// document, and only the embedder that started it can honour them.
+    /// synchronous script work it caused, and acknowledges. `Navigate`,
+    /// `Relaunch` and `Quit` are refused here on purpose: they need a loader
+    /// or a process, and only the embedder that started it can honour them.
     pub fn agent(
         &mut self,
         document: &mut ScriptDocument,
@@ -133,9 +133,11 @@ impl DocumentControl {
                 },
                 Err(error) => DebugResponse::Error(error),
             },
-            AgentControlRequest::Relaunch | AgentControlRequest::Quit => control_error(
+            AgentControlRequest::Navigate { .. }
+            | AgentControlRequest::Relaunch
+            | AgentControlRequest::Quit => control_error(
                 "unsupportedRequest",
-                "the process lifecycle belongs to the embedder, not to the document",
+                "navigation and process lifecycle belong to the embedder, not to the document",
             ),
         }
     }
@@ -619,9 +621,15 @@ mod tests {
     fn the_process_lifecycle_is_refused_rather_than_acknowledged() {
         let mut document = document();
         let mut control = DocumentControl::new();
-        for request in [AgentControlRequest::Relaunch, AgentControlRequest::Quit] {
+        for request in [
+            AgentControlRequest::Navigate {
+                url: "https://example.com/".into(),
+            },
+            AgentControlRequest::Relaunch,
+            AgentControlRequest::Quit,
+        ] {
             let DebugResponse::Error(error) = control.agent(&mut document, request) else {
-                panic!("a document cannot restart its own process")
+                panic!("a document cannot restart its own process or fetch a URL")
             };
             assert_eq!(error.code, "unsupportedRequest");
         }

@@ -141,8 +141,19 @@ pub enum IncomingRequest {
 #[serde(tag = "command", content = "params", rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum AgentControlRequest {
-    Inspect { root: Option<u64>, max_depth: u32 },
+    Inspect {
+        root: Option<u64>,
+        max_depth: u32,
+    },
     Act(AgentAction),
+    /// Load a URL in the standing document.
+    ///
+    /// Relative values resolve against the page that is up. The host that
+    /// owns the loader answers this; a document core cannot, any more than it
+    /// can relaunch the process.
+    Navigate {
+        url: String,
+    },
     Relaunch,
     Quit,
 }
@@ -1331,7 +1342,13 @@ mod tests {
             );
         }
 
-        for request in [AgentControlRequest::Relaunch, AgentControlRequest::Quit] {
+        for request in [
+            AgentControlRequest::Navigate {
+                url: "/second.html".into(),
+            },
+            AgentControlRequest::Relaunch,
+            AgentControlRequest::Quit,
+        ] {
             let id = JsonRpcId::Number(9);
             assert_eq!(
                 decode_agent_request(encode_agent_request(id.clone(), &request).unwrap()).unwrap(),
