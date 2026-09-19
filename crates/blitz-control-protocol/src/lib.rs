@@ -67,6 +67,11 @@
 /// The socket transport, connecting half.
 #[cfg(feature = "client")]
 pub mod client;
+/// Condensing a settled page into levels a caller can widen from.
+///
+/// Types and ranking only, no transport: a caller with a snapshot already has
+/// everything this needs, and the cache is keyed on settle rather than fetch.
+pub mod condense;
 /// The core: reading, capturing and driving a document.
 #[cfg(feature = "engine")]
 pub mod document;
@@ -153,6 +158,18 @@ pub enum AgentControlRequest {
     /// can relaunch the process.
     Navigate {
         url: String,
+    },
+    /// Condense the settled page into one level, with an account of what the
+    /// level dropped.
+    ///
+    /// The document core can answer this: it needs the tree that is already
+    /// there and no loader, no compositor and no second renderer pass. See
+    /// [`condense`], which is where the ranking lives.
+    Condense {
+        #[serde(default)]
+        level: condense::Level,
+        #[serde(default)]
+        options: condense::CondenseOptions,
     },
     Relaunch,
     Quit,
@@ -257,6 +274,9 @@ pub enum DebugResponse {
     Idle(RevisionSet),
     WindowComposition(WindowComposition),
     Captured(CapturedImage),
+    /// One condensation level over the settled page, level-shaped so a caller
+    /// asking for keywords is not handed the page's full text.
+    Condensation(condense::Condensation),
     Error(DebugError),
 }
 
@@ -1075,6 +1095,9 @@ fn response_summary(response: &DebugResponse) -> String {
         DebugResponse::WindowComposition(_) => "native window composition".into(),
         DebugResponse::Captured(image) => {
             format!("captured {}x{} image", image.width, image.height)
+        }
+        DebugResponse::Condensation(condensation) => {
+            format!("condensed page, {} level", condensation.level_name())
         }
         DebugResponse::Error(error) => error.message.clone(),
     }

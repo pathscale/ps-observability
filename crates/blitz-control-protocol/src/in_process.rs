@@ -133,6 +133,19 @@ impl DocumentControl {
                 },
                 Err(error) => DebugResponse::Error(error),
             },
+            AgentControlRequest::Condense { level, options } => {
+                self.revision += 1;
+                match inspect_document(document, None, 0, self.revision) {
+                    DebugResponse::AgentSnapshot(snapshot) => {
+                        let page = crate::condense::condense(&snapshot.nodes, options);
+                        DebugResponse::Condensation(level.select(page))
+                    }
+                    _ => control_error(
+                        "unsupportedRequest",
+                        "the document has no semantic tree to condense",
+                    ),
+                }
+            }
             AgentControlRequest::Navigate { .. }
             | AgentControlRequest::Relaunch
             | AgentControlRequest::Quit => control_error(
