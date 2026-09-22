@@ -95,7 +95,7 @@ pub use endpoint_libs::libs::ws::{
         JsonRpcError, JsonRpcId, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
         MCP_PROTOCOL_VERSION,
     },
-    transport::{TransportStream, framed_json},
+    transport::{FramedError, Transport, TransportStream, framed_json_neutral},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1297,10 +1297,32 @@ pub fn decode_rpc(message: WireMessage) -> Result<JsonRpcMessage, DebugProtocolE
     parse(&text).map_err(DebugProtocolError::Rpc)
 }
 
+/// The framing the control socket speaks, over a tokio stream.
+///
+/// Behind `server` or `client`, the two features that put tokio in the graph: a
+/// build that only reads the semantic tree has no socket to frame.
+///
+/// endpoint-libs 3.2 removed `framed_json` along with its tokio flavour.
+/// `framed_json_neutral` replaces it but takes a `futures_io` stream, and every
+/// caller in this workspace holds a tokio one, so the `compat` bridge lives here
+/// once rather than at each call site. The codec on the wire is unchanged.
+#[cfg(any(feature = "server", feature = "client", test))]
+pub fn framed_json<S>(
+    stream: S,
+) -> impl Transport<WireMessage, WireMessage, TransportError = FramedError> + Unpin + Send
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+    framed_json_neutral(stream.compat())
+}
+
 #[cfg(test)]
 mod tests {
     use endpoint_libs::libs::ws::MessageStream;
-    use endpoint_libs::libs::ws::transport::{TransportStream, framed_json};
+    use endpoint_libs::libs::ws::transport::TransportStream;
+
+    use super::framed_json;
 
     use super::*;
 
