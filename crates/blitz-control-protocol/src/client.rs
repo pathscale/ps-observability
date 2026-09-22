@@ -16,7 +16,7 @@
 //!
 //! The transport is deliberately not hand-rolled. Frames are length-prefixed
 //! rather than newline-delimited, which is why a naive socket read hangs, and
-//! `endpoint_libs`' `framed_json` is the same codec the server writes with.
+//! `endpoint_libs`' `framed_json_neutral` is the same codec the server writes with.
 //!
 //! This was `ps-qa`'s `inspector` module. It moved here so there is one client
 //! rather than one per consumer: the browser's own `chuzz-inspect` had grown a
@@ -189,7 +189,7 @@ fn read_descriptor(path: &Path) -> Result<Descriptor> {
 /// A connected inspector client.
 ///
 /// `MessageStream` is the object-safe half of the endpoint-libs transport seam,
-/// so the concrete `framed_json` type, which is opaque, never has to be named.
+/// so the concrete framing type, which is opaque, never has to be named.
 pub struct Client {
     stream: Box<dyn MessageStream>,
     next_id: i64,
