@@ -254,15 +254,23 @@ fn run(
     // connection on it. A nagoya socket makes progress only while its own
     // reactor is polled, so the listener and the connections accepted from it
     // have to share one.
-    let Ok(reactor) = Reactor::local() else {
-        return;
+    let reactor = match Reactor::local() {
+        Ok(reactor) => reactor,
+        Err(error) => {
+            eprintln!("control socket reactor could not start: {error:?}");
+            return;
+        }
     };
     let handle = reactor.handle();
     // Registered, not bound: the socket was bound in `start_inner` so that it
     // is listening before `start` returns. Registration is what has to happen
     // here, because it ties the listener to the reactor this thread polls.
-    let Ok(listener) = TcpListener::from_listener(listener, &handle) else {
-        return;
+    let listener = match TcpListener::from_listener(listener, &handle) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("control socket could not register on the reactor: {error:?}");
+            return;
+        }
     };
 
     block_on_with(&reactor, async move {
