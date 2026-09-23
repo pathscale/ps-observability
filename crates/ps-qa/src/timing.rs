@@ -19,6 +19,6 @@ pub(crate) fn check_timeout(milliseconds: u64) -> Duration {
 pub(crate) async fn sleep_pace() {
     let pace = pace();
     if !pace.is_zero() {
-        tokio::time::sleep(pace).await;
+        nagoya::sleep(pace).await;
     }
 }

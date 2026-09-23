@@ -356,7 +356,7 @@ pub(crate) async fn locate_control(
      * while letting initial layout finish on its own.
      */
     for _ in 0..4 {
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        nagoya::sleep(std::time::Duration::from_millis(25)).await;
         let (settled, _) = inspect(client).await?;
         if let Some(found) = pick(&settled) {
             target = found;
