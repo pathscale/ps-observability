@@ -1311,9 +1311,6 @@ pub use endpoint_libs::libs::ws::transport::nagoya::NagoyaStream;
 
 #[cfg(test)]
 mod tests {
-    use endpoint_libs::libs::ws::MessageStream;
-    use endpoint_libs::libs::ws::transport::TransportStream;
-
     use super::*;
 
     fn key_request() -> AgentControlRequest {
