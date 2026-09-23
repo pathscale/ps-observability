@@ -33,11 +33,15 @@ use crate::{
     DebugProtocolError, DebugResponse, DebugStream, DiagnosticsRequest, JsonRpcId, JsonRpcMessage,
     JsonRpcRequest, MCP_PROTOCOL_VERSION, MessageStream, TransportStream, WireMessage,
     decode_diagnostics_event_value, decode_response_value, decode_wire_value, encode_agent_request,
-    encode_diagnostics_request, encode_rpc, framed_json, peek_value_request_id,
+    encode_diagnostics_request, encode_rpc, peek_value_request_id,
 };
 use eyre::{Context, Result, bail, eyre};
-use tokio::net::UnixStream;
-use tokio::time::timeout;
+use std::os::unix::ffi::OsStrExt;
+
+use endpoint_libs::libs::ws::transport::framed::framed_json_neutral;
+use endpoint_libs::libs::ws::transport::nagoya::NagoyaStream;
+use nagoya::reactor::{Addr, Reactor, TcpStream};
+use nagoya::timeout;
 
 /// Matches the Python client's bench timeout. Long because a driven
 /// interaction can leave the app resolving for a while before it answers.
@@ -53,6 +57,26 @@ pub struct Descriptor {
     /// struct would hide any field this build of the tool does not know about.
     pub raw: serde_json::Value,
     verified_reachable: bool,
+}
+
+/// The reactor every inspector connection lives on.
+///
+/// A nagoya socket makes progress only while the reactor it was created on is
+/// polled, and this client is a library: it does not own the caller's thread and
+/// cannot assume one is polling anything. `Reactor::start` owns a thread, so a
+/// connection keeps being driven between the caller's awaits.
+///
+/// One for the process rather than one per connection: a thread per inspector
+/// connection would be a thread per command in a QA sweep.
+fn client_reactor() -> &'static nagoya::reactor::Handle {
+    static REACTOR: std::sync::OnceLock<(Reactor, nagoya::reactor::Handle)> =
+        std::sync::OnceLock::new();
+    let (_, handle) = REACTOR.get_or_init(|| {
+        let reactor = Reactor::start().expect("inspector reactor could not start");
+        let handle = reactor.handle();
+        (reactor, handle)
+    });
+    handle
 }
 
 impl Descriptor {
@@ -243,10 +267,12 @@ impl Client {
 
         let started = Instant::now();
         let stream = loop {
-            match UnixStream::connect(socket).await {
+            let addr = Addr::path(socket.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::other("socket path is not a valid unix address"))?;
+            match TcpStream::connect(addr, client_reactor()).await {
                 Ok(stream) => break stream,
                 Err(_) if started.elapsed() < CONNECT_DEADLINE => {
-                    tokio::time::sleep(RETRY_DELAY).await;
+                    nagoya::sleep(RETRY_DELAY).await;
                 }
                 Err(error) => {
                     return Err(error)
@@ -255,7 +281,9 @@ impl Client {
             }
         };
         Ok(Self {
-            stream: Box::new(TransportStream::new(framed_json(stream))),
+            stream: Box::new(TransportStream::new(framed_json_neutral(
+                NagoyaStream::new(stream),
+            ))),
             next_id: 0,
             request_timeout: REQUEST_TIMEOUT,
             events: VecDeque::new(),
@@ -401,9 +429,9 @@ impl Client {
             return Ok(true);
         }
 
-        let deadline = tokio::time::Instant::now() + within;
+        let deadline = Instant::now() + within;
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(false);
             }
@@ -449,10 +477,10 @@ impl Client {
 
     /// Collect pushed notifications for a while, as `watch` does.
     pub async fn drain(&mut self, seconds: f64) -> Result<Vec<serde_json::Value>> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(seconds);
+        let deadline = Instant::now() + Duration::from_secs_f64(seconds);
         let mut out = Vec::new();
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(out);
             }
@@ -526,67 +554,71 @@ fn protocol_error(error: DebugProtocolError) -> eyre::Report {
 mod tests {
     use super::*;
     use crate::{JsonRpcResponse, encode_diagnostics_event};
-    use tokio::net::UnixListener;
+    use nagoya::reactor::TcpListener;
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn connect_retries_startup_and_exchange_preserves_events() {
-        let socket = std::env::temp_dir().join(format!(
-            "ps-qa-transport-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock is after the epoch")
-                .as_nanos()
-        ));
-        let server_socket = socket.clone();
-        let server = async move {
-            // The descriptor can be visible before its socket is bound. Make
-            // that production race deterministic and require the client retry.
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            let listener = UnixListener::bind(&server_socket).expect("bind test socket");
-            let (stream, _) = listener.accept().await.expect("accept test client");
-            let mut stream = TransportStream::new(framed_json(stream));
-            let _request = stream
-                .recv()
-                .await
-                .expect("client keeps connection open")
-                .expect("read initialize request");
-            stream
-                .send(
-                    encode_diagnostics_event(&DebugEvent::PaintCommitted { revision: 7 })
-                        .expect("encode paint event"),
-                )
-                .await
-                .expect("send paint event");
-            stream
-                .send(
-                    encode_rpc(JsonRpcMessage::Response(JsonRpcResponse::result(
-                        Some(JsonRpcId::Number(1)),
-                        serde_json::json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
-                    )))
-                    .expect("encode initialize response"),
-                )
-                .await
-                .expect("send initialize response");
-        };
-
-        let client_socket = socket.clone();
-        let client = async move {
-            let mut client = Client::connect(&client_socket)
-                .await
-                .expect("client retries until socket is bound");
-            client.initialize().await.expect("initialize completes");
-            assert!(
-                client
-                    .wait_for_paint(Duration::ZERO)
+    #[test]
+    fn connect_retries_startup_and_exchange_preserves_events() {
+        nagoya::block_on(async {
+            let socket = std::env::temp_dir().join(format!(
+                "ps-qa-transport-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock is after the epoch")
+                    .as_nanos()
+            ));
+            let server_socket = socket.clone();
+            let server = async move {
+                // The descriptor can be visible before its socket is bound. Make
+                // that production race deterministic and require the client retry.
+                nagoya::sleep(Duration::from_millis(40)).await;
+                let addr = Addr::path(server_socket.as_os_str().as_bytes()).expect("socket path");
+                let listener = TcpListener::bind(addr, client_reactor()).expect("bind test socket");
+                let (stream, _) = listener.accept().await.expect("accept test client");
+                let mut stream =
+                    TransportStream::new(framed_json_neutral(NagoyaStream::new(stream)));
+                let _request = stream
+                    .recv()
                     .await
-                    .expect("queued paint remains readable"),
-                "an event arriving before the response must not steal the response or be discarded"
-            );
-        };
+                    .expect("client keeps connection open")
+                    .expect("read initialize request");
+                stream
+                    .send(
+                        encode_diagnostics_event(&DebugEvent::PaintCommitted { revision: 7 })
+                            .expect("encode paint event"),
+                    )
+                    .await
+                    .expect("send paint event");
+                stream
+                    .send(
+                        encode_rpc(JsonRpcMessage::Response(JsonRpcResponse::result(
+                            Some(JsonRpcId::Number(1)),
+                            serde_json::json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
+                        )))
+                        .expect("encode initialize response"),
+                    )
+                    .await
+                    .expect("send initialize response");
+            };
 
-        tokio::join!(server, client);
-        let _ = std::fs::remove_file(socket);
+            let client_socket = socket.clone();
+            let client = async move {
+                let mut client = Client::connect(&client_socket)
+                    .await
+                    .expect("client retries until socket is bound");
+                client.initialize().await.expect("initialize completes");
+                assert!(
+                    client
+                        .wait_for_paint(Duration::ZERO)
+                        .await
+                        .expect("queued paint remains readable"),
+                    "an event arriving before the response must not steal the response or be discarded"
+                );
+            };
+
+            futures::future::join(server, client).await;
+            let _ = std::fs::remove_file(socket);
+        });
     }
 
     #[test]

@@ -1300,6 +1300,7 @@ pub fn decode_rpc(message: WireMessage) -> Result<JsonRpcMessage, DebugProtocolE
     parse(&text).map_err(DebugProtocolError::Rpc)
 }
 
+#[cfg(feature = "tokio-framing")]
 /// The framing the control socket speaks, over a tokio stream.
 ///
 /// Behind `server` or `client`, the two features that put tokio in the graph: a
@@ -1309,7 +1310,6 @@ pub fn decode_rpc(message: WireMessage) -> Result<JsonRpcMessage, DebugProtocolE
 /// `framed_json_neutral` replaces it but takes a `futures_io` stream, and every
 /// caller in this workspace holds a tokio one, so the `compat` bridge lives here
 /// once rather than at each call site. The codec on the wire is unchanged.
-#[cfg(any(feature = "server", feature = "client", test))]
 pub fn framed_json<S>(
     stream: S,
 ) -> impl Transport<WireMessage, WireMessage, TransportError = FramedError> + Unpin + Send
@@ -1325,6 +1325,7 @@ mod tests {
     use endpoint_libs::libs::ws::MessageStream;
     use endpoint_libs::libs::ws::transport::TransportStream;
 
+    #[cfg(feature = "tokio-framing")]
     use super::framed_json;
 
     use super::*;
@@ -1464,6 +1465,10 @@ mod tests {
         );
     }
 
+    /// Gated with the shim it exercises: the duplex pipe is tokio's, and there
+    /// is no nagoya equivalent to write it against. The codec under test is the
+    /// same one the sockets use either way.
+    #[cfg(feature = "tokio-framing")]
     #[tokio::test(flavor = "current_thread")]
     async fn endpoint_framing_carries_debug_frames_without_a_session_or_token() {
         let (server_io, client_io) = tokio::io::duplex(64 * 1024);
