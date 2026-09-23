@@ -32,7 +32,7 @@ publish = true
 #
 # `server` and `client` carry no engine because a transport does not need one:
 # the framing is shared, the document is not. `ps-qa` takes `client` and gets
-# serde, endpoint-libs and tokio. A peer that is both, such as AgencyZero
+# serde, endpoint-libs and nagoya. A peer that is both, such as AgencyZero
 # driving an embedded browser while agents drive it, takes both halves.
 [features]
 default = []
