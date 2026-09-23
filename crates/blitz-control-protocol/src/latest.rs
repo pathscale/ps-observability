@@ -54,6 +54,25 @@ impl<T: Clone> Latest<T> {
         self.changed.notify_waiters();
     }
 
+    /// Replace the value from a synchronous context.
+    ///
+    /// A paint lands in a window event handler, which is not async and has no
+    /// runtime to await on. Contention is only against a reader taking a
+    /// snapshot, so `try_write` either succeeds at once or means a reader holds
+    /// the slot for an instant; dropping that revision is correct rather than
+    /// unfortunate, because this keeps only the newest anyway.
+    ///
+    /// Returns whether the value was stored.
+    pub fn set_now(&self, value: T) -> bool {
+        let Some(mut slot) = self.slot.try_write() else {
+            return false;
+        };
+        *slot = Some(value);
+        drop(slot);
+        self.revision.fetch_add(1, Ordering::Release);
+        self.changed.notify_waiters();
+        true
+    }
     /// The current value, if any.
     pub async fn get(&self) -> Option<T> {
         self.slot.read().await.clone()
