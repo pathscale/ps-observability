@@ -37,7 +37,7 @@
 //! lifecycle directly, supports observation by more than one client, and has
 //! no authentication handshake. Agent control binds only to a local transport;
 //! expensive diagnostics collection remains an explicit compile-time feature
-//! *of the server*, `tauri-runtime-blitz/diagnostics`.
+//! *of the server*, `izumo/diagnostics`.
 //!
 //! # Why this is its own crate
 //!
@@ -48,7 +48,7 @@
 //! the difference used to present as a hung application. Sharing the types
 //! makes that a compile error.
 //!
-//! Speaking the protocol must not cost a renderer. `tauri-runtime-blitz` pulls
+//! Speaking the protocol must not cost a renderer. `izumo` pulls
 //! in tauri, winit, wgpu and blitz, so a measurement tool that depended on it
 //! for these types would build a browser engine to send a wheel event. Nothing
 //! here needs any of that: it is serde plus endpoint-libs' framing.
@@ -962,7 +962,7 @@ pub fn decode_incoming_value(
 
 /// The MCP handshake, answered on behalf of whichever host is serving.
 ///
-/// `server_name` used to be the literal `tauri-runtime-blitz`, because that is
+/// `server_name` used to be the literal `tauri-runtime-blitz` (now izumo), because that is
 /// where this code lived. There are three hosts now, and none of them is this
 /// crate: a window runtime, a headless browser, and an embedder driving a
 /// browser in-process. Each says its own name.

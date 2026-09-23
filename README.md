@@ -16,7 +16,7 @@ the system has one ownership boundary.
      │        │                   the document
      │        └── ps-qa (no blitz, no window)
      │
-     ├── tauri-runtime-blitz, for the application window
+     ├── izumo, for the application window
      └── chuzz-headless, for a page with no window
 ```
 

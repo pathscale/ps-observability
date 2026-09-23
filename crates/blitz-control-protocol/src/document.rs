@@ -6,7 +6,7 @@
 //! directly and [`crate::server`] calls it across a socket, and neither is
 //! visible from here.
 //!
-//! It used to live in `tauri-runtime-blitz`, beside the Tauri runtime, which
+//! It used to live in `izumo`, beside the Tauri runtime, which
 //! meant that depending on it meant compiling Tauri. On Linux that means GTK:
 //! system libraries pulled in to build a binary that never creates a window,
 //! and a crate that would not compile there at all. The dependency edge was
@@ -2799,7 +2799,7 @@ mod role_projection_tests {
 
 /// What the runtime's own tests asserted about this code.
 ///
-/// They lived in `tauri-runtime-blitz`'s `runtime.rs`, beside a window, and
+/// They lived in `izumo`'s `runtime.rs`, beside a window, and
 /// every one of them is about a document instead: what a node is named, what
 /// it is called, whether it is visible, what an activation reaches, what a
 /// capture draws, and what a diagnostic row reports. They move with the code
