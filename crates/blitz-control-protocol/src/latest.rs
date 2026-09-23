@@ -149,14 +149,21 @@ impl<T> Once<T> {
     ///
     /// The bridge closure is not async: a host that already holds the answer
     /// replies without awaiting, and one that does not hands the `Once` to
-    /// whatever will. Contention is only against a receiver taking the value,
-    /// so `try_write` either succeeds immediately or means the answer was
-    /// already delivered; either way there is nothing to wait for.
+    /// whatever will.
+    ///
+    /// A failed `try_write` is not a delivered answer: `recv` holds the write
+    /// lock while it looks at an empty slot, and giving up then dropped the
+    /// reply and left the receiver waiting for one that would never come. The
+    /// receiver holds it only to read two fields, so this retries rather than
+    /// returning.
     ///
     /// Returns whether the value was stored.
     pub fn fill(&self, value: T) -> bool {
-        let Some(mut state) = self.state.try_write() else {
-            return false;
+        let mut state = loop {
+            match self.state.try_write() {
+                Some(state) => break state,
+                None => std::thread::yield_now(),
+            }
         };
         if state.0.is_some() || state.1 {
             return false;
