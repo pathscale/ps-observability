@@ -5736,6 +5736,39 @@ pub async fn run() -> Result<()> {
                     ghosts.push((id, name, x, y, w, h));
                 }
             }
+            // `visible` is the accessibility answer, so it is also false for
+            // `aria-hidden="true"`, and a decorative icon marked that way
+            // paints normally. Counting those made chuzz's chrome report 14
+            // ghosts that were ten collapsible chevrons and a settings cog,
+            // all on screen. A ghost is a box that holds layout and paints
+            // nothing. `display: none` and `[hidden]` leave no box, so what
+            // remains is computed `visibility`, which inherits: ask for it on
+            // the candidates only, and keep the ones it hides. A candidate
+            // with no style row stays, so a gap in the answer cannot read as
+            // a clean tree.
+            if !ghosts.is_empty() {
+                let answer = client
+                    .diagnostics(&DiagnosticsRequest::Snapshot(SnapshotRequest {
+                        include_dom: false,
+                        include_layout: false,
+                        include_computed_style: true,
+                        node_ids: ghosts.iter().map(|ghost| ghost.0).collect(),
+                    }))
+                    .await?;
+                let DebugResponse::Snapshot(styled) = answer.response else {
+                    bail!("asked for computed styles, got {:?}", answer.response);
+                };
+                let painted: HashSet<u64> = styled
+                    .computed_style
+                    .as_ref()
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter(|row| row.get("visibility").and_then(|v| v.as_str()) == Some("Visible"))
+                    .filter_map(|row| row.get("nodeId").and_then(|v| v.as_u64()))
+                    .collect();
+                ghosts.retain(|ghost| !painted.contains(&ghost.0));
+            }
             ghosts.sort_by(|a, b| (b.4 * b.5).total_cmp(&(a.4 * a.5)));
 
             println!(
