@@ -13,6 +13,7 @@
 //! between the read and the first poll.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use nagoya::sync::{Notify, RwLock};
 
@@ -27,6 +28,9 @@ use nagoya::sync::{Notify, RwLock};
 pub struct Latest<T> {
     slot: RwLock<Option<T>>,
     changed: Notify,
+    /// Bumped on every set, so a reader can tell "newer than what I saw" from
+    /// "woken for somebody else".
+    revision: AtomicU64,
 }
 
 impl<T: Clone> Latest<T> {
@@ -36,6 +40,7 @@ impl<T: Clone> Latest<T> {
         Arc::new(Self {
             slot: RwLock::new(None),
             changed: Notify::new(),
+            revision: AtomicU64::new(0),
         })
     }
 
@@ -45,6 +50,7 @@ impl<T: Clone> Latest<T> {
     /// then reads finds the new value.
     pub async fn set(&self, value: T) {
         *self.slot.write().await = Some(value);
+        self.revision.fetch_add(1, Ordering::Release);
         self.changed.notify_waiters();
     }
 
@@ -53,19 +59,43 @@ impl<T: Clone> Latest<T> {
         self.slot.read().await.clone()
     }
 
-    /// Wait for the next change, then return the value.
-    pub async fn changed(&self) -> Option<T> {
-        let notified = self.changed.notified();
-        futures::pin_mut!(notified);
-        // Registered before the read below, and `enable` reports a wake that
-        // already landed so it is not waited for twice.
-        if !notified.as_mut().enable() {
-            notified.await;
+    /// The revision a reader has now seen.
+    ///
+    /// A reader holds this and passes it back to [`Self::changed_since`]. That
+    /// is what a `watch::Receiver` tracks internally, made explicit because the
+    /// position belongs to the reader: two readers of the same slot are at
+    /// different places in the stream, and one calling `borrow_and_update` must
+    /// not move the other.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// Wait until the value is newer than `seen`, then return it with its
+    /// revision.
+    ///
+    /// Returns immediately when the slot has already moved past `seen`, which
+    /// is what makes a caller that stopped reading for a while catch up to the
+    /// newest revision rather than to the next one.
+    pub async fn changed_since(&self, seen: u64) -> (Option<T>, u64) {
+        loop {
+            let notified = self.changed.notified();
+            futures::pin_mut!(notified);
+            // Registered before the revision is read: `notify_waiters` stores
+            // no permit, so a waiter that read first could lose a `set` landing
+            // between the read and the first poll.
+            let ready = notified.as_mut().enable();
+
+            let now = self.revision();
+            if now != seen {
+                return (self.get().await, now);
+            }
+            if !ready {
+                notified.await;
+            }
         }
-        self.get().await
     }
 }
-
 /// One value, delivered once.
 ///
 /// Replaces a `oneshot`. The sender fills the slot and wakes; the receiver
@@ -152,6 +182,65 @@ impl<T> Once<T> {
     }
 }
 
+
+/// A one-way flag, settable without a runtime.
+///
+/// Shutdown is not a value handoff and should not have been a channel. A
+/// `oneshot::Sender` had to be *moved* to fire, which is why the old `Drop` had
+/// to `take()` it out of an `Option`, and sending is async on any primitive
+/// built from an `RwLock`. `Drop` is neither async nor able to await.
+///
+/// So: an atomic for the state and a `Notify` for the wake, both settable from
+/// a `&self` in a destructor. A waiter that arrives after the flag is already
+/// set returns immediately rather than waiting for a broadcast that has been
+/// and gone.
+#[derive(Debug, Default)]
+pub struct Flag {
+    set: AtomicBool,
+    raised: Notify,
+}
+
+impl Flag {
+    /// A flag that has not been raised.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            set: AtomicBool::new(false),
+            raised: Notify::new(),
+        })
+    }
+
+    /// Raise the flag and wake every waiter. Safe from a destructor.
+    ///
+    /// The store is released before the wake, so a waiter that observes the
+    /// broadcast and then reads the flag has to see `true`.
+    pub fn raise(&self) {
+        self.set.store(true, Ordering::Release);
+        self.raised.notify_waiters();
+    }
+
+    /// Whether the flag is up.
+    #[must_use]
+    pub fn is_raised(&self) -> bool {
+        self.set.load(Ordering::Acquire)
+    }
+
+    /// Resolve once the flag is up, immediately if it already is.
+    pub async fn raised(&self) {
+        loop {
+            let notified = self.raised.notified();
+            futures::pin_mut!(notified);
+            let ready = notified.as_mut().enable();
+            if self.is_raised() {
+                return;
+            }
+            if ready {
+                continue;
+            }
+            notified.await;
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

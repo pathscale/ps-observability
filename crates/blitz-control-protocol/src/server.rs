@@ -1,5 +1,6 @@
 use std::fs::{OpenOptions, remove_file};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,9 +11,11 @@ use endpoint_libs::libs::ws::mcp_wire::{INVALID_REQUEST, JsonRpcError};
 use endpoint_libs::libs::ws::transport::TransportStream;
 
 use crate::framed_json;
+use endpoint_libs::libs::ws::transport::framed::framed_json_neutral;
+use endpoint_libs::libs::ws::transport::nagoya::NagoyaStream;
 use endpoint_libs::libs::ws::{MessageStream, StreamError, WireMessage};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{oneshot, watch};
+use nagoya::reactor::{Addr, Reactor, TcpListener, TcpStream, block_on_with};
+use crate::latest::{Flag, Latest, Once};
 
 use crate::{
     AgentControlRequest, DebugDescriptor, DebugEvent, DebugResponse, DebugStream,
@@ -70,15 +73,15 @@ pub struct Host {
 /// which is what pushed a QA harness into screenshot and tree-file workarounds
 /// that could not answer any question involving a click.
 pub type ControlBridge =
-    Arc<dyn Fn(ControlBridgeRequest) -> oneshot::Receiver<DebugResponse> + Send + Sync + 'static>;
+    Arc<dyn Fn(ControlBridgeRequest) -> Arc<Once<DebugResponse>> + Send + Sync + 'static>;
 
 #[cfg(test)]
-pub(crate) static CONTROL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static CONTROL_TEST_LOCK: nagoya::sync::RwLock<()> = nagoya::sync::RwLock::new(());
 
 pub struct AgentControlServer {
     descriptor_path: PathBuf,
     socket_path: PathBuf,
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: Option<Arc<Flag>>,
     thread: Option<JoinHandle<()>>,
     /// Holds deep-profiling collection open while a tool can attach.
     ///
@@ -117,7 +120,7 @@ impl AgentControlServer {
     pub fn start_with_events(
         bridge: ControlBridge,
         host: Host,
-        events: watch::Receiver<Option<DebugEvent>>,
+        events: Arc<Latest<DebugEvent>>,
     ) -> io::Result<Self> {
         Self::start_inner(bridge, host, Some(events))
     }
@@ -125,19 +128,32 @@ impl AgentControlServer {
     fn start_inner(
         bridge: ControlBridge,
         host: Host,
-        events: Option<watch::Receiver<Option<DebugEvent>>>,
+        events: Option<Arc<Latest<DebugEvent>>>,
     ) -> io::Result<Self> {
         let instance_id = instance_id();
         let descriptor_path = descriptor_path(&instance_id);
         let socket_path = descriptor_path.with_extension("sock");
+
+        // The directory carries the access control, and it is set before
+        // anything inside it exists.
+        //
+        // A mode on the socket cannot be: a Unix socket is created by `bind`
+        // already listening, so any mode applied afterwards leaves a window in
+        // which the path is connectable. That window was real here. The
+        // directory had whatever `create_dir_all` gives, which is world
+        // readable under `/tmp`, and the socket's `0600` landed after `bind`.
+        //
+        // `0700` on the directory closes it without depending on ordering at
+        // all: a process that cannot traverse the directory cannot reach the
+        // socket whatever the socket's own mode says. The socket keeps `0600`
+        // as well, because defence that rests on one check is defence that
+        // rests on nobody ever relaxing the directory.
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
         let _ = remove_file(&socket_path);
 
-        let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
-        listener.set_nonblocking(true)?;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
 
         let descriptor = DebugDescriptor {
             protocol_version: crate::DEBUG_PROTOCOL_VERSION,
@@ -150,15 +166,17 @@ impl AgentControlServer {
         write_descriptor(&descriptor_path, &descriptor)?;
         reap_dead_descriptors(&descriptor_path);
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let shutdown_flag = Flag::new();
+        let shutdown_for_thread = Arc::clone(&shutdown_flag);
+        let socket_for_thread = socket_path.clone();
         let thread = thread::Builder::new()
             .name("blitz-agent-control".into())
-            .spawn(move || run(listener, bridge, host, events, shutdown_rx))?;
+            .spawn(move || run(socket_for_thread, bridge, host, events, shutdown_for_thread))?;
 
         Ok(Self {
             descriptor_path,
             socket_path,
-            shutdown: Some(shutdown_tx),
+            shutdown: Some(shutdown_flag),
             thread: Some(thread),
             // Taken after the socket is listening, so a permitted profile
             // begins collecting for the tool that is now able to attach, and
@@ -208,7 +226,7 @@ impl AgentControlServer {
 impl Drop for AgentControlServer {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            shutdown.raise();
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -217,48 +235,93 @@ impl Drop for AgentControlServer {
         let _ = remove_file(&self.descriptor_path);
     }
 }
-
 fn run(
-    listener: std::os::unix::net::UnixListener,
+    socket_path: PathBuf,
     bridge: ControlBridge,
     host: Host,
-    events: Option<watch::Receiver<Option<DebugEvent>>>,
-    shutdown: oneshot::Receiver<()>,
+    events: Option<Arc<Latest<DebugEvent>>>,
+    shutdown: Arc<Flag>,
 ) {
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .build()
-    else {
+    // One reactor, owned by this thread, driving the listener and every
+    // connection on it. A nagoya socket makes progress only while its own
+    // reactor is polled, so the listener and the connections accepted from it
+    // have to share one.
+    let Ok(reactor) = Reactor::local() else {
         return;
     };
-    let local = tokio::task::LocalSet::new();
-    local.block_on(&runtime, async move {
-        let Ok(listener) = UnixListener::from_std(listener) else {
-            return;
-        };
-        tokio::pin!(shutdown);
+    let handle = reactor.handle();
+    // Bound here rather than handed in: nagoya has no way to adopt a raw fd,
+    // and binding on the thread that will poll it is the shape its reactor
+    // wants anyway. The std listener created in `start_inner` is dropped before
+    // this runs, which is why the path is unlinked first.
+    let _ = remove_file(&socket_path);
+    let Ok(addr) = Addr::path(socket_path.as_os_str().as_bytes()) else {
+        return;
+    };
+    let Ok(listener) = TcpListener::bind(addr, &handle) else {
+        return;
+    };
+    // The socket is world-accessible between bind and here. Narrow it before
+    // anything can connect, which is what the std bind did inline.
+    if std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).is_err() {
+        return;
+    };
+
+    block_on_with(&reactor, async move {
+        use futures::future::{Either, select};
+        use futures::stream::FuturesUnordered;
+        use futures::StreamExt;
+
+        // Connections are held here and polled in place rather than spawned.
+        // nagoya's `TaskSet` is the purpose-built runner for non-Send tasks on
+        // one thread, but it never removes a finished task's entry: the slot
+        // stays so a late wake still has a link to follow. A set fed by
+        // unbounded connection churn therefore grows one entry per connection
+        // ever accepted. A debug socket that a QA harness reconnects to in a
+        // loop is exactly that churn. `FuturesUnordered` drops what finishes.
+        let mut connections = FuturesUnordered::new();
+
         loop {
-            tokio::select! {
-                _ = &mut shutdown => break,
-                accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => {
-                        let bridge = Arc::clone(&bridge);
-                        let host = host.clone();
-                        let events = events.clone();
-                        tokio::task::spawn_local(async move {
-                            handle_connection(stream, bridge, host, events).await;
-                        });
-                    }
-                    Err(_) => break,
+            let stopping = shutdown.raised();
+            let accepted = listener.accept();
+            futures::pin_mut!(stopping, accepted);
+
+            // Shutdown is the outer left arm so a raised flag is not stuck
+            // behind an accept, or behind a live connection that is also ready.
+            let accepted = if connections.is_empty() {
+                match select(stopping, accepted).await {
+                    Either::Left(_) => break,
+                    Either::Right((accepted, _)) => accepted,
                 }
-            }
+            } else {
+                let progress = select(accepted, connections.next());
+                futures::pin_mut!(progress);
+                match select(stopping, progress).await {
+                    Either::Left(_) => break,
+                    Either::Right((Either::Left((accepted, _)), _)) => accepted,
+                    // A connection finished and the set has already dropped it.
+                    Either::Right((Either::Right(_), _)) => continue,
+                }
+            };
+
+            let Ok((stream, _)) = accepted else {
+                break;
+            };
+            connections.push(handle_connection(
+                stream,
+                Arc::clone(&bridge),
+                host.clone(),
+                events.clone(),
+            ));
         }
     });
 }
 
 enum ConnectionInput {
     Message(Option<Result<WireMessage, StreamError>>),
-    Event(Result<(), watch::error::RecvError>),
+    /// The newest event, carried directly. A `Latest` has no sender to drop,
+    /// so there is no receive error to represent.
+    Event(DebugEvent),
 }
 
 fn stream_wants_event(streams: &[DebugStream], event: &DebugEvent) -> bool {
@@ -272,37 +335,41 @@ fn stream_wants_event(streams: &[DebugStream], event: &DebugEvent) -> bool {
 }
 
 async fn handle_connection(
-    stream: UnixStream,
+    stream: TcpStream,
     bridge: ControlBridge,
     host: Host,
-    mut events: Option<watch::Receiver<Option<DebugEvent>>>,
+    events: Option<Arc<Latest<DebugEvent>>>,
 ) {
-    let mut stream = TransportStream::new(framed_json(stream));
+    let mut stream = TransportStream::new(framed_json_neutral(NagoyaStream::new(stream)));
     let mut observed = Vec::<DebugStream>::new();
+    // This reader's position in the event stream. Held here rather than in the
+    // slot, because two connections read the same `Latest` from different
+    // places and one catching up must not move the other.
+    let mut seen = events.as_ref().map_or(0, |latest| latest.revision());
     loop {
         let input = if observed.is_empty() {
             ConnectionInput::Message(stream.recv().await)
-        } else if let Some(receiver) = events.as_mut() {
-            tokio::select! {
-                message = stream.recv() => ConnectionInput::Message(message),
-                changed = receiver.changed() => ConnectionInput::Event(changed),
+        } else if let Some(latest) = events.as_ref() {
+            use futures::future::{Either, select};
+            let message = stream.recv();
+            let changed = latest.changed_since(seen);
+            futures::pin_mut!(message, changed);
+            match select(message, changed).await {
+                Either::Left((message, _)) => ConnectionInput::Message(message),
+                Either::Right(((event, revision), _)) => {
+                    seen = revision;
+                    match event {
+                        Some(event) => ConnectionInput::Event(event),
+                        None => continue,
+                    }
+                }
             }
         } else {
             ConnectionInput::Message(stream.recv().await)
         };
 
         let message = match input {
-            ConnectionInput::Event(changed) => {
-                if changed.is_err() {
-                    events = None;
-                    continue;
-                }
-                let Some(event) = events
-                    .as_ref()
-                    .and_then(|receiver| receiver.borrow().clone())
-                else {
-                    continue;
-                };
+            ConnectionInput::Event(event) => {
                 if !stream_wants_event(&observed, &event) {
                     continue;
                 }
@@ -334,8 +401,9 @@ async fn handle_connection(
                         }
                         Ok(IncomingRequest::Agent { id, request }) => {
                             let response = bridge(ControlBridgeRequest::Agent(request))
+                                .recv()
                                 .await
-                                .unwrap_or_else(|_| {
+                                .unwrap_or_else(|| {
                                     DebugResponse::Error(crate::DebugError {
                                         code: "bridgeClosed".into(),
                                         message: "the UI-thread control bridge closed".into(),
@@ -356,15 +424,19 @@ async fn handle_connection(
                             // Arming observation establishes a revision baseline.
                             // Do not immediately replay a paint that happened
                             // before the action the caller is about to drive.
-                            if let Some(receiver) = events.as_mut() {
-                                receiver.borrow_and_update();
+                            // The action about to run should not be answered with a
+                            // paint that happened before it. Advancing the cursor
+                            // to now is what `borrow_and_update` did on a watch.
+                            if let Some(latest) = events.as_ref() {
+                                seen = latest.revision();
                             }
                             encode_response(id, &DebugResponse::Ack)
                         }
                         Ok(IncomingRequest::Diagnostics { id, request }) => {
                             let response = bridge(ControlBridgeRequest::Diagnostics(request))
+                                .recv()
                                 .await
-                                .unwrap_or_else(|_| {
+                                .unwrap_or_else(|| {
                                     DebugResponse::Error(crate::DebugError {
                                         code: "bridgeClosed".into(),
                                         message: "the UI-thread diagnostics bridge closed".into(),
