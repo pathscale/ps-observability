@@ -63,8 +63,15 @@ capture = [
     # for the script half of the same capture.
     "blitz-shell/debug-control",
 ]
-server = ["dep:tokio", "dep:tokio-util", "dep:nagoya", "dep:futures"]
-client = ["dep:eyre", "dep:tokio", "dep:tokio-util", "dep:nagoya", "dep:futures"]
+server = ["dep:nagoya", "dep:futures"]
+client = ["dep:eyre", "dep:nagoya", "dep:futures"]
+
+# The tokio-stream framing shim, for consumers that still hold tokio streams.
+# Nothing in this crate needs it any more: the server and the client both speak
+# to nagoya sockets. It stays because ps-qa and chuzz frame tokio streams of
+# their own, and it is a feature so that depending on this crate does not put
+# tokio in a graph that had got rid of it.
+tokio-framing = ["dep:tokio", "dep:tokio-util"]
 
 [dependencies]
 endpoint-libs.workspace = true

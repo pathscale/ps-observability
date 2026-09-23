@@ -10,7 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use endpoint_libs::libs::ws::mcp_wire::{INVALID_REQUEST, JsonRpcError};
 use endpoint_libs::libs::ws::transport::TransportStream;
 
-use crate::framed_json;
 use crate::latest::{Flag, Latest, Once};
 use endpoint_libs::libs::ws::transport::framed::framed_json_neutral;
 use endpoint_libs::libs::ws::transport::nagoya::NagoyaStream;
