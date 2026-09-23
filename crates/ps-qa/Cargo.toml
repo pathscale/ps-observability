@@ -22,7 +22,7 @@ publish = true
 # `tauri-runtime-blitz` for the same types would build a browser engine to send
 # a wheel event. `cargo tree -p ps-qa` is the check.
 [dependencies]
-blitz-control-protocol = { workspace = true, features = ["client", "tokio-framing"] }
+blitz-control-protocol = { workspace = true, features = ["client"] }
 # The same framing the server uses, from the same crate, for the same reason as
 # the protocol types: a hand-rolled length-prefix reader is how the Python
 # client hung on its first malformed frame.
@@ -45,3 +45,7 @@ clap = { version = "4.6.6", features = ["derive", "env"] }
 [[bin]]
 name = "ps-qa"
 path = "src/main.rs"
+
+[dev-dependencies]
+# The silent-host fixture binds a real control socket, which is nagoya's.
+nagoya = { version = "^0.1.11", features = ["reactor"] }
