@@ -11,11 +11,12 @@ use endpoint_libs::libs::ws::mcp_wire::{INVALID_REQUEST, JsonRpcError};
 use endpoint_libs::libs::ws::transport::TransportStream;
 
 use crate::framed_json;
+use crate::latest::{Flag, Latest, Once};
 use endpoint_libs::libs::ws::transport::framed::framed_json_neutral;
 use endpoint_libs::libs::ws::transport::nagoya::NagoyaStream;
 use endpoint_libs::libs::ws::{MessageStream, StreamError, WireMessage};
+use nagoya::reactor::socket::TcpListener as BoundListener;
 use nagoya::reactor::{Addr, Reactor, TcpListener, TcpStream, block_on_with};
-use crate::latest::{Flag, Latest, Once};
 
 use crate::{
     AgentControlRequest, DebugDescriptor, DebugEvent, DebugResponse, DebugStream,
@@ -154,6 +155,15 @@ impl AgentControlServer {
         }
         let _ = remove_file(&socket_path);
 
+        // Bound here, before `start` returns, so a caller that connects the
+        // moment it has the path finds a socket listening. Registering it on a
+        // reactor is the server thread's job; binding is not, and doing it
+        // there was a race the tests caught immediately.
+        let addr = Addr::path(socket_path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::other("socket path is not a valid unix address"))?;
+        let listener = BoundListener::bind(addr, 128)
+            .map_err(|error| io::Error::other(format!("bind: {error:?}")))?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
 
         let descriptor = DebugDescriptor {
             protocol_version: crate::DEBUG_PROTOCOL_VERSION,
@@ -168,10 +178,9 @@ impl AgentControlServer {
 
         let shutdown_flag = Flag::new();
         let shutdown_for_thread = Arc::clone(&shutdown_flag);
-        let socket_for_thread = socket_path.clone();
         let thread = thread::Builder::new()
             .name("blitz-agent-control".into())
-            .spawn(move || run(socket_for_thread, bridge, host, events, shutdown_for_thread))?;
+            .spawn(move || run(listener, bridge, host, events, shutdown_for_thread))?;
 
         Ok(Self {
             descriptor_path,
@@ -236,7 +245,7 @@ impl Drop for AgentControlServer {
     }
 }
 fn run(
-    socket_path: PathBuf,
+    listener: BoundListener,
     bridge: ControlBridge,
     host: Host,
     events: Option<Arc<Latest<DebugEvent>>>,
@@ -250,27 +259,17 @@ fn run(
         return;
     };
     let handle = reactor.handle();
-    // Bound here rather than handed in: nagoya has no way to adopt a raw fd,
-    // and binding on the thread that will poll it is the shape its reactor
-    // wants anyway. The std listener created in `start_inner` is dropped before
-    // this runs, which is why the path is unlinked first.
-    let _ = remove_file(&socket_path);
-    let Ok(addr) = Addr::path(socket_path.as_os_str().as_bytes()) else {
-        return;
-    };
-    let Ok(listener) = TcpListener::bind(addr, &handle) else {
-        return;
-    };
-    // The socket is world-accessible between bind and here. Narrow it before
-    // anything can connect, which is what the std bind did inline.
-    if std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).is_err() {
+    // Registered, not bound: the socket was bound in `start_inner` so that it
+    // is listening before `start` returns. Registration is what has to happen
+    // here, because it ties the listener to the reactor this thread polls.
+    let Ok(listener) = TcpListener::from_listener(listener, &handle) else {
         return;
     };
 
     block_on_with(&reactor, async move {
+        use futures::StreamExt;
         use futures::future::{Either, select};
         use futures::stream::FuturesUnordered;
-        use futures::StreamExt;
 
         // Connections are held here and polled in place rather than spawned.
         // nagoya's `TaskSet` is the purpose-built runner for non-Send tasks on
@@ -591,6 +590,26 @@ mod tests {
 
     /// A host that can do everything, for the tests that are about the
     /// transport rather than about what is on the other side of it.
+    /// Connect to a running server's socket, on a reactor of the caller's own.
+    ///
+    /// A test drives both ends: the server polls its socket on the thread it
+    /// spawned, and this is the client side, which needs a reactor of its own
+    /// because a nagoya socket only makes progress while the reactor it was
+    /// created on is polled. `Reactor::start` owns a thread, so the connection
+    /// keeps being driven while the test awaits a reply on it.
+    async fn connect(path: &Path) -> NagoyaStream {
+        static CLIENT_REACTOR: std::sync::OnceLock<(Reactor, nagoya::reactor::Handle)> =
+            std::sync::OnceLock::new();
+        let (_, handle) = CLIENT_REACTOR.get_or_init(|| {
+            let reactor = Reactor::start().expect("client reactor");
+            let handle = reactor.handle();
+            (reactor, handle)
+        });
+        let addr = Addr::path(path.as_os_str().as_bytes()).expect("socket path");
+        let stream = TcpStream::connect(addr, handle).await.expect("connect");
+        NagoyaStream::new(stream)
+    }
+
     fn test_host() -> Host {
         Host {
             name: "test-host".into(),
@@ -599,254 +618,262 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn local_server_is_mcp_compatible_and_needs_no_session_or_token() {
-        let _guard = CONTROL_TEST_LOCK.lock().await;
-        let bridge: ControlBridge = Arc::new(|request| {
-            let (sender, receiver) = oneshot::channel();
-            assert!(matches!(
-                request,
-                ControlBridgeRequest::Agent(AgentControlRequest::Act(AgentAction::Click {
-                    node_id: 42
-                }))
-            ));
-            sender.send(DebugResponse::Ack).unwrap();
-            receiver
-        });
-        let server = AgentControlServer::start(bridge, test_host()).unwrap();
-        assert!(server.descriptor_path().is_file());
-        assert_eq!(
-            server
-                .descriptor_path()
-                .metadata()
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+    #[test]
+    fn local_server_is_mcp_compatible_and_needs_no_session_or_token() {
+        nagoya::block_on(async {
+            let _guard = CONTROL_TEST_LOCK.write().await;
+            let bridge: ControlBridge = Arc::new(|request| {
+                let answer = Once::new();
+                assert!(matches!(
+                    request,
+                    ControlBridgeRequest::Agent(AgentControlRequest::Act(AgentAction::Click {
+                        node_id: 42
+                    }))
+                ));
+                answer.fill(DebugResponse::Ack);
+                answer
+            });
+            let server = AgentControlServer::start(bridge, test_host()).unwrap();
+            assert!(server.descriptor_path().is_file());
+            assert_eq!(
+                server
+                    .descriptor_path()
+                    .metadata()
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
 
-        let stream = UnixStream::connect(server.socket_path()).await.unwrap();
-        let mut stream = TransportStream::new(framed_json(stream));
-        stream
-            .send(
-                encode_rpc(JsonRpcMessage::Request(JsonRpcRequest::call(
-                    JsonRpcId::Number(1),
-                    MCP_INITIALIZE,
-                    serde_json::json!({"protocolVersion": "2025-06-18"}),
-                )))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            decode_rpc(stream.recv().await.unwrap().unwrap()).unwrap(),
-            JsonRpcMessage::Response(_)
-        ));
-        stream
-            .send(
-                encode_rpc(JsonRpcMessage::Request(JsonRpcRequest::call(
-                    JsonRpcId::Number(2),
-                    MCP_TOOLS_LIST,
-                    serde_json::json!({}),
-                )))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            decode_rpc(stream.recv().await.unwrap().unwrap()).unwrap(),
-            JsonRpcMessage::Response(_)
-        ));
-        let id = JsonRpcId::Number(42);
-        stream
-            .send(
-                encode_agent_request(
-                    id.clone(),
-                    &AgentControlRequest::Act(AgentAction::Click { node_id: 42 }),
+            let stream = connect(server.socket_path()).await;
+            let mut stream = TransportStream::new(framed_json_neutral(stream));
+            stream
+                .send(
+                    encode_rpc(JsonRpcMessage::Request(JsonRpcRequest::call(
+                        JsonRpcId::Number(1),
+                        MCP_INITIALIZE,
+                        serde_json::json!({"protocolVersion": "2025-06-18"}),
+                    )))
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let response = stream.recv().await.unwrap().unwrap();
-        assert_eq!(decode_response(response).unwrap(), (id, DebugResponse::Ack));
-
-        let second = UnixStream::connect(server.socket_path()).await.unwrap();
-        let mut second = TransportStream::new(framed_json(second));
-        let id = JsonRpcId::String("second-observer".into());
-        second
-            .send(
-                encode_agent_request(
-                    id.clone(),
-                    &AgentControlRequest::Act(AgentAction::Click { node_id: 42 }),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            decode_response(second.recv().await.unwrap().unwrap()).unwrap(),
-            (id, DebugResponse::Ack)
-        );
-
-        drop(server);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn diagnostics_metrics_reach_the_runtime_bridge_over_mcp() {
-        let _guard = CONTROL_TEST_LOCK.lock().await;
-        let bridge: ControlBridge = Arc::new(|request| {
-            let (sender, receiver) = oneshot::channel();
-            assert!(matches!(
-                request,
-                ControlBridgeRequest::Diagnostics(DiagnosticsRequest::Metrics)
-            ));
-            sender
-                .send(DebugResponse::Metrics(RendererMetrics {
-                    resident_bytes: Some(8192),
-                    ..Default::default()
-                }))
+                .await
                 .unwrap();
-            receiver
+            assert!(matches!(
+                decode_rpc(stream.recv().await.unwrap().unwrap()).unwrap(),
+                JsonRpcMessage::Response(_)
+            ));
+            stream
+                .send(
+                    encode_rpc(JsonRpcMessage::Request(JsonRpcRequest::call(
+                        JsonRpcId::Number(2),
+                        MCP_TOOLS_LIST,
+                        serde_json::json!({}),
+                    )))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                decode_rpc(stream.recv().await.unwrap().unwrap()).unwrap(),
+                JsonRpcMessage::Response(_)
+            ));
+            let id = JsonRpcId::Number(42);
+            stream
+                .send(
+                    encode_agent_request(
+                        id.clone(),
+                        &AgentControlRequest::Act(AgentAction::Click { node_id: 42 }),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let response = stream.recv().await.unwrap().unwrap();
+            assert_eq!(decode_response(response).unwrap(), (id, DebugResponse::Ack));
+
+            let second = connect(server.socket_path()).await;
+            let mut second = TransportStream::new(framed_json_neutral(second));
+            let id = JsonRpcId::String("second-observer".into());
+            second
+                .send(
+                    encode_agent_request(
+                        id.clone(),
+                        &AgentControlRequest::Act(AgentAction::Click { node_id: 42 }),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                decode_response(second.recv().await.unwrap().unwrap()).unwrap(),
+                (id, DebugResponse::Ack)
+            );
+
+            drop(server);
         });
-        let server = AgentControlServer::start(bridge, test_host()).unwrap();
-        let stream = UnixStream::connect(server.socket_path()).await.unwrap();
-        let mut stream = TransportStream::new(framed_json(stream));
-        let id = JsonRpcId::Number(91);
+    }
 
-        stream
-            .send(encode_diagnostics_request(id.clone(), &DiagnosticsRequest::Metrics).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            decode_response(stream.recv().await.unwrap().unwrap()).unwrap(),
-            (
-                id,
-                DebugResponse::Metrics(RendererMetrics {
+    #[test]
+    fn diagnostics_metrics_reach_the_runtime_bridge_over_mcp() {
+        nagoya::block_on(async {
+            let _guard = CONTROL_TEST_LOCK.write().await;
+            let bridge: ControlBridge = Arc::new(|request| {
+                let answer = Once::new();
+                assert!(matches!(
+                    request,
+                    ControlBridgeRequest::Diagnostics(DiagnosticsRequest::Metrics)
+                ));
+                answer.fill(DebugResponse::Metrics(RendererMetrics {
                     resident_bytes: Some(8192),
                     ..Default::default()
-                })
-            )
-        );
-    }
+                }));
+                answer
+            });
+            let server = AgentControlServer::start(bridge, test_host()).unwrap();
+            let stream = connect(server.socket_path()).await;
+            let mut stream = TransportStream::new(framed_json_neutral(stream));
+            let id = JsonRpcId::Number(91);
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn observe_pushes_only_requested_latest_value_events() {
-        let _guard = CONTROL_TEST_LOCK.lock().await;
-        let bridge: ControlBridge = Arc::new(|_request| {
-            panic!("observe is connection-local and must not reach the UI bridge")
-        });
-        let (events, receiver) = watch::channel(None);
-        let server = AgentControlServer::start_with_events(bridge, test_host(), receiver).unwrap();
-        let stream = UnixStream::connect(server.socket_path()).await.unwrap();
-        let mut stream = TransportStream::new(framed_json(stream));
-        let id = JsonRpcId::Number(92);
+            stream
+                .send(encode_diagnostics_request(id.clone(), &DiagnosticsRequest::Metrics).unwrap())
+                .await
+                .unwrap();
 
-        stream
-            .send(
-                encode_diagnostics_request(
-                    id.clone(),
-                    &DiagnosticsRequest::Observe {
-                        streams: vec![DebugStream::Paint],
-                    },
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            decode_response(stream.recv().await.unwrap().unwrap()).unwrap(),
-            (id, DebugResponse::Ack)
-        );
-
-        let event = DebugEvent::PaintCommitted { revision: 7 };
-        events.send_replace(Some(event.clone()));
-        assert_eq!(
-            decode_diagnostics_event(stream.recv().await.unwrap().unwrap()).unwrap(),
-            event
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn large_snapshot_keeps_the_socket_open_for_follow_up_requests() {
-        let _guard = CONTROL_TEST_LOCK.lock().await;
-        const LARGE_DOM_BYTES: usize = 9 * 1024 * 1024;
-        let bridge: ControlBridge = Arc::new(|request| {
-            let (sender, receiver) = oneshot::channel();
-            let response = match request {
-                ControlBridgeRequest::Diagnostics(DiagnosticsRequest::Snapshot(_)) => {
-                    DebugResponse::Snapshot(DebugSnapshot {
-                        revisions: RevisionSet::default(),
-                        active_window: Some("main".into()),
-                        active_element: None,
-                        dom: Some(serde_json::Value::String("x".repeat(LARGE_DOM_BYTES))),
-                        layout: None,
-                        computed_style: None,
-                        metrics: RendererMetrics::default(),
+            assert_eq!(
+                decode_response(stream.recv().await.unwrap().unwrap()).unwrap(),
+                (
+                    id,
+                    DebugResponse::Metrics(RendererMetrics {
+                        resident_bytes: Some(8192),
+                        ..Default::default()
                     })
-                }
-                ControlBridgeRequest::Diagnostics(DiagnosticsRequest::Metrics) => {
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn observe_pushes_only_requested_latest_value_events() {
+        nagoya::block_on(async {
+            let _guard = CONTROL_TEST_LOCK.write().await;
+            let bridge: ControlBridge = Arc::new(|_request| {
+                panic!("observe is connection-local and must not reach the UI bridge")
+            });
+            let events = Latest::new();
+            let server =
+                AgentControlServer::start_with_events(bridge, test_host(), Arc::clone(&events))
+                    .unwrap();
+            let stream = connect(server.socket_path()).await;
+            let mut stream = TransportStream::new(framed_json_neutral(stream));
+            let id = JsonRpcId::Number(92);
+
+            stream
+                .send(
+                    encode_diagnostics_request(
+                        id.clone(),
+                        &DiagnosticsRequest::Observe {
+                            streams: vec![DebugStream::Paint],
+                        },
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                decode_response(stream.recv().await.unwrap().unwrap()).unwrap(),
+                (id, DebugResponse::Ack)
+            );
+
+            let event = DebugEvent::PaintCommitted { revision: 7 };
+            events.set(event.clone()).await;
+            assert_eq!(
+                decode_diagnostics_event(stream.recv().await.unwrap().unwrap()).unwrap(),
+                event
+            );
+        });
+    }
+
+    #[test]
+    fn large_snapshot_keeps_the_socket_open_for_follow_up_requests() {
+        nagoya::block_on(async {
+            let _guard = CONTROL_TEST_LOCK.write().await;
+            const LARGE_DOM_BYTES: usize = 9 * 1024 * 1024;
+            let bridge: ControlBridge = Arc::new(|request| {
+                let answer = Once::new();
+                let response = match request {
+                    ControlBridgeRequest::Diagnostics(DiagnosticsRequest::Snapshot(_)) => {
+                        DebugResponse::Snapshot(DebugSnapshot {
+                            revisions: RevisionSet::default(),
+                            active_window: Some("main".into()),
+                            active_element: None,
+                            dom: Some(serde_json::Value::String("x".repeat(LARGE_DOM_BYTES))),
+                            layout: None,
+                            computed_style: None,
+                            metrics: RendererMetrics::default(),
+                        })
+                    }
+                    ControlBridgeRequest::Diagnostics(DiagnosticsRequest::Metrics) => {
+                        DebugResponse::Metrics(RendererMetrics {
+                            resident_bytes: Some(4096),
+                            ..Default::default()
+                        })
+                    }
+                    _ => panic!("unexpected request"),
+                };
+                answer.fill(response);
+                answer
+            });
+            let server = AgentControlServer::start(bridge, test_host()).unwrap();
+            let stream = connect(server.socket_path()).await;
+            let mut stream = TransportStream::new(framed_json_neutral(stream));
+
+            let snapshot_id = JsonRpcId::Number(92);
+            stream
+                .send(
+                    encode_diagnostics_request(
+                        snapshot_id.clone(),
+                        &DiagnosticsRequest::Snapshot(SnapshotRequest {
+                            include_dom: true,
+                            include_layout: false,
+                            include_computed_style: false,
+                            node_ids: Vec::new(),
+                        }),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let (response_id, response) =
+                decode_response(stream.recv().await.unwrap().unwrap()).unwrap();
+            assert_eq!(response_id, snapshot_id);
+            let DebugResponse::Snapshot(snapshot) = response else {
+                panic!("expected a diagnostic snapshot")
+            };
+            assert_eq!(
+                snapshot.dom.unwrap().as_str().unwrap().len(),
+                LARGE_DOM_BYTES
+            );
+
+            let metrics_id = JsonRpcId::Number(93);
+            stream
+                .send(
+                    encode_diagnostics_request(metrics_id.clone(), &DiagnosticsRequest::Metrics)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                decode_response(stream.recv().await.unwrap().unwrap()).unwrap(),
+                (
+                    metrics_id,
                     DebugResponse::Metrics(RendererMetrics {
                         resident_bytes: Some(4096),
                         ..Default::default()
                     })
-                }
-                _ => panic!("unexpected request"),
-            };
-            sender.send(response).unwrap();
-            receiver
-        });
-        let server = AgentControlServer::start(bridge, test_host()).unwrap();
-        let stream = UnixStream::connect(server.socket_path()).await.unwrap();
-        let mut stream = TransportStream::new(framed_json(stream));
-
-        let snapshot_id = JsonRpcId::Number(92);
-        stream
-            .send(
-                encode_diagnostics_request(
-                    snapshot_id.clone(),
-                    &DiagnosticsRequest::Snapshot(SnapshotRequest {
-                        include_dom: true,
-                        include_layout: false,
-                        include_computed_style: false,
-                        node_ids: Vec::new(),
-                    }),
                 )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let (response_id, response) =
-            decode_response(stream.recv().await.unwrap().unwrap()).unwrap();
-        assert_eq!(response_id, snapshot_id);
-        let DebugResponse::Snapshot(snapshot) = response else {
-            panic!("expected a diagnostic snapshot")
-        };
-        assert_eq!(
-            snapshot.dom.unwrap().as_str().unwrap().len(),
-            LARGE_DOM_BYTES
-        );
-
-        let metrics_id = JsonRpcId::Number(93);
-        stream
-            .send(
-                encode_diagnostics_request(metrics_id.clone(), &DiagnosticsRequest::Metrics)
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            decode_response(stream.recv().await.unwrap().unwrap()).unwrap(),
-            (
-                metrics_id,
-                DebugResponse::Metrics(RendererMetrics {
-                    resident_bytes: Some(4096),
-                    ..Default::default()
-                })
-            )
-        );
+            );
+        });
     }
 
     #[test]
@@ -928,27 +955,29 @@ mod tests {
     /// removes both files, and losing that assertion would lose the property.
     /// Leaving either behind advertises a host that is not there, and a client
     /// that finds a stale descriptor attaches to a socket nobody is serving.
-    #[tokio::test(flavor = "current_thread")]
-    async fn teardown_removes_the_socket_and_the_descriptor() {
-        let _guard = CONTROL_TEST_LOCK.lock().await;
-        let bridge: ControlBridge = Arc::new(|_request| {
-            let (sender, receiver) = oneshot::channel();
-            sender.send(DebugResponse::Ack).unwrap();
-            receiver
+    #[test]
+    fn teardown_removes_the_socket_and_the_descriptor() {
+        nagoya::block_on(async {
+            let _guard = CONTROL_TEST_LOCK.write().await;
+            let bridge: ControlBridge = Arc::new(|_request| {
+                let answer = Once::new();
+                answer.fill(DebugResponse::Ack);
+                answer
+            });
+            let server = AgentControlServer::start(bridge, test_host()).unwrap();
+            let descriptor = server.descriptor_path().to_path_buf();
+            let socket = server.socket_path().to_path_buf();
+            assert!(descriptor.is_file(), "the descriptor was not published");
+            assert!(socket.exists(), "the socket was not bound");
+
+            drop(server);
+
+            assert!(!socket.exists(), "the socket outlived the server");
+            assert!(
+                !descriptor.exists(),
+                "the descriptor outlived the server, so a client can still find it"
+            );
         });
-        let server = AgentControlServer::start(bridge, test_host()).unwrap();
-        let descriptor = server.descriptor_path().to_path_buf();
-        let socket = server.socket_path().to_path_buf();
-        assert!(descriptor.is_file(), "the descriptor was not published");
-        assert!(socket.exists(), "the socket was not bound");
-
-        drop(server);
-
-        assert!(!socket.exists(), "the socket outlived the server");
-        assert!(
-            !descriptor.exists(),
-            "the descriptor outlived the server, so a client can still find it"
-        );
     }
 
     /// What the tool list says is the host's answer, not this crate's.
@@ -956,98 +985,102 @@ mod tests {
     /// It used to be `cfg!(feature = "diagnostics")` read off the crate that
     /// happened to contain the server. There are three hosts now and the
     /// transport is in none of them.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_host_that_cannot_collect_diagnostics_does_not_advertise_them() {
-        let _guard = CONTROL_TEST_LOCK.lock().await;
-        let bridge: ControlBridge = Arc::new(|_request| {
-            let (sender, receiver) = oneshot::channel();
-            sender.send(DebugResponse::Ack).unwrap();
-            receiver
-        });
-        let server = AgentControlServer::start(
-            bridge,
-            Host {
-                name: "plain-host".into(),
-                version: "9.9.9".into(),
-                diagnostics: false,
-            },
-        )
-        .unwrap();
-
-        let stream = UnixStream::connect(server.socket_path()).await.unwrap();
-        let mut stream = TransportStream::new(framed_json(stream));
-        stream
-            .send(
-                encode_rpc(JsonRpcMessage::Request(JsonRpcRequest::call(
-                    JsonRpcId::Number(1),
-                    MCP_TOOLS_LIST,
-                    serde_json::json!({}),
-                )))
-                .unwrap(),
+    #[test]
+    fn a_host_that_cannot_collect_diagnostics_does_not_advertise_them() {
+        nagoya::block_on(async {
+            let _guard = CONTROL_TEST_LOCK.write().await;
+            let bridge: ControlBridge = Arc::new(|_request| {
+                let answer = Once::new();
+                answer.fill(DebugResponse::Ack);
+                answer
+            });
+            let server = AgentControlServer::start(
+                bridge,
+                Host {
+                    name: "plain-host".into(),
+                    version: "9.9.9".into(),
+                    diagnostics: false,
+                },
             )
-            .await
             .unwrap();
-        let JsonRpcMessage::Response(response) =
-            decode_rpc(stream.recv().await.unwrap().unwrap()).unwrap()
-        else {
-            panic!("tools/list should be a response")
-        };
-        let tools = response.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(
-            tools, 1,
-            "a host that cannot collect diagnostics must not offer the tool: \
+
+            let stream = connect(server.socket_path()).await;
+            let mut stream = TransportStream::new(framed_json_neutral(stream));
+            stream
+                .send(
+                    encode_rpc(JsonRpcMessage::Request(JsonRpcRequest::call(
+                        JsonRpcId::Number(1),
+                        MCP_TOOLS_LIST,
+                        serde_json::json!({}),
+                    )))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let JsonRpcMessage::Response(response) =
+                decode_rpc(stream.recv().await.unwrap().unwrap()).unwrap()
+            else {
+                panic!("tools/list should be a response")
+            };
+            let tools = response.result.unwrap()["tools"].as_array().unwrap().len();
+            assert_eq!(
+                tools, 1,
+                "a host that cannot collect diagnostics must not offer the tool: \
              a client reports the application as broken rather than as a plain \
              build"
-        );
+            );
+        });
     }
 
     /// The host names itself in the handshake.
-    #[tokio::test(flavor = "current_thread")]
-    async fn initialize_reports_the_host_rather_than_the_transport() {
-        let _guard = CONTROL_TEST_LOCK.lock().await;
-        let bridge: ControlBridge = Arc::new(|_request| {
-            let (sender, receiver) = oneshot::channel();
-            sender.send(DebugResponse::Ack).unwrap();
-            receiver
-        });
-        let server = AgentControlServer::start(
-            bridge,
-            Host {
-                name: "chuzz-headless".into(),
-                version: "1.2.3".into(),
-                diagnostics: true,
-            },
-        )
-        .unwrap();
-
-        let stream = UnixStream::connect(server.socket_path()).await.unwrap();
-        let mut stream = TransportStream::new(framed_json(stream));
-        stream
-            .send(
-                encode_rpc(JsonRpcMessage::Request(JsonRpcRequest::call(
-                    JsonRpcId::Number(1),
-                    MCP_INITIALIZE,
-                    serde_json::json!({"protocolVersion": "2025-06-18"}),
-                )))
-                .unwrap(),
+    #[test]
+    fn initialize_reports_the_host_rather_than_the_transport() {
+        nagoya::block_on(async {
+            let _guard = CONTROL_TEST_LOCK.write().await;
+            let bridge: ControlBridge = Arc::new(|_request| {
+                let answer = Once::new();
+                answer.fill(DebugResponse::Ack);
+                answer
+            });
+            let server = AgentControlServer::start(
+                bridge,
+                Host {
+                    name: "chuzz-headless".into(),
+                    version: "1.2.3".into(),
+                    diagnostics: true,
+                },
             )
-            .await
             .unwrap();
-        let JsonRpcMessage::Response(response) =
-            decode_rpc(stream.recv().await.unwrap().unwrap()).unwrap()
-        else {
-            panic!("initialize should be a response")
-        };
-        let result = response.result.unwrap();
-        assert_eq!(result["serverInfo"]["name"], "chuzz-headless");
-        assert_eq!(result["serverInfo"]["version"], "1.2.3");
 
-        let descriptor: DebugDescriptor =
-            serde_json::from_str(&std::fs::read_to_string(server.descriptor_path()).unwrap())
+            let stream = connect(server.socket_path()).await;
+            let mut stream = TransportStream::new(framed_json_neutral(stream));
+            stream
+                .send(
+                    encode_rpc(JsonRpcMessage::Request(JsonRpcRequest::call(
+                        JsonRpcId::Number(1),
+                        MCP_INITIALIZE,
+                        serde_json::json!({"protocolVersion": "2025-06-18"}),
+                    )))
+                    .unwrap(),
+                )
+                .await
                 .unwrap();
-        assert_eq!(
-            descriptor.renderer_revision, "1.2.3",
-            "the descriptor reports the host's version, not the protocol crate's"
-        );
+            let JsonRpcMessage::Response(response) =
+                decode_rpc(stream.recv().await.unwrap().unwrap()).unwrap()
+            else {
+                panic!("initialize should be a response")
+            };
+            let result = response.result.unwrap();
+            assert_eq!(result["serverInfo"]["name"], "chuzz-headless");
+            assert_eq!(result["serverInfo"]["version"], "1.2.3");
+
+            let descriptor: DebugDescriptor =
+                serde_json::from_str(&std::fs::read_to_string(server.descriptor_path()).unwrap())
+                    .unwrap();
+            assert_eq!(
+                descriptor.renderer_revision, "1.2.3",
+                "the descriptor reports the host's version, not the protocol crate's"
+            );
+        });
     }
 }
