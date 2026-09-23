@@ -6721,13 +6721,20 @@ mod tests {
     async fn serve_silent_host(socket: std::path::PathBuf, nodes: Vec<SemanticNode>) {
         use blitz_control_protocol::{
             DebugResponse, IncomingRequest, MessageStream, TransportStream, decode_incoming,
-            encode_initialize_response, encode_response, framed_json,
+            encode_initialize_response, encode_response,
         };
-        use tokio::net::UnixListener;
+        use blitz_control_protocol::{NagoyaStream, framed_json_neutral};
+        use nagoya::reactor::{Addr, Reactor, TcpListener};
+        use std::os::unix::ffi::OsStrExt;
 
-        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        // A reactor of its own: the fixture drives the server end while the
+        // test drives the client, and a nagoya socket only progresses while the
+        // reactor it was created on is polled.
+        let reactor = Reactor::start().expect("fixture reactor");
+        let addr = Addr::path(socket.as_os_str().as_bytes()).expect("socket path");
+        let listener = TcpListener::bind(addr, &reactor.handle()).expect("bind test socket");
         let (stream, _) = listener.accept().await.expect("accept test client");
-        let mut stream = TransportStream::new(framed_json(stream));
+        let mut stream = TransportStream::new(framed_json_neutral(NagoyaStream::new(stream)));
         while let Some(Ok(message)) = stream.recv().await {
             let answer = match decode_incoming(message) {
                 Ok(IncomingRequest::Initialize { id }) => {

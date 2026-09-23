@@ -1300,33 +1300,19 @@ pub fn decode_rpc(message: WireMessage) -> Result<JsonRpcMessage, DebugProtocolE
     parse(&text).map_err(DebugProtocolError::Rpc)
 }
 
-#[cfg(feature = "tokio-framing")]
-/// The framing the control socket speaks, over a tokio stream.
+/// The framing the control socket speaks, and the socket type it speaks over.
 ///
-/// Behind `server` or `client`, the two features that put tokio in the graph: a
-/// build that only reads the semantic tree has no socket to frame.
-///
-/// endpoint-libs 3.2 removed `framed_json` along with its tokio flavour.
-/// `framed_json_neutral` replaces it but takes a `futures_io` stream, and every
-/// caller in this workspace holds a tokio one, so the `compat` bridge lives here
-/// once rather than at each call site. The codec on the wire is unchanged.
-pub fn framed_json<S>(
-    stream: S,
-) -> impl Transport<WireMessage, WireMessage, TransportError = FramedError> + Unpin + Send
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    use tokio_util::compat::TokioAsyncReadCompatExt;
-    framed_json_neutral(stream.compat())
-}
+/// Re-exported so a consumer that serves or fakes this protocol does not have to
+/// depend on endpoint-libs and nagoya directly to name the two halves of a
+/// connection. There is no tokio bridge here any more: the transport is nagoya
+/// end to end.
+#[cfg(any(feature = "server", feature = "client"))]
+pub use endpoint_libs::libs::ws::transport::nagoya::NagoyaStream;
 
 #[cfg(test)]
 mod tests {
     use endpoint_libs::libs::ws::MessageStream;
     use endpoint_libs::libs::ws::transport::TransportStream;
-
-    #[cfg(feature = "tokio-framing")]
-    use super::framed_json;
 
     use super::*;
 
@@ -1463,27 +1449,6 @@ mod tests {
             value["params"]["arguments"]["params"]["params"]["node_id"],
             9
         );
-    }
-
-    /// Gated with the shim it exercises: the duplex pipe is tokio's, and there
-    /// is no nagoya equivalent to write it against. The codec under test is the
-    /// same one the sockets use either way.
-    #[cfg(feature = "tokio-framing")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn endpoint_framing_carries_debug_frames_without_a_session_or_token() {
-        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-        let mut server = TransportStream::new(framed_json(server_io));
-        let mut client = TransportStream::new(framed_json(client_io));
-        let request = key_request();
-        let id = JsonRpcId::String("input-7".into());
-
-        client
-            .send(encode_agent_request(id.clone(), &request).unwrap())
-            .await
-            .unwrap();
-        let received = server.recv().await.unwrap().unwrap();
-
-        assert_eq!(decode_agent_request(received).unwrap(), (id, request));
     }
 
     #[test]

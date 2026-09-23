@@ -66,18 +66,10 @@ capture = [
 server = ["dep:nagoya", "dep:futures"]
 client = ["dep:eyre", "dep:nagoya", "dep:futures"]
 
-# The tokio-stream framing shim, for consumers that still hold tokio streams.
-# Nothing in this crate needs it any more: the server and the client both speak
-# to nagoya sockets. It stays because ps-qa and chuzz frame tokio streams of
-# their own, and it is a feature so that depending on this crate does not put
-# tokio in a graph that had got rid of it.
-tokio-framing = ["dep:tokio", "dep:tokio-util"]
-
 [dependencies]
 endpoint-libs.workspace = true
 nagoya = { version = "^0.1.11", features = ["reactor"], optional = true }
 futures = { version = "^0.3", optional = true }
-tokio-util = { version = "^0.7", features = ["compat"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
@@ -108,24 +100,8 @@ blitz-paint = { package = "ps-blitz-paint", version = "^0.4.8", optional = true 
 blitz-shell = { package = "ps-blitz-shell", version = "^0.4.8", default-features = false, optional = true }
 base64 = { version = "0.22", optional = true }
 
-# Both transports. A listener and a connector need the same runtime and the
-# same framing, and nothing else.
-tokio = { version = "1", features = [
-    "io-util",
-    "macros",
-    "net",
-    "rt",
-    "sync",
-    "time",
-], optional = true }
 eyre = { version = "0.6", optional = true }
 
-[dev-dependencies]
-# The framing round-trip test drives a real duplex pipe rather than asserting
-# on a string, because the bug this protocol keeps hitting is at the seam
-# between the typed value and the bytes, not inside serde.
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
-tokio-util = { version = "^0.7", features = ["compat"] }
 
 [package.metadata.docs.rs]
 all-features = true
