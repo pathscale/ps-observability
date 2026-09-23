@@ -126,6 +126,28 @@ impl<T> Once<T> {
         })
     }
 
+    /// Fill the slot from a synchronous context, and wake the receiver.
+    ///
+    /// The bridge closure is not async: a host that already holds the answer
+    /// replies without awaiting, and one that does not hands the `Once` to
+    /// whatever will. Contention is only against a receiver taking the value,
+    /// so `try_write` either succeeds immediately or means the answer was
+    /// already delivered; either way there is nothing to wait for.
+    ///
+    /// Returns whether the value was stored.
+    pub fn fill(&self, value: T) -> bool {
+        let Some(mut state) = self.state.try_write() else {
+            return false;
+        };
+        if state.0.is_some() || state.1 {
+            return false;
+        }
+        state.0 = Some(value);
+        state.1 = true;
+        drop(state);
+        self.ready.notify_waiters();
+        true
+    }
     /// Fill the slot and wake the receiver. A second send is ignored.
     pub async fn send(&self, value: T) {
         {
@@ -181,7 +203,6 @@ impl<T> Once<T> {
         }
     }
 }
-
 
 /// A one-way flag, settable without a runtime.
 ///
