@@ -358,7 +358,8 @@ pub enum Command {
 
     /// Scroll a named node into view, reporting its y before and after.
     Reveal {
-        /// Match the node whose accessible name contains this.
+        /// Match the node whose accessible name contains this, or a selector
+        /// as `click` takes it: `#dom-id`, `@slot`, `role:name`.
         name: String,
     },
 
