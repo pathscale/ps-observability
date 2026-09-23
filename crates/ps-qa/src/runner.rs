@@ -5988,7 +5988,14 @@ pub async fn run() -> Result<()> {
             let Some(target) = snapshot
                 .nodes
                 .iter()
-                .find(|node| node.name.contains(&name) && node.bounds.is_some())
+                // The selector grammar `click` takes, so `reveal '#id'` then
+                // `click '#id'` address the same node. Name-only matching made
+                // chuzz's `reveal '#chuzz-agent-control-off'` fail with "no
+                // node named" while the button was on screen.
+                .find(|node| {
+                    (selector_matches_node(node, &name) || node.name.contains(&name))
+                        && node.bounds.is_some()
+                })
             else {
                 bail!("no node named {name:?}");
             };
