@@ -63,11 +63,13 @@ capture = [
     # for the script half of the same capture.
     "blitz-shell/debug-control",
 ]
-server = ["dep:tokio", "dep:tokio-util"]
-client = ["dep:eyre", "dep:tokio", "dep:tokio-util"]
+server = ["dep:tokio", "dep:tokio-util", "dep:nagoya", "dep:futures"]
+client = ["dep:eyre", "dep:tokio", "dep:tokio-util", "dep:nagoya", "dep:futures"]
 
 [dependencies]
 endpoint-libs.workspace = true
+nagoya = { version = "^0.1.11", features = ["reactor"], optional = true }
+futures = { version = "^0.3", optional = true }
 tokio-util = { version = "^0.7", features = ["compat"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
