@@ -80,6 +80,9 @@ pub mod document;
 pub mod in_process;
 /// The embedder's answer to a request about the process, not the document.
 pub mod lifecycle;
+/// Latest-value and one-shot handoffs built on nagoya, replacing tokio channels.
+#[cfg(any(feature = "server", feature = "client"))]
+pub mod latest;
 /// The socket transport, listening half.
 ///
 /// Unix only. The transport is a Unix domain socket with owner-only
