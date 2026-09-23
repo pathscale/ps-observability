@@ -19,7 +19,10 @@ mod sweep;
 mod target;
 mod timing;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> eyre::Result<()> {
-    runner::run().await
+// nagoya, not tokio. The inspector connection is a nagoya socket now, and a
+// tokio executor polling that future never sees the readiness the nagoya
+// reactor owns: the request is written and the reply never arrives. One
+// runtime drives the whole client.
+fn main() -> eyre::Result<()> {
+    nagoya::block_on(runner::run())
 }

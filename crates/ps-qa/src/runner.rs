@@ -63,7 +63,7 @@ async fn wait_for_arrival(
     want_here: &str,
     within: Duration,
 ) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + within;
+    let deadline = std::time::Instant::now() + within;
     let mut painted_streak = 0;
     let mut root = None;
     loop {
@@ -90,10 +90,10 @@ async fn wait_for_arrival(
         if stable_arrival(&mut painted_streak, arrived) {
             return Ok(true);
         }
-        if tokio::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        nagoya::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -109,7 +109,7 @@ async fn wait_for_visible_arrival(
     want_here: &str,
     within: Duration,
 ) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + within;
+    let deadline = std::time::Instant::now() + within;
     let mut painted_streak = 0;
     loop {
         let (tree, _) = inspect(client).await?;
@@ -117,10 +117,10 @@ async fn wait_for_visible_arrival(
         if stable_arrival(&mut painted_streak, arrived) {
             return Ok(true);
         }
-        if tokio::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        nagoya::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -185,7 +185,7 @@ async fn wait_for_navigation_arrival(
     if !named_document {
         return wait_for_arrival(client, destination, want_here, within).await;
     }
-    let deadline = tokio::time::Instant::now() + within;
+    let deadline = std::time::Instant::now() + within;
     let mut painted_streak = 0;
     let mut selected_tab = None;
     loop {
@@ -227,10 +227,10 @@ async fn wait_for_navigation_arrival(
         if stable_arrival(&mut painted_streak, arrived) {
             return Ok(true);
         }
-        if tokio::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        nagoya::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -258,20 +258,20 @@ async fn wait_for_semantic_condition(
     within: Duration,
     mut matches: impl FnMut(&[SemanticNode]) -> bool,
 ) -> Result<AgentSnapshot> {
-    let deadline = tokio::time::Instant::now() + within;
+    let deadline = std::time::Instant::now() + within;
     let event_driven = client.arm_paint_events().await.unwrap_or(false);
     loop {
         let snapshot = inspect(client).await?.0;
-        if matches(&snapshot.nodes) || tokio::time::Instant::now() >= deadline {
+        if matches(&snapshot.nodes) || std::time::Instant::now() >= deadline {
             return Ok(snapshot);
         }
         if event_driven {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if !remaining.is_zero() {
                 let _ = client.wait_for_paint(remaining).await?;
             }
         } else {
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            nagoya::sleep(Duration::from_millis(25)).await;
         }
     }
 }
@@ -690,13 +690,13 @@ async fn capture_stable_region(
     // renderer's capture work. A CPU-backed regional capture can legitimately
     // take longer than one refresh interval; charging that work to the quiet
     // deadline made an unchanged frame fail before four samples existed.
-    let mut deadline = tokio::time::Instant::now() + settle_timeout;
+    let mut deadline = std::time::Instant::now() + settle_timeout;
     let mut matching = 1;
     loop {
-        tokio::time::sleep(Duration::from_millis(16)).await;
-        let capture_started = tokio::time::Instant::now();
+        nagoya::sleep(Duration::from_millis(16)).await;
+        let capture_started = std::time::Instant::now();
         let current = capture_node_region(client, node_id, selector).await?;
-        deadline += tokio::time::Instant::now().duration_since(capture_started);
+        deadline += std::time::Instant::now().duration_since(capture_started);
         let held =
             captured_pixels_hold(&previous, &current, CAPTURE_CHANNEL_TOLERANCE).unwrap_or(false);
         if cli::trace_capture() {
@@ -716,7 +716,7 @@ async fn capture_stable_region(
         } else {
             matching = 1;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             let detail = if previous.width != current.width || previous.height != current.height {
                 format!(
                     "; last frame changed size from {}x{} to {}x{}",
@@ -750,13 +750,13 @@ async fn wait_for_pixels_change(
     before: &CapturedImage,
     timeout: Duration,
 ) -> std::result::Result<(), String> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = std::time::Instant::now() + timeout;
 
     loop {
         let after = capture_region(client, selector).await?;
-        match assess_pixel_change(before, &after, tokio::time::Instant::now() >= deadline)? {
+        match assess_pixel_change(before, &after, std::time::Instant::now() >= deadline)? {
             Some(()) => return Ok(()),
-            None => tokio::time::sleep(Duration::from_millis(8)).await,
+            None => nagoya::sleep(Duration::from_millis(8)).await,
         }
     }
 }
@@ -1593,7 +1593,7 @@ async fn run_qa(
                 let _ = wait_for_arrival(client, None, next, check_timeout(900)).await?;
             }
             if open_error.is_none() && check.prepare_wait_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(check.prepare_wait_ms)).await;
+                nagoya::sleep(Duration::from_millis(check.prepare_wait_ms)).await;
             }
         }
 
@@ -2231,7 +2231,7 @@ async fn run_qa(
             retries,
         });
         if check.settle_after_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(check.settle_after_ms)).await;
+            nagoya::sleep(Duration::from_millis(check.settle_after_ms)).await;
         }
     }
 
@@ -2343,13 +2343,13 @@ fn outcome_verdict(
 #[derive(Default)]
 struct OutcomeStability {
     fingerprint: Option<u64>,
-    since: Option<tokio::time::Instant>,
+    since: Option<std::time::Instant>,
 }
 
 impl OutcomeStability {
     fn observe(
         &mut self,
-        now: tokio::time::Instant,
+        now: std::time::Instant,
         fingerprint: u64,
         passing: bool,
         required: Duration,
@@ -2371,7 +2371,7 @@ impl OutcomeStability {
             .is_some_and(|since| now.duration_since(since) >= required)
     }
 
-    fn remaining(&self, now: tokio::time::Instant, required: Duration) -> Duration {
+    fn remaining(&self, now: std::time::Instant, required: Duration) -> Duration {
         self.since
             .map(|since| required.saturating_sub(now.saturating_duration_since(since)))
             .unwrap_or_default()
@@ -2529,7 +2529,7 @@ async fn wait_for_contrast(
                 .await
                 .map_err(|error| error.to_string())?;
         } else {
-            tokio::time::sleep(wait.min(Duration::from_millis(25))).await;
+            nagoya::sleep(wait.min(Duration::from_millis(25))).await;
         }
     }
 }
@@ -2544,14 +2544,14 @@ async fn settle_for_outcome(
     already_armed: bool,
 ) -> Result<(AgentSnapshot, Option<String>, u32)> {
     let outcome_timeout = declared_outcome_timeout(check);
-    let deadline = tokio::time::Instant::now() + outcome_timeout;
+    let deadline = std::time::Instant::now() + outcome_timeout;
     let stable_for = Duration::from_millis(check.stable_for_ms);
     let mut stability = OutcomeStability::default();
     let mut iterations = 0;
     let mut scope = outcome_poll_scope(before);
     // When the whole tree was last serialised, so a scoped poll cannot go
     // permanently blind to the rest of the page. See the interval below.
-    let mut last_full_probe: Option<tokio::time::Instant> = None;
+    let mut last_full_probe: Option<std::time::Instant> = None;
     // Arming discards the frames already queued, which is right before an
     // action and wrong after one: the commit this loop is waiting for may
     // already have arrived. A caller that armed before driving says so.
@@ -2576,7 +2576,7 @@ async fn settle_for_outcome(
             inspect(client).await?.0
         };
         iterations += 1;
-        let now = tokio::time::Instant::now();
+        let now = std::time::Instant::now();
         let mut passing = outcome_verdict(
             check,
             before,
@@ -2651,7 +2651,7 @@ async fn settle_for_outcome(
                 let _ = client.wait_for_paint(wait).await?;
             }
         } else {
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            nagoya::sleep(Duration::from_millis(25)).await;
         }
     }
 }
@@ -5256,7 +5256,7 @@ async fn run_cover(
              * control in the error and stop before a transport failure is
              * multiplied by the rest of the plan.
              */
-            let activation = tokio::time::timeout(check_timeout(900), click_by_id(client, id))
+            let activation = nagoya::timeout(check_timeout(900), click_by_id(client, id))
                 .await
                 .map_err(|_| {
                     eyre!(
@@ -5615,7 +5615,7 @@ pub async fn run() -> Result<()> {
         cli::Command::Drift { seconds } => {
             let before = metrics(&mut client).await?;
             println!("== holding still for {seconds}s, nothing driven ==");
-            tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+            nagoya::sleep(Duration::from_secs_f64(seconds)).await;
             let after = metrics(&mut client).await?;
             let frames_of =
                 |m: &RendererMetrics| m.frame_window.as_ref().map(|w| w.frames_total).unwrap_or(0);
@@ -5912,7 +5912,7 @@ pub async fn run() -> Result<()> {
             checks,
             max_seconds,
         } => {
-            let result = tokio::time::timeout(
+            let result = nagoya::timeout(
                 Duration::from_secs(max_seconds),
                 run_cover(
                     &mut client,
@@ -6097,7 +6097,7 @@ mod tests {
 
     #[test]
     fn outcome_stability_restarts_when_late_content_changes_the_document() {
-        let start = tokio::time::Instant::now();
+        let start = std::time::Instant::now();
         let required = Duration::from_millis(150);
         let mut stability = OutcomeStability::default();
 
@@ -6110,7 +6110,7 @@ mod tests {
 
     #[test]
     fn failed_outcome_clears_a_partial_stability_window() {
-        let start = tokio::time::Instant::now();
+        let start = std::time::Instant::now();
         let required = Duration::from_millis(100);
         let mut stability = OutcomeStability::default();
 
@@ -6122,7 +6122,7 @@ mod tests {
 
     #[test]
     fn outcome_stability_waits_only_for_the_unproven_part_of_its_window() {
-        let start = tokio::time::Instant::now();
+        let start = std::time::Instant::now();
         let required = Duration::from_millis(100);
         let mut stability = OutcomeStability::default();
 
@@ -6771,8 +6771,12 @@ mod tests {
     /// 3004ms against 3000. The first half of this test is that constant. The
     /// second is the path the runner takes now, against the same silent host
     /// and the same budget.
-    #[tokio::test(flavor = "current_thread")]
-    async fn the_outcome_path_does_not_spend_the_declared_budget_waiting_for_a_frame() {
+    #[test]
+    fn the_outcome_path_does_not_spend_the_declared_budget_waiting_for_a_frame() {
+        nagoya::block_on(the_outcome_path_does_not_spend_the_declared_budget());
+    }
+
+    async fn the_outcome_path_does_not_spend_the_declared_budget() {
         let socket = std::env::temp_dir().join(format!(
             "ps-qa-silent-host-{}-{}.sock",
             std::process::id(),
@@ -6843,7 +6847,7 @@ mod tests {
             );
         };
 
-        tokio::join!(host, driver);
+        futures::join!(host, driver);
         let _ = std::fs::remove_file(socket);
     }
 
