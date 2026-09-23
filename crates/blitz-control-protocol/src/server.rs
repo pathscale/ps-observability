@@ -35,7 +35,7 @@ pub enum ControlBridgeRequest {
 ///
 /// It used to read this off its own cargo features: the tool list advertised
 /// diagnostics when the crate had been built with them, and `serverInfo` said
-/// `tauri-runtime-blitz` because that is where the code lived. Both were
+/// `tauri-runtime-blitz` (now izumo) because that is where the code lived. Both were
 /// guesses that happened to hold while there was one host.
 ///
 /// There are three now, and none of them is this crate. The window runtime,

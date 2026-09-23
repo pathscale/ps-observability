@@ -4,7 +4,7 @@ Typed observability commands, events, snapshots, diagnostics, and MCP wire
 encoding for Blitz applications.
 
 The crate deliberately has no renderer or window dependency. A driver can use
-it to speak the exact protocol served by `tauri-runtime-blitz` without building
+it to speak the exact protocol served by `izumo` without building
 a browser engine. Clients must compare a discovered descriptor's
 `protocolVersion` with `DEBUG_PROTOCOL_VERSION` before connecting.
 

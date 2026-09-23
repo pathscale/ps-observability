@@ -11,7 +11,7 @@
 //! rather than inside a host, because more than one host serves the same
 //! request: the Tauri runtime does it for a window today, and an embedder that
 //! drives a browser in process will do it for that browser next. It used to
-//! live in `tauri-runtime-blitz`, which meant an application registered a
+//! live in `izumo`, which meant an application registered a
 //! handler for an inspection service through a window runtime, and named the
 //! protocol's types through that runtime's re-export of this crate. Depending
 //! on a renderer to answer "restart yourself" is the edge this removes.

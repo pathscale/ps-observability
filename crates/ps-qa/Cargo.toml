@@ -19,7 +19,7 @@ publish = true
 # Nothing here may pull in tauri, winit, wgpu or blitz. The protocol types come
 # from `blitz-control-protocol` precisely so this binary can speak the wire
 # without building the renderer that serves it; depending on
-# `tauri-runtime-blitz` for the same types would build a browser engine to send
+# `izumo` for the same types would build a browser engine to send
 # a wheel event. `cargo tree -p ps-qa` is the check.
 [dependencies]
 nagoya = { version = "^0.1", features = ["reactor"] }
