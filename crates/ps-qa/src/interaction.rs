@@ -80,12 +80,20 @@ pub(crate) async fn pointer_drag(
     dy: f64,
     steps: u32,
     cancel: bool,
+    to: Option<&str>,
 ) -> Result<()> {
     if !dx.is_finite() || !dy.is_finite() || steps == 0 || steps > 240 {
         bail!("pointer drag needs finite offsets and 1..=240 steps");
     }
+    let destination = if let Some(to) = to {
+        let (_, bounds) = locate_control(client, to, &[]).await?;
+        Some((bounds[0] + bounds[2] / 2.0, bounds[1] + bounds[3] / 2.0))
+    } else {
+        None
+    };
     let (_, bounds) = locate_control(client, want, &[]).await?;
     let start = (bounds[0] + bounds[2] / 2.0, bounds[1] + bounds[3] / 2.0);
+    let (dx, dy) = destination.map_or((dx, dy), |end| (end.0 - start.0, end.1 - start.1));
     let request = |phase, x, y| {
         AgentControlRequest::Act(AgentAction::Input(InputCommand::Pointer {
             phase,

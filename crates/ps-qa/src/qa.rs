@@ -354,7 +354,14 @@ pub enum Expect {
 #[serde(deny_unknown_fields)]
 pub struct PointerDrag {
     pub from: String,
+    /// Optional painted destination; its center determines the drag offset.
+    /// This lets a QA page expose data-derived coordinates without copying them
+    /// into a static check manifest.
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
     pub dx: f64,
+    #[serde(default)]
     pub dy: f64,
     pub steps: u32,
     #[serde(default)]
@@ -851,6 +858,17 @@ fn validate_check(
     if check.scroll_over.is_some() && (check.scroll_ticks == 0 || check.scroll_delta == 0.0) {
         return Err(format!(
             "{}: check {:?} must declare non-zero scroll_ticks and scroll_delta with scroll_over",
+            file.display(),
+            check.id,
+        ));
+    }
+
+    if let Some(drag) = &check.pointer_drag
+        && let Some(to) = &drag.to
+        && (to.is_empty() || drag.dx != 0.0 || drag.dy != 0.0)
+    {
+        return Err(format!(
+            "{}: check {:?} must use either a non-empty pointer drag destination or dx/dy offsets",
             file.display(),
             check.id,
         ));
@@ -1711,10 +1729,12 @@ fn action_description(check: &Check) -> String {
     }
     if let Some(drag) = &check.pointer_drag {
         let description = format!(
-            "drag {:?} by {},{} in {} steps{}",
+            "drag {:?} {} in {} steps{}",
             drag.from,
-            drag.dx,
-            drag.dy,
+            drag.to.as_ref().map_or_else(
+                || format!("by {},{}", drag.dx, drag.dy),
+                |to| format!("to {to:?}"),
+            ),
             drag.steps,
             if drag.cancel {
                 " and cancel"
@@ -2055,6 +2075,24 @@ mod tests {
             action_description(&check),
             "prepare-press \"Draft\", activate \"Save\""
         );
+    }
+
+    #[test]
+    fn a_drag_can_name_its_painted_destination() {
+        let mut check =
+            parse("pointer_drag:Some((from:\"button:Piece\",to:Some(\"#target\"),steps:12)),");
+        check.click = None;
+        let drag = check.pointer_drag.as_ref().expect("drag is configured");
+        assert_eq!(drag.to.as_deref(), Some("#target"));
+        assert_eq!(drag.dx, 0.0);
+        assert_eq!(drag.dy, 0.0);
+        assert!(action_description(&check).contains("drag \"button:Piece\" to \"#target\""));
+
+        let mut invalid = check.clone();
+        invalid.pointer_drag.as_mut().unwrap().dx = 20.0;
+        let error = validate_check(&invalid, Path::new("drag.ron"), &mut HashMap::new())
+            .expect_err("a named destination and displacement are ambiguous");
+        assert!(error.contains("either a non-empty pointer drag destination or dx/dy"));
     }
 
     #[test]

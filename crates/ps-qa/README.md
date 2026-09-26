@@ -125,6 +125,11 @@ name, `click --id` selects the intended row without coordinates.
 
 For repeatable drag outcomes, declare
 `pointer_drag: Some((from: "button:Drag handle", dx: 60.0, dy: 30.0, steps: 3))`
+can instead use a painted destination:
+`pointer_drag: Some((from: "button:Drag handle", to: Some("#target"), steps: 12))`.
+ps-qa resolves both centers at run time, so a data-derived target can move
+without copying its coordinates into the check file. Use either `to` or
+`dx`/`dy` for one drag.
 on a check, then assert the resulting state through `subject` and `expect`.
 Adding `cancel: true` sends pointercancel instead of pointerup. This drives
 pointer capture and movement; the older `drag` diagnostic directly scrolls a
