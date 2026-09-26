@@ -1987,6 +1987,7 @@ async fn run_qa(
                 drag.dy,
                 drag.steps,
                 drag.cancel,
+                drag.to.as_deref(),
             )
             .await
             {
@@ -6045,7 +6046,7 @@ pub async fn run() -> Result<()> {
             steps,
             cancel,
         } => {
-            pointer_drag(&mut client, &name, dx, dy, steps, cancel).await?;
+            pointer_drag(&mut client, &name, dx, dy, steps, cancel, None).await?;
         }
         // Direct container scrolling, retained for existing diagnostic commands.
         cli::Command::Drag { name, dy, steps } => {
@@ -7381,6 +7382,7 @@ mod tests {
         drag.expect = Expect::ValueChanges;
         drag.pointer_drag = Some(PointerDrag {
             from: "slider:Hue".into(),
+            to: None,
             dx: 20.0,
             dy: 0.0,
             steps: 2,
