@@ -1898,6 +1898,7 @@ pub(crate) fn keyboard_modifiers(modifiers: ControlModifiers) -> KeyboardModifie
     output.set(KeyboardModifiers::CONTROL, modifiers.control);
     output.set(KeyboardModifiers::ALT, modifiers.alt);
     output.set(KeyboardModifiers::META, modifiers.meta);
+    output.set(KeyboardModifiers::SUPER, modifiers.meta);
     output
 }
 
@@ -2150,6 +2151,16 @@ pub(crate) fn activate_agent_node(
 mod tests {
     use super::*;
     use blitz_dom::{Document, DocumentConfig};
+
+    #[test]
+    fn meta_also_sets_the_super_modifier() {
+        let modifiers = keyboard_modifiers(ControlModifiers {
+            meta: true,
+            ..ControlModifiers::default()
+        });
+        assert!(modifiers.contains(KeyboardModifiers::META));
+        assert!(modifiers.contains(KeyboardModifiers::SUPER));
+    }
 
     /// A control whose whole size is its label, next to one with padding.
     ///
