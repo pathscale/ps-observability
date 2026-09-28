@@ -1157,7 +1157,7 @@ async fn run_qa(
          * on another surface.
          */
         /*
-         * Navigation is best-effort: already being on the surface is success.
+         * `open` is best-effort: already being on the surface is success.
          *
          * Checks run in sequence, so a later one often inherits exactly the
          * screen it would have navigated to, and the control it navigates *by*
@@ -1171,7 +1171,36 @@ async fn run_qa(
         let mut open_error = None;
         let mut pixel_outcome: Option<std::result::Result<(), String>> = None;
         let open_budget = declared_open_timeout(check);
-        if let Some(want) = check.open.as_deref() {
+        if let Some(url) = check.navigate.as_deref() {
+            let navigated = client
+                .agent(&AgentControlRequest::Navigate {
+                    url: url.to_owned(),
+                })
+                .await;
+            if let Err(error) = navigated {
+                open_error = Some(format!("could not navigate to {url:?}: {error}"));
+            } else {
+                let target = check
+                    .open
+                    .as_deref()
+                    .or_else(|| check.hover.as_ref().map(qa::Hover::target))
+                    .or(check.prepare.as_deref())
+                    .or(check.click.as_deref())
+                    .or(check.type_into.as_deref())
+                    .or(check.key_on.as_deref())
+                    .unwrap_or(&check.subject);
+                if !wait_for_arrival(client, None, target, open_budget).await? {
+                    open_error = Some(format!(
+                        "could not navigate to {url:?}: the arrival target {target:?} did not paint within \
+                         {}ms. Raise open_timeout_ms if this route fetches.",
+                        open_budget.as_millis()
+                    ));
+                }
+            }
+        }
+        if open_error.is_none()
+            && let Some(want) = check.open.as_deref()
+        {
             /*
              * A permanent surface marker can answer "already there". A
              * document marker cannot: every document renders the same
@@ -6946,6 +6975,7 @@ mod tests {
             group: "coverage".into(),
             what: "a rendered outcome".into(),
             open: None,
+            navigate: None,
             prepare: None,
             prepare_unless: None,
             prepare_press: false,
