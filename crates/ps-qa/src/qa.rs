@@ -383,7 +383,15 @@ pub struct Check {
     pub group: String,
     /// What this proves, in the words you would use to report it.
     pub what: String,
-    /// Press this first, to reach the surface the check is about.
+    /// Load a URL in the standing document before opening a surface.
+    ///
+    /// Relative URLs resolve against the document that is up. Use this when a
+    /// route must load as a fresh document, such as reloading a signed-in
+    /// account page that client-side navigation cannot reach.
+    #[serde(default)]
+    pub navigate: Option<String>,
+    /// Activate this after [`navigate`](Self::navigate), when set, to reach the
+    /// surface the check is about.
     ///
     /// Checks run in sequence against one instance and start wherever the app
     /// opens, so anything not on that first surface is unreachable without a
@@ -552,18 +560,16 @@ pub struct Check {
     /// rendered action still has to pass the one-second budget.
     #[serde(default)]
     pub settle_after_ms: u64,
-    /// Deadline for this check's [`open`](Self::open) step.
+    /// Deadline for this check's [`navigate`](Self::navigate) and
+    /// [`open`](Self::open) steps.
     ///
-    /// Navigation is not the interaction contract. `open` may be a route change
-    /// that fetches before it can paint, and a live network round trip lands on
-    /// either side of the 900ms every other step gets. The failure that
-    /// produces is also the wrong sentence: `could not open "Crates"` reads as
-    /// a missing tab rather than as a deadline, and the reader goes looking for
-    /// a control that is there.
+    /// Navigation is not the interaction contract. `navigate` loads a document,
+    /// and `open` can activate a route that fetches before it paints. A live
+    /// network round trip can exceed the 900ms default, so the route can declare
+    /// its arrival budget without weakening every other check.
     ///
-    /// So a route that is known to fetch declares what it costs here, and every
-    /// other navigation in the suite keeps the strict default rather than being
-    /// weakened to cover the slow one.
+    /// Use this only for a route known to fetch. Without it, the failure reads
+    /// as a missing control rather than as a deadline.
     #[serde(default)]
     pub open_timeout_ms: u64,
     /// Deadline for this check's rendered outcome.
@@ -734,13 +740,14 @@ pub fn checks(dir: Option<&std::path::Path>) -> Result<Vec<Check>, String> {
              */
             if index == 0
                 && check.open.is_none()
+                && check.navigate.is_none()
                 && let Some((previous_file, opener)) = &established
             {
                 return Err(format!(
                     concat!(
-                        "{}: check {:?} is the first in its file and declares no `open`, so it ",
-                        "would run on {:?}, which {} navigated to. Declare the surface this ",
-                        "file starts on."
+                        "{}: check {:?} is the first in its file and declares neither `navigate` nor ",
+                        "`open`, so it would run on {:?}, which {} navigated to. Declare how this ",
+                        "file establishes its starting surface."
                     ),
                     file.display(),
                     check.id,
@@ -748,7 +755,7 @@ pub fn checks(dir: Option<&std::path::Path>) -> Result<Vec<Check>, String> {
                     previous_file.display(),
                 ));
             }
-            if let Some(opener) = check.open.as_deref() {
+            if let Some(opener) = check.open.as_deref().or(check.navigate.as_deref()) {
                 established = Some((file.to_path_buf(), opener.to_owned()));
             }
         }
@@ -1794,6 +1801,15 @@ mod tests {
         ron::from_str(&ron).expect("check parses")
     }
 
+    #[test]
+    fn navigate_is_optional_and_read_from_check_files() {
+        assert_eq!(parse("").navigate, None);
+        assert_eq!(
+            parse("navigate:Some(\"/account\"),").navigate.as_deref(),
+            Some("/account")
+        );
+    }
+
     fn painted_node(id: u64, name: &str, width: f64, height: f64) -> SemanticNode {
         SemanticNode {
             dom_id: None,
@@ -2301,6 +2317,7 @@ mod tests {
             group: "settings".into(),
             what: "the slider moves".into(),
             open: None,
+            navigate: None,
             prepare: None,
             prepare_unless: None,
             prepare_press: false,
