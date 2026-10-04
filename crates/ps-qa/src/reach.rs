@@ -729,12 +729,31 @@ pub fn folds_a_section(name: &str) -> bool {
 /// This is called per button per surface, so a file read per call would
 /// dominate the sweep.
 pub fn profile() -> &'static crate::app::AppProfile {
-    static PROFILE: std::sync::OnceLock<crate::app::AppProfile> = std::sync::OnceLock::new();
+    static PROFILES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<Option<std::path::PathBuf>, &'static crate::app::AppProfile>,
+        >,
+    > = std::sync::OnceLock::new();
+    let profile_path = crate::cli::app_profile();
+    let key = profile_path.map(|path| path.canonicalize().unwrap_or(path));
+    let profiles = PROFILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut profiles = profiles.lock().expect("app profile cache lock poisoned");
+    if let Some(profile) = profiles.get(&key) {
+        return *profile;
+    }
     // Broad driving commands validate their required profile before this
     // cache is reached. Targeted diagnostics deliberately do not require
     // product navigation rules; an empty profile makes their explicit
     // selector the whole policy instead of panicking inside lookup.
-    PROFILE.get_or_init(|| crate::app::AppProfile::load(None).unwrap_or_default())
+    // RunPlan starts separate hosts with separate application profiles. Keep
+    // each loaded value stable because existing callers borrow this profile
+    // for the duration of an interaction; plan files contain a finite set of
+    // profile paths, so this process-lifetime cache is bounded by that set.
+    let profile = Box::leak(Box::new(
+        crate::app::AppProfile::load(None).unwrap_or_default(),
+    ));
+    profiles.insert(key, profile);
+    profile
 }
 
 /// The disclosure controls that must be opened before a sweep of this surface.
