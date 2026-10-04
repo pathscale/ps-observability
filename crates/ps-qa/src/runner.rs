@@ -323,7 +323,9 @@ impl Drop for HostProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(path) = &self.control_dir {
-            let _ = std::fs::remove_dir_all(path);
+            if control_directory_is_real(path) {
+                let _ = std::fs::remove_dir_all(path);
+            }
         }
     }
 }
@@ -805,13 +807,28 @@ fn plan_control_directory() -> std::result::Result<std::path::PathBuf, String> {
         .canonicalize()
         .map_err(|error| format!("could not resolve QA artifact directory: {error}"))?;
     let target = ensure_plan_directory(&current, "target")?;
-    let qa_output = ensure_plan_directory(&target, "ps-qa")?;
-    let root = ensure_plan_directory(&qa_output, "run-plan-control")?;
+    // Unix socket paths include the protocol's directory and instance name.
+    // Keep the private plan root short enough for macOS's sockaddr_un limit.
+    let root = ensure_plan_directory(&target, "q")?;
     for _ in 0..32 {
         let sequence = NEXT_CONTROL_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = root.join(format!("{}-{sequence}", std::process::id()));
-        match std::fs::create_dir(&path) {
-            Ok(()) => return Ok(path),
+        let path = root.join(format!("{:x}-{sequence:x}", std::process::id()));
+        let mut directory = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        match directory.create(&path) {
+            Ok(()) => {
+                if !control_directory_is_real(&path) {
+                    let _ = std::fs::remove_dir(&path);
+                    return Err("QA host control directory cannot be a symlink".into());
+                }
+                return path.canonicalize().map_err(|error| {
+                    format!("could not resolve QA host control directory: {error}")
+                });
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(format!(
@@ -849,6 +866,32 @@ fn ensure_plan_directory(
     Ok(path)
 }
 
+fn control_directory_is_real(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+}
+
+fn contained_control_file(
+    path: &std::path::Path,
+    root: &std::path::Path,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect host descriptor: {error}"))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err("host descriptor must be a regular file under the QA control directory".into());
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("could not resolve host descriptor: {error}"))?;
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("could not resolve QA host control directory: {error}"))?;
+    if !path.starts_with(&root) {
+        return Err("host descriptor must stay under the QA control directory".into());
+    }
+    Ok(path)
+}
+
 /// Launch a host, optionally with a clean environment. The quiet mode prevents
 /// application console output from echoing form values into the runner's logs.
 fn start_host_with_policy(
@@ -868,7 +911,7 @@ fn start_host_with_policy(
     };
     if clean_environment {
         // Run plans must not forward unrelated secrets or application config
-        // to the browser process. QA_INSPECT_PAGE and CHUZZ_CONTROL_DIR are
+        // to the browser process. Page, control and temporary directories are
         // explicit host interfaces and point at plan-owned, in-repository paths.
         command.env_clear();
     }
@@ -878,6 +921,12 @@ fn start_host_with_policy(
     command.env("QA_INSPECT_PAGE", page);
     if let Some(path) = &control_dir {
         command.env("CHUZZ_CONTROL_DIR", path);
+        // The current Blitz protocol uses std::env::temp_dir(), while legacy
+        // Chuzz control uses CHUZZ_CONTROL_DIR. Confine both implementations.
+        command
+            .env("TMPDIR", path)
+            .env("TMP", path)
+            .env("TEMP", path);
     }
     command.stdout(std::process::Stdio::piped());
     command.stderr(if quiet_output {
@@ -950,7 +999,13 @@ fn start_host_with_policy(
 
     match rx.recv_timeout(startup_timeout) {
         Ok(line) if !line.trim().is_empty() => {
-            Ok((child, std::path::PathBuf::from(line.trim().to_owned())))
+            let announced = std::path::PathBuf::from(line.trim());
+            let announced = if let Some(root) = &child.control_dir {
+                contained_control_file(&announced, root)?
+            } else {
+                announced
+            };
+            Ok((child, announced))
         }
         _ => Err("the host never announced a descriptor".to_owned()),
     }
