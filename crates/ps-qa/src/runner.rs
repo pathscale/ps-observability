@@ -1378,8 +1378,9 @@ async fn run_qa_inner(
                 open_error = Some(format!("could not navigate to {url:?}: {error}"));
             } else {
                 let target = check
-                    .open
+                    .arrival_subject
                     .as_deref()
+                    .or(check.open.as_deref())
                     .or_else(|| check.hover.as_ref().map(qa::Hover::target))
                     .or(check.prepare.as_deref())
                     .or(check.click.as_deref())
@@ -7504,6 +7505,7 @@ mod tests {
             what: "a rendered outcome".into(),
             open: None,
             navigate: None,
+            arrival_subject: None,
             prepare: None,
             prepare_unless: None,
             prepare_press: false,

@@ -316,6 +316,14 @@ fetches can declare what it costs without weakening the interaction the check
 exists to measure. Without it a live network round trip lands on either side of
 900ms and fails as `could not open …`, which reads as a missing control.
 
+`navigate` waits for a painted arrival before the assertion. When no opener is
+declared that target is `subject`, which cannot succeed for a correct `Absent`
+check: the forbidden name is what the harness then waits to paint. Set
+`arrival_subject` to a positive marker the destination actually paints. It is
+opt-in and off by default; omitting it leaves existing checks unchanged. The
+assertion, including a negative `Absent` subject, still runs after that
+arrival.
+
 Outcome checks can continue past activation with literal semantic input:
 `type_into: Some("New item"), text: Some("qa audit newest"), key: Some("Enter")`.
 Text is focused, selected, and exactly replaced by node id; no coordinate pointer is involved.
