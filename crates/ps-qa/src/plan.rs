@@ -484,6 +484,12 @@ impl RunPlan {
             if protected > 1 && !alias_is_explicit {
                 return Err("each protected session requires a distinct account".into());
             }
+            if protected == 0 {
+                return Err(
+                    "optional username-alias skip requires another session that uses that account"
+                        .into(),
+                );
+            }
             for index in indexes {
                 if sessions[*index].skip_on_username_alias {
                     sessions[*index].skip_reason =

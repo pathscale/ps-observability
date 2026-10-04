@@ -749,9 +749,11 @@ pub fn profile() -> &'static crate::app::AppProfile {
     // each loaded value stable because existing callers borrow this profile
     // for the duration of an interaction; plan files contain a finite set of
     // profile paths, so this process-lifetime cache is bounded by that set.
-    let profile = Box::leak(Box::new(
-        crate::app::AppProfile::load(None).unwrap_or_default(),
-    ));
+    let profile = Box::leak(Box::new(match crate::app::AppProfile::load(None) {
+        Ok(profile) => profile,
+        Err(_) if key.is_none() => crate::app::AppProfile::default(),
+        Err(_) => panic!("required application profile could not be loaded"),
+    }));
     profiles.insert(key, profile);
     profile
 }

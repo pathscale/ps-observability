@@ -944,6 +944,38 @@ fn validate_check(
         ));
     }
 
+    if check
+        .arrival_subject
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(format!(
+            "{}: check {:?} declares an empty arrival_subject",
+            file.display(),
+            check.id
+        ));
+    }
+
+    if check.navigate.is_some() && check.expect == Expect::Absent {
+        let arrival = check
+            .arrival_subject
+            .as_deref()
+            .or(check.open.as_deref())
+            .or_else(|| check.hover.as_ref().map(Hover::target))
+            .or(check.prepare.as_deref())
+            .or(check.click.as_deref())
+            .or(check.type_into.as_deref())
+            .or(check.key_on.as_deref())
+            .unwrap_or(check.subject.as_str());
+        if arrival == check.subject.as_str() {
+            return Err(format!(
+                "{}: check {:?} navigates to an Absent subject and must declare a positive arrival_subject",
+                file.display(),
+                check.id
+            ));
+        }
+    }
+
     /*
      * A setup value cannot be the thing a check proves.
      *
