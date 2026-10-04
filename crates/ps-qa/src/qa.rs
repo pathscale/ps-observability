@@ -408,6 +408,15 @@ pub struct Check {
     /// account page that client-side navigation cannot reach.
     #[serde(default)]
     pub navigate: Option<String>,
+    /// Painted marker that must arrive after [`navigate`](Self::navigate).
+    ///
+    /// Arrival currently falls through to [`subject`](Self::subject) when no
+    /// opener is declared. A negative `Absent` subject is then treated as the
+    /// thing that must paint, so a correct destination cannot complete setup.
+    /// Set this to a positive marker the destination actually paints. The
+    /// assertion is unchanged and still runs after that arrival.
+    #[serde(default)]
+    pub arrival_subject: Option<String>,
     /// Activate this after [`navigate`](Self::navigate), when set, to reach the
     /// surface the check is about.
     ///
@@ -2450,6 +2459,7 @@ mod tests {
             what: "the slider moves".into(),
             open: None,
             navigate: None,
+            arrival_subject: None,
             prepare: None,
             prepare_unless: None,
             prepare_press: false,
