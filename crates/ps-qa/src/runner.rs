@@ -1264,6 +1264,10 @@ fn resolve_secret_subjects(
     Ok(())
 }
 
+fn redact_session_text(text: &str, secrets: Option<&plan::SessionSecrets>) -> String {
+    secrets.map_or_else(|| text.to_owned(), |secrets| secrets.redact(text))
+}
+
 async fn run_qa(
     client: &mut Client,
     group: Option<&str>,
@@ -1305,15 +1309,11 @@ async fn run_qa_inner(
     secrets: Option<&plan::SessionSecrets>,
     assertion_values: Option<&HashMap<String, String>>,
 ) -> Result<usize> {
-    let mut all = if let Some(paths) = checks_paths {
+    let all = if let Some(paths) = checks_paths {
         qa::checks_from_paths(paths).map_err(eyre::Report::msg)?
     } else {
         qa::checks(None).map_err(eyre::Report::msg)?
     };
-    if let Some(values) = assertion_values {
-        resolve_assertion_subjects(&mut all, values).map_err(eyre::Report::msg)?;
-    }
-    resolve_secret_subjects(&mut all, secrets).map_err(eyre::Report::msg)?;
     let selected = ordered_checks(&all, group);
     if selected.is_empty() {
         let mut names: Vec<String> = all
@@ -1326,12 +1326,17 @@ async fn run_qa_inner(
             names.join("\n  ")
         );
     }
+    let mut selected: Vec<qa::Check> = selected.into_iter().cloned().collect();
+    if let Some(values) = assertion_values {
+        resolve_assertion_subjects(&mut selected, values).map_err(eyre::Report::msg)?;
+    }
+    resolve_secret_subjects(&mut selected, secrets).map_err(eyre::Report::msg)?;
     if secrets.is_none() && selected.iter().any(|check| check.setup_secret.is_some()) {
         bail!("checks with runtime credential setup must run through `ps-qa run-plan`");
     }
 
     let mut results: Vec<CheckResult<'_>> = Vec::new();
-    for check in selected {
+    for check in &selected {
         let full_check_started = Instant::now();
         let mut retries = 0;
         // Navigation and disclosure materialization are suite setup. Give them
@@ -1429,11 +1434,12 @@ async fn run_qa_inner(
                     .find(|surface| reach::on_surface(&here.nodes, surface))
                     .map(|surface| surface.name.as_str())
                     .unwrap_or("none");
-                println!(
+                let trace = format!(
                     "        arrival want={want:?} destination={} target={want_here:?} \
                      named_document={named_document} arrived={arrived} on_surface={surface}",
                     destination.map_or("dynamic", |surface| surface.name.as_str()),
                 );
+                println!("{}", redact_session_text(&trace, secrets));
             }
             if !arrived {
                 /*
@@ -1613,7 +1619,9 @@ async fn run_qa_inner(
         {
             let opened = expand_everything(client, surface).await?;
             if cli::trace() && opened > 0 {
-                println!("        opened {opened} collapsed section(s) for {setup_target:?}");
+                let trace =
+                    format!("        opened {opened} collapsed section(s) for {setup_target:?}");
+                println!("{}", redact_session_text(&trace, secrets));
             }
         }
 
@@ -1627,9 +1635,10 @@ async fn run_qa_inner(
             match reveal_deferred_content(client, surface, setup_target).await {
                 Ok(reveals) => {
                     if cli::trace() && reveals > 0 {
-                        println!(
+                        let trace = format!(
                             "        revealed deferred content for {setup_target:?} in {reveals} step(s)"
                         );
+                        println!("{}", redact_session_text(&trace, secrets));
                     }
                 }
                 Err(error) => {
@@ -2455,9 +2464,10 @@ async fn run_qa_inner(
                     elapsed.as_secs_f64() * 1000.0
                 ),
                 Err(error) => println!(
-                    "        verdict fail: {} ({:.0}ms): {error}",
+                    "        verdict fail: {} ({:.0}ms): {}",
                     check.id,
-                    elapsed.as_secs_f64() * 1000.0
+                    elapsed.as_secs_f64() * 1000.0,
+                    redact_session_text(error, secrets)
                 ),
             }
         }
