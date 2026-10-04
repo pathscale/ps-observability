@@ -507,6 +507,17 @@ pub enum Command {
         checks: Option<PathBuf>,
     },
 
+    /// Run the application's typed, RON-declared guest and signed-in suites.
+    ///
+    /// The plan launches the configured headless host directly, resolves only
+    /// declared environment bindings, and runs the referenced check groups in
+    /// order. Runtime credentials are read by variable name and never written
+    /// to a plan or temporary file. No shell command is accepted.
+    RunPlan {
+        /// The application-owned RON run plan.
+        plan: PathBuf,
+    },
+
     /// Launch one headless page, run its checks, and stop the host.
     ///
     /// This is the single-page counterpart to `sweep-components`. The host
@@ -639,19 +650,18 @@ pub fn set_timeout_scale(scale: f64) {
     TIMEOUT_SCALE.store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// `--app <path>`, if one was given. Set once, from `main`, for the same reason
-/// as `TRACE`: the profile is read from inside the reach and sweep code, several
-/// frames below anything that has seen the command line.
-static APP: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+/// The active application profile. A RunPlan changes this between its separate
+/// guest hosts; ordinary CLI runs set it once from `main`.
+static APP: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
-/// Record the profile path. Called once, from `main`.
+/// Record the profile path before a host or inventory operation starts.
 pub fn set_app_profile(path: Option<PathBuf>) {
-    let _ = APP.set(path);
+    *APP.write().expect("app profile lock poisoned") = path;
 }
 
 /// The profile path named on the command line, if any.
 pub fn app_profile() -> Option<PathBuf> {
-    APP.get().cloned().flatten()
+    APP.read().expect("app profile lock poisoned").clone()
 }
 
 /// The inter-event delay, in seconds.
@@ -703,6 +713,7 @@ impl Command {
                 | Command::Cover { .. }
                 | Command::Inventory { .. }
                 | Command::Qa { .. }
+                | Command::RunPlan { .. }
                 | Command::QaHosted { .. }
                 | Command::SweepComponents { .. }
         )

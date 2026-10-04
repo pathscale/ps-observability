@@ -45,7 +45,7 @@ use crate::target::{
     painted_named, resolved_action_target, selector_matches_node, viewport_of,
 };
 use crate::timing::{check_timeout, sleep_pace};
-use crate::{app, audit, cli, inspector, paint_audit, qa, reach, report, sweep};
+use crate::{app, audit, cli, inspector, paint_audit, plan, qa, reach, report, sweep};
 
 /// Wait only for the destination a navigation check declared.
 ///
@@ -313,12 +313,18 @@ async fn settle_sweep_case(
 /// socket and a document for the rest of the session. One leaked during a sweep
 /// that panicked on a missing profile, and it had to be found and killed by
 /// hand.
-struct HostProcess(std::process::Child);
+struct HostProcess {
+    child: std::process::Child,
+    control_dir: Option<std::path::PathBuf>,
+}
 
 impl Drop for HostProcess {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(path) = &self.control_dir {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -788,28 +794,118 @@ fn start_host(
     page: &std::path::Path,
     startup_timeout: Duration,
 ) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
+    start_host_with_policy(host, page, startup_timeout, false, false)
+}
+
+fn plan_control_directory() -> std::result::Result<std::path::PathBuf, String> {
+    static NEXT_CONTROL_DIRECTORY: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let current = std::env::current_dir()
+        .map_err(|error| format!("could not locate QA artifact directory: {error}"))?
+        .canonicalize()
+        .map_err(|error| format!("could not resolve QA artifact directory: {error}"))?;
+    let target = ensure_plan_directory(&current, "target")?;
+    let qa_output = ensure_plan_directory(&target, "ps-qa")?;
+    let root = ensure_plan_directory(&qa_output, "run-plan-control")?;
+    for _ in 0..32 {
+        let sequence = NEXT_CONTROL_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = root.join(format!("{}-{sequence}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not create QA host control directory: {error}"
+                ));
+            }
+        }
+    }
+    Err("could not allocate a unique QA host control directory".into())
+}
+
+fn ensure_plan_directory(
+    parent: &std::path::Path,
+    name: &str,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let path = parent.join(name);
+    match std::fs::create_dir(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "could not create QA control artifact directory: {error}"
+            ));
+        }
+    }
+    let parent = parent
+        .canonicalize()
+        .map_err(|error| format!("could not resolve QA control artifact directory: {error}"))?;
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("could not resolve QA control artifact directory: {error}"))?;
+    if !path.starts_with(parent) {
+        return Err("QA control artifact directory must stay under its parent".into());
+    }
+    Ok(path)
+}
+
+/// Launch a host, optionally with a clean environment. The quiet mode prevents
+/// application console output from echoing form values into the runner's logs.
+fn start_host_with_policy(
+    host: &std::path::Path,
+    page: &std::path::Path,
+    startup_timeout: Duration,
+    quiet_output: bool,
+    clean_environment: bool,
+) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
     use std::io::BufRead;
 
-    let mut child = HostProcess(
-        std::process::Command::new(host)
-            // The page this host is to serve. The variable is the host
-            // interface, not a particular host's: `chuzz-headless` reads it,
-            // and a host with a different one can read its own environment and
-            // ignore this.
-            .env("QA_INSPECT_PAGE", page)
-            .stdout(std::process::Stdio::piped())
-            // Host diagnostics belong to the sweep artifact. Discarding them
-            // turns a startup or renderer failure into only "never announced
-            // a descriptor", which hides the one message that explains it.
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .map_err(|error| format!("launching {}: {error}", host.display()))?,
-    );
+    let mut command = std::process::Command::new(host);
+    let control_dir = if clean_environment {
+        Some(plan_control_directory()?)
+    } else {
+        None
+    };
+    if clean_environment {
+        // Run plans must not forward unrelated secrets or application config
+        // to the browser process. QA_INSPECT_PAGE and CHUZZ_CONTROL_DIR are
+        // explicit host interfaces and point at plan-owned, in-repository paths.
+        command.env_clear();
+    }
+    // The page this host is to serve. The variable is the host interface, not
+    // a particular host's: `chuzz-headless` reads it, and a host with a
+    // different one can read its own environment and ignore this.
+    command.env("QA_INSPECT_PAGE", page);
+    if let Some(path) = &control_dir {
+        command.env("CHUZZ_CONTROL_DIR", path);
+    }
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(if quiet_output {
+        std::process::Stdio::null()
+    } else {
+        // Host diagnostics belong to the sweep artifact. Discarding them
+        // turns a startup or renderer failure into only "never announced a
+        // descriptor", which hides the one message that explains it.
+        std::process::Stdio::inherit()
+    });
+    let spawned = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(path) = &control_dir {
+                let _ = std::fs::remove_dir_all(path);
+            }
+            return Err(format!("launching {}: {error}", host.display()));
+        }
+    };
+    let mut child = HostProcess {
+        child: spawned,
+        control_dir,
+    };
 
     // Read on a thread with a deadline around it: a host that dies before
     // announcing would otherwise block for ever on a pipe that will never
     // produce a line.
-    let stdout = child.0.stdout.take().expect("stdout was piped");
+    let stdout = child.child.stdout.take().expect("stdout was piped");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(stdout);
@@ -842,7 +938,7 @@ fn start_host(
             if !announced && text.ends_with(".json") && std::path::Path::new(text).is_file() {
                 announced = true;
                 let _ = tx.send(text.to_owned());
-            } else if !text.is_empty() {
+            } else if !quiet_output && !text.is_empty() {
                 eprintln!("host: {text}");
             }
             line.clear();
@@ -1111,6 +1207,7 @@ async fn run_component(
 fn ordered_checks<'a>(all: &'a [qa::Check], group: Option<&str>) -> Vec<&'a qa::Check> {
     // A group *or* one check's id, so chasing a single failure does not mean
     // re-running its neighbours against the real app every time.
+    let group = group.filter(|group| *group != "*");
     let mut selected: Vec<&qa::Check> = all
         .iter()
         .filter(|check| group.is_none_or(|want| check.group == want || check.id == want))
@@ -1119,12 +1216,104 @@ fn ordered_checks<'a>(all: &'a [qa::Check], group: Option<&str>) -> Vec<&'a qa::
     selected
 }
 
+fn resolve_assertion_subjects(
+    checks: &mut [qa::Check],
+    values: &HashMap<String, String>,
+) -> std::result::Result<HashSet<String>, String> {
+    let mut used = HashSet::new();
+    for check in checks {
+        if let Some(binding) = check.subject_env.as_deref() {
+            let value = values.get(binding).ok_or_else(|| {
+                format!(
+                    "check {:?} references an unknown assertion binding",
+                    check.id
+                )
+            })?;
+            check.subject.clone_from(value);
+            used.insert(binding.to_owned());
+        }
+        if let Some(binding) = check.setup_text_env.as_deref() {
+            let value = values.get(binding).ok_or_else(|| {
+                format!(
+                    "check {:?} references an unknown assertion binding",
+                    check.id
+                )
+            })?;
+            check.setup_text = Some(value.clone());
+            used.insert(binding.to_owned());
+        }
+    }
+    Ok(used)
+}
+
+fn resolve_secret_subjects(
+    checks: &mut [qa::Check],
+    secrets: Option<&plan::SessionSecrets>,
+) -> std::result::Result<(), String> {
+    for check in checks {
+        if let Some(input) = check.subject_secret {
+            let secrets = secrets.ok_or_else(|| {
+                format!(
+                    "check {:?} requires a signed-in session credential",
+                    check.id
+                )
+            })?;
+            check.subject = secrets.value(input).to_owned();
+        }
+    }
+    Ok(())
+}
+
 async fn run_qa(
     client: &mut Client,
     group: Option<&str>,
     checks_dir: Option<&std::path::Path>,
 ) -> Result<usize> {
-    let all = qa::checks(checks_dir).map_err(|error| eyre!(error))?;
+    run_qa_with_secrets(client, group, checks_dir, None).await
+}
+
+async fn run_qa_with_secrets(
+    client: &mut Client,
+    group: Option<&str>,
+    checks_dir: Option<&std::path::Path>,
+    secrets: Option<&plan::SessionSecrets>,
+) -> Result<usize> {
+    let checks_paths = checks_dir.map(|path| vec![path.to_path_buf()]);
+    run_qa_with_plan_values(client, group, checks_paths.as_deref(), secrets, None).await
+}
+
+async fn run_qa_with_plan_values(
+    client: &mut Client,
+    group: Option<&str>,
+    checks_paths: Option<&[std::path::PathBuf]>,
+    secrets: Option<&plan::SessionSecrets>,
+    assertion_values: Option<&HashMap<String, String>>,
+) -> Result<usize> {
+    match run_qa_inner(client, group, checks_paths, secrets, assertion_values).await {
+        Err(error) => match secrets {
+            Some(secrets) => Err(eyre!(secrets.redact(&error.to_string()))),
+            None => Err(error),
+        },
+        result => result,
+    }
+}
+
+async fn run_qa_inner(
+    client: &mut Client,
+    group: Option<&str>,
+    checks_paths: Option<&[std::path::PathBuf]>,
+    secrets: Option<&plan::SessionSecrets>,
+    assertion_values: Option<&HashMap<String, String>>,
+) -> Result<usize> {
+    let mut all = if let Some(paths) = checks_paths {
+        qa::checks_from_paths(paths).map_err(eyre::Report::msg)?
+    } else {
+        qa::checks(None).map_err(eyre::Report::msg)?
+    };
+    if let Some(values) = assertion_values {
+        resolve_assertion_subjects(&mut all, values).map_err(eyre::Report::msg)?;
+    }
+    resolve_secret_subjects(&mut all, secrets).map_err(eyre::Report::msg)?;
     let selected = ordered_checks(&all, group);
     if selected.is_empty() {
         let mut names: Vec<String> = all
@@ -1136,6 +1325,9 @@ async fn run_qa(
             "no check or group matching {group:?}. known:\n  {}",
             names.join("\n  ")
         );
+    }
+    if secrets.is_none() && selected.iter().any(|check| check.setup_secret.is_some()) {
+        bail!("checks with runtime credential setup must run through `ps-qa run-plan`");
     }
 
     let mut results: Vec<CheckResult<'_>> = Vec::new();
@@ -1330,17 +1522,24 @@ async fn run_qa(
             // acknowledgements such as "Copied".
         }
 
+        let setup_value = check.setup_type_into.as_deref().and_then(|field| {
+            let value = check.setup_text.as_deref().or_else(|| {
+                check
+                    .setup_secret
+                    .and_then(|kind| secrets.map(|secrets| secrets.value(kind)))
+            });
+            value.map(|value| (field, value, check.setup_secret.is_some()))
+        });
         if open_error.is_none()
-            && let (Some(field), Some(value)) = (
-                check.setup_type_into.as_deref(),
-                check.setup_text.as_deref(),
-            )
+            && let Some((field, value, is_secret)) = setup_value
         {
             match type_text(client, field, value).await {
                 Err(error) => {
-                    open_error = Some(format!(
-                        "could not establish setup value in {field:?}: {error}"
-                    ));
+                    open_error = Some(if is_secret {
+                        format!("could not establish credential setup in {field:?}")
+                    } else {
+                        format!("could not establish setup value in {field:?}: {error}")
+                    });
                 }
                 /*
                  * Wait for the value to reach the tree, not merely for the
@@ -1365,12 +1564,21 @@ async fn run_qa(
                         })
                         .await?;
                     if !setup_value_landed(&settled.nodes, node_id, value) {
-                        open_error = Some(format!(
-                            "the setup value {value:?} had not reached {field:?} within {}ms; \
-                             a baseline taken before it lands lets the setup satisfy the \
-                             check's own outcome",
-                            check_timeout(900).as_millis()
-                        ));
+                        open_error = Some(if is_secret {
+                            format!(
+                                "credential setup had not reached {field:?} within {}ms; \
+                                 a baseline taken before it lands lets setup satisfy the \
+                                 check's own outcome",
+                                check_timeout(900).as_millis()
+                            )
+                        } else {
+                            format!(
+                                "the setup value {value:?} had not reached {field:?} within {}ms; \
+                                 a baseline taken before it lands lets the setup satisfy the \
+                                 check's own outcome",
+                                check_timeout(900).as_millis()
+                            )
+                        });
                     }
                 }
             }
@@ -2316,10 +2524,12 @@ async fn run_qa(
             .collect(),
         checks: results.iter().map(CheckRow::from).collect(),
     };
-    println!(
-        "{}",
-        toon_format::encode_default(&report).map_err(|e| eyre!(e.to_string()))?
-    );
+    let encoded = toon_format::encode_default(&report).map_err(|e| eyre!(e.to_string()))?;
+    let printable = match secrets {
+        Some(secrets) => secrets.redact(&encoded),
+        None => encoded,
+    };
+    println!("{printable}");
     Ok(failed)
 }
 
@@ -4290,7 +4500,8 @@ async fn run_inventory(
     client: &mut Client,
     only: Option<&str>,
     require_outcomes: bool,
-    checks_path: Option<&std::path::Path>,
+    checks_paths: Option<&[std::path::PathBuf]>,
+    assertion_values: Option<&HashMap<String, String>>,
 ) -> Result<usize> {
     validate_surface_filter(only)?;
     #[derive(serde::Serialize)]
@@ -4368,8 +4579,10 @@ async fn run_inventory(
     }
 
     let default_checks_exist = qa::default_checks_path().is_dir();
-    let checks = if checks_path.is_some() || default_checks_exist || require_outcomes {
-        qa::checks(checks_path).map_err(eyre::Report::msg)?
+    let mut checks = if let Some(paths) = checks_paths {
+        qa::checks_from_paths(paths).map_err(eyre::Report::msg)?
+    } else if default_checks_exist || require_outcomes {
+        qa::checks(None).map_err(eyre::Report::msg)?
     } else {
         eprintln!(
             "warning: no --checks directory and {} does not exist; outcome coverage will be reported as zero",
@@ -4377,6 +4590,9 @@ async fn run_inventory(
         );
         Vec::new()
     };
+    if let Some(values) = assertion_values {
+        resolve_assertion_subjects(&mut checks, values).map_err(eyre::Report::msg)?;
+    }
     let mut rows = Vec::new();
     let mut controls = Vec::new();
     let mut surface_failures = 0_usize;
@@ -5431,6 +5647,287 @@ async fn run_cover(
     Ok(failures.len())
 }
 
+/// Load and validate every referenced profile and check before any app host is started.
+fn preflight_plan(
+    plan: &plan::ResolvedPlan,
+    session_profile: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>> {
+    let load_suite = |suite: &plan::CheckSuite| -> Result<Vec<qa::Check>> {
+        let all = qa::checks_from_paths(&suite.checks).map_err(eyre::Report::msg)?;
+        let selected = ordered_checks(&all, Some(&suite.selector));
+        if selected.is_empty() {
+            bail!("run-plan selector {:?} matched no check", suite.selector);
+        }
+        Ok(selected.into_iter().cloned().collect())
+    };
+    let mut used_assertions = HashSet::new();
+    let validate_assertions =
+        |checks: &mut [qa::Check], used: &mut HashSet<String>| -> Result<()> {
+            used.extend(
+                resolve_assertion_subjects(checks, &plan.assertion_values)
+                    .map_err(eyre::Report::msg)?,
+            );
+            Ok(())
+        };
+
+    for guest in &plan.guests {
+        app::AppProfile::load(Some(&guest.app_profile)).map_err(|error| eyre!(error))?;
+        if let Some(inventory) = &guest.inventory {
+            let mut checks = qa::checks_from_paths(&inventory.checks).map_err(eyre::Report::msg)?;
+            validate_assertions(&mut checks, &mut used_assertions)?;
+            if checks
+                .iter()
+                .any(|check| check.setup_secret.is_some() || check.subject_secret.is_some())
+            {
+                bail!("runtime credentials cannot be referenced by an inventory manifest");
+            }
+        }
+    }
+
+    if let Some(login) = &plan.login {
+        let mut login_checks = load_suite(login)?;
+        validate_assertions(&mut login_checks, &mut used_assertions)?;
+        let mut username_inputs = 0;
+        let mut password_inputs = 0;
+        for check in &login_checks {
+            match check.setup_secret {
+                Some(qa::SecretInput::Username) => username_inputs += 1,
+                Some(qa::SecretInput::Password) => password_inputs += 1,
+                None => {}
+            }
+            // The login group cannot keep credentials as RON literals or type
+            // a second, untracked value through the ordinary action fields.
+            if check.setup_text.is_some() || check.setup_text_env.is_some() || check.text.is_some()
+            {
+                bail!("run-plan login checks must use runtime credential references");
+            }
+        }
+        if username_inputs != 1 || password_inputs != 1 {
+            bail!("run-plan login selector must establish one username and one password");
+        }
+    }
+
+    let validate_non_login_suites = |suites: &[plan::CheckSuite],
+                                     credentials: Option<&plan::SessionSecrets>,
+                                     used: &mut HashSet<String>|
+     -> Result<()> {
+        for suite in suites {
+            let mut checks = load_suite(suite)?;
+            validate_assertions(&mut checks, used)?;
+            for check in checks {
+                if check.setup_secret.is_some() {
+                    bail!("runtime credentials may be used only by the run-plan login suite");
+                }
+                if check.subject_secret.is_some() && credentials.is_none() {
+                    bail!("runtime credential subjects require a signed-in session");
+                }
+                if credentials.is_some_and(|credentials| {
+                    let subject = check
+                        .subject_secret
+                        .is_none()
+                        .then_some(check.subject.as_str());
+                    [check.setup_text.as_deref(), check.text.as_deref(), subject]
+                        .into_iter()
+                        .flatten()
+                        .chain(
+                            check
+                                .any_of
+                                .iter()
+                                .map(|alternative| alternative.subject.as_str()),
+                        )
+                        .any(|literal| {
+                            literal == credentials.value(qa::SecretInput::Username)
+                                || literal == credentials.value(qa::SecretInput::Password)
+                        })
+                }) {
+                    bail!("a check contains a literal matching a runtime credential");
+                }
+            }
+        }
+        Ok(())
+    };
+    for guest in &plan.guests {
+        validate_non_login_suites(&guest.suites, None, &mut used_assertions)?;
+    }
+    for session in &plan.sessions {
+        validate_non_login_suites(
+            &session.suites,
+            session.credentials.as_ref(),
+            &mut used_assertions,
+        )?;
+    }
+
+    if used_assertions.len() != plan.assertion_values.len() {
+        return Err(eyre!(
+            "run plan declares an unused assertion environment binding"
+        ));
+    }
+
+    let session_profile = if plan.sessions.is_empty() {
+        None
+    } else {
+        let path = session_profile.ok_or_else(|| {
+            eyre!("run plan with signed-in sessions requires the command-line --app profile")
+        })?;
+        app::AppProfile::load(Some(path)).map_err(|error| eyre!(error))?;
+        Some(
+            path.canonicalize()
+                .map_err(|_| eyre!("could not resolve --app profile"))?,
+        )
+    };
+    Ok(session_profile)
+}
+
+async fn run_plan_host(
+    plan: &plan::ResolvedPlan,
+    app_profile: &std::path::Path,
+    suites: &[plan::CheckSuite],
+    inventory: Option<&plan::InventoryPlan>,
+    login: Option<(&plan::CheckSuite, &str, &plan::SessionSecrets)>,
+) -> Result<usize> {
+    cli::set_app_profile(Some(app_profile.to_path_buf()));
+    let (child, descriptor_path) = start_host_with_policy(
+        &plan.host,
+        std::path::Path::new(&plan.page),
+        Duration::from_secs(plan.startup_timeout_secs),
+        true,
+        true,
+    )
+    .map_err(eyre::Report::msg)?;
+    let descriptor = inspector::discover(descriptor_path.to_str())?;
+    let mut client = Client::connect(&descriptor.socket_path()).await?;
+    client.initialize().await?;
+
+    let mut failed = 0;
+    if let Some((login_suite, landing, credentials)) = login {
+        let login_failed = run_qa_with_plan_values(
+            &mut client,
+            Some(&login_suite.selector),
+            Some(&login_suite.checks),
+            Some(credentials),
+            Some(&plan.assertion_values),
+        )
+        .await?;
+        failed += login_failed;
+        if login_failed > 0 {
+            println!("SKIP signed-in suites: login checks failed");
+            drop(child);
+            return Ok(failed);
+        }
+        let arrived = wait_for_arrival(&mut client, None, landing, Duration::from_secs(15))
+            .await
+            .map_err(|error| eyre!(credentials.redact(&error.to_string())))?;
+        if !arrived {
+            println!("FAIL signed-in session: expected landing marker did not paint");
+            drop(child);
+            return Ok(failed + 1);
+        }
+    }
+
+    if let Some(inventory) = inventory {
+        failed += run_inventory(
+            &mut client,
+            None,
+            inventory.require_outcomes,
+            Some(&inventory.checks),
+            Some(&plan.assertion_values),
+        )
+        .await?;
+    } else {
+        for suite in suites {
+            failed += if let Some((_, _, credentials)) = login {
+                run_qa_with_plan_values(
+                    &mut client,
+                    Some(&suite.selector),
+                    Some(&suite.checks),
+                    Some(credentials),
+                    Some(&plan.assertion_values),
+                )
+                .await?
+            } else {
+                run_qa_with_plan_values(
+                    &mut client,
+                    Some(&suite.selector),
+                    Some(&suite.checks),
+                    None,
+                    Some(&plan.assertion_values),
+                )
+                .await?
+            };
+        }
+    }
+    drop(child);
+    Ok(failed)
+}
+
+async fn run_plan(
+    path: &std::path::Path,
+    cli_app_profile: Option<&std::path::Path>,
+) -> Result<usize> {
+    let parsed = plan::RunPlan::load(path).map_err(eyre::Report::msg)?;
+    let resolved = parsed.resolve().map_err(eyre::Report::msg)?;
+    let session_profile = preflight_plan(&resolved, cli_app_profile)?;
+
+    let mut failed = 0;
+    for guest in &resolved.guests {
+        println!("== {} invocation ==", guest.id);
+        match run_plan_host(
+            &resolved,
+            &guest.app_profile,
+            &guest.suites,
+            guest.inventory.as_ref(),
+            None,
+        )
+        .await
+        {
+            Ok(session_failed) => failed += session_failed,
+            Err(error) => {
+                eprintln!("FAIL {} invocation: {error}", guest.id);
+                failed += 1;
+            }
+        }
+    }
+
+    for session in &resolved.sessions {
+        if let Some(reason) = session.skip_reason {
+            println!("SKIP {}: {}", session.id, reason);
+            continue;
+        }
+        let Some(credentials) = session.credentials.as_ref() else {
+            eprintln!("FAIL {} session has no configured credentials", session.id);
+            failed += 1;
+            continue;
+        };
+        println!("== {} session ==", session.id);
+        let login = resolved
+            .login
+            .as_ref()
+            .ok_or_else(|| eyre!("run plan with signed-in sessions must declare a login suite"))?;
+        match run_plan_host(
+            &resolved,
+            session_profile
+                .as_deref()
+                .ok_or_else(|| eyre!("signed-in session profile was not preflighted"))?,
+            &session.suites,
+            None,
+            Some((login, &session.landing, credentials)),
+        )
+        .await
+        {
+            Ok(session_failed) => failed += session_failed,
+            Err(error) => {
+                eprintln!(
+                    "FAIL {} session: {}",
+                    session.id,
+                    credentials.redact(&error.to_string())
+                );
+                failed += 1;
+            }
+        }
+    }
+    Ok(failed)
+}
+
 pub async fn run() -> Result<()> {
     let cli = <cli::Cli as clap::Parser>::parse();
     cli::set_trace(cli.trace);
@@ -5468,8 +5965,26 @@ pub async fn run() -> Result<()> {
     // therefore dispatch before descriptor discovery, but they still use the
     // profile to classify controls. Validating after that early dispatch made
     // a missing profile panic from `reach` instead of returning a CLI error.
-    if cli.command.requires_app_profile() {
+    if cli.command.requires_app_profile() && !matches!(&cli.command, cli::Command::RunPlan { .. }) {
         app::AppProfile::load(cli.app.as_deref()).map_err(|error| eyre!(error))?;
+    }
+
+    if let cli::Command::RunPlan { plan } = &cli.command {
+        if cli.trace
+            || cli.trace_capture
+            || cli.require_paint_events
+            || cli.pixel_artifact_dir.is_some()
+        {
+            bail!("`run-plan` does not accept tracing or pixel capture options");
+        }
+        if cli.descriptor.is_some() {
+            bail!("`run-plan` starts its own host and does not accept `--descriptor`");
+        }
+        let failures = run_plan(plan, cli.app.as_deref()).await?;
+        if failures > 0 {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     // A component sweep launches its own hosts, so it attaches to something
@@ -5996,11 +6511,13 @@ pub async fn run() -> Result<()> {
             require_outcomes,
             checks,
         } => {
+            let checks_paths = checks.as_ref().map(std::slice::from_ref);
             let failures = run_inventory(
                 &mut client,
                 surface.as_deref(),
                 require_outcomes,
-                checks.as_deref(),
+                checks_paths,
+                None,
             )
             .await?;
             if failures > 0 {
@@ -6131,6 +6648,7 @@ pub async fn run() -> Result<()> {
         // own hosts or read only files. Listed here so the match stays
         // exhaustive and a new command cannot be forgotten.
         cli::Command::QaHosted { .. }
+        | cli::Command::RunPlan { .. }
         | cli::Command::SweepComponents { .. }
         | cli::Command::List { .. }
         | cli::Command::Reconcile { .. } => {
@@ -6988,6 +7506,8 @@ mod tests {
             reveal_before_capture: None,
             setup_type_into: None,
             setup_text: None,
+            setup_text_env: None,
+            setup_secret: None,
             click: click.map(str::to_owned),
             type_into: None,
             text: None,
@@ -7010,7 +7530,10 @@ mod tests {
             text_sized: false,
             destructive: false,
             subject: subject.into(),
+            subject_env: None,
+            subject_secret: None,
             expect: Expect::Paints,
+            any_of: Vec::new(),
         }
     }
 

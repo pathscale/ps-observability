@@ -368,6 +368,24 @@ pub struct PointerDrag {
     pub cancel: bool,
 }
 
+/// Which runtime credential a check may enter before the measured action.
+///
+/// The value is supplied by a `run-plan` session and is never part of the RON
+/// check file or its report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SecretInput {
+    Username,
+    Password,
+}
+
+/// One explicit rendered state accepted by an `any_of` check.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeAlternative {
+    pub subject: String,
+    pub expect: Expect,
+}
+
 /// One thing that must be true of the running panel.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -501,6 +519,19 @@ pub struct Check {
     /// Literal value entered into [`setup_type_into`](Self::setup_type_into).
     #[serde(default)]
     pub setup_text: Option<String>,
+    /// RunPlan binding that supplies nonsecret text for this setup input.
+    ///
+    /// The binding is resolved in memory from a declared Assertion environment
+    /// value before the check runs; the environment variable name stays in the
+    /// RON plan and the supplied value stays out of it.
+    #[serde(default)]
+    pub setup_text_env: Option<String>,
+    /// Session credential entered into [`setup_type_into`](Self::setup_type_into).
+    ///
+    /// Only the typed reference is read from RON. The value is resolved from
+    /// the active run-plan session and errors redact it.
+    #[serde(default)]
+    pub setup_secret: Option<SecretInput>,
     /// Click this node, if the check is about an action.
     pub click: Option<String>,
     /// Focus this named text field and enter [`text`](Self::text).
@@ -656,7 +687,27 @@ pub struct Check {
     pub destructive: bool,
     /// The node the assertion is about.
     pub subject: String,
+    /// RunPlan binding that supplies a nonsecret assertion subject.
+    ///
+    /// The literal `subject` remains the fallback for ordinary QA commands;
+    /// RunPlan resolves this binding before checking the plan-selected suite.
+    #[serde(default)]
+    pub subject_env: Option<String>,
+    /// Runtime session credential used as the assertion subject.
+    ///
+    /// This supports checks that verify a submitted password was not rendered
+    /// back into the page. The value is resolved only for an authenticated
+    /// RunPlan session and is redacted from the report.
+    #[serde(default)]
+    pub subject_secret: Option<SecretInput>,
     pub expect: Expect,
+    /// Accept the primary outcome or any one of these explicit alternatives.
+    ///
+    /// This is for state that is valid in more than one observable form, such
+    /// as an existing chat history or its documented empty state. It does not
+    /// combine actions or turn several independent checks into an OR.
+    #[serde(default)]
+    pub any_of: Vec<OutcomeAlternative>,
 }
 
 /// Every check, in the order they run, read from the application's own files.
@@ -683,33 +734,50 @@ pub fn default_checks_path() -> std::path::PathBuf {
 }
 
 pub fn checks(dir: Option<&std::path::Path>) -> Result<Vec<Check>, String> {
-    let dir = dir
+    let path = dir
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(default_checks_path);
-    if !dir.is_dir() {
-        return Err(format!(
-            "no checks at {}. Point --checks at the application's check \
-             directory.",
-            dir.display()
-        ));
+    checks_from_paths(&[path])
+}
+
+/// Load one or more application-owned check files/directories as one outcome
+/// manifest. Sorting and duplicate-ID validation span every supplied path.
+pub fn checks_from_paths(paths: &[std::path::PathBuf]) -> Result<Vec<Check>, String> {
+    let mut files = Vec::new();
+    for dir in paths {
+        if !dir.is_dir() && !dir.is_file() {
+            return Err(format!(
+                "no checks at {}. Point --checks at the application's check file or directory.",
+                dir.display()
+            ));
+        }
+        if dir.is_file() {
+            if !dir.extension().is_some_and(|ext| ext == "ron") {
+                return Err(format!(
+                    "check file must have a .ron extension: {}",
+                    dir.display()
+                ));
+            }
+            files.push(dir.clone());
+        } else {
+            files.extend(
+                std::fs::read_dir(dir)
+                    .map_err(|error| format!("could not read {}: {error}", dir.display()))?
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "ron"))
+                    // The application profile is not a check group.
+                    .filter(|path| path.file_name().is_some_and(|name| name != "ps-qa.ron")),
+            );
+        }
     }
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|error| format!("could not read {}: {error}", dir.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "ron"))
-        // The application profile is not a check group.
-        //
-        // The documented layout puts `ps-qa.ron` beside the checks, and this
-        // glob then read it as one and failed the whole run with
-        // "Expected opening `[`" at line 5 -- pointing at the profile's
-        // syntax, which is correct, rather than at the file being included by
-        // mistake. The documented layout could not be used.
-        .filter(|path| path.file_name().is_some_and(|name| name != "ps-qa.ron"))
-        .collect();
-    // Name order, so a run is reproducible rather than dependent on whatever
-    // order the filesystem happens to hand back.
-    files.sort();
+    // File-name order, so combining directories behaves like one manifest and
+    // is not dependent on either filesystem enumeration or directory order.
+    files.sort_by(|left, right| {
+        left.file_name()
+            .cmp(&right.file_name())
+            .then_with(|| left.cmp(right))
+    });
 
     let mut all = Vec::new();
     let mut ids = HashMap::new();
@@ -821,9 +889,47 @@ fn validate_check(
         ));
     }
 
-    if check.setup_type_into.is_some() != check.setup_text.is_some() {
+    let setup_value_count = (if check.setup_text.is_some() { 1 } else { 0 })
+        + (if check.setup_text_env.is_some() { 1 } else { 0 })
+        + (if check.setup_secret.is_some() { 1 } else { 0 });
+    if (check.setup_type_into.is_some() && setup_value_count != 1)
+        || (check.setup_type_into.is_none() && setup_value_count != 0)
+    {
+        let rule = if check.setup_secret.is_some() {
+            "must declare setup_type_into and exactly one of setup_text, setup_text_env, or setup_secret"
+        } else if check.setup_text_env.is_some() {
+            "must declare setup_type_into and setup_text_env together"
+        } else {
+            "must declare setup_type_into and setup_text together"
+        };
+        return Err(format!("{}: check {:?} {rule}", file.display(), check.id));
+    }
+
+    if !check.any_of.is_empty() {
+        let supported = |expect| {
+            matches!(
+                expect,
+                Expect::Present | Expect::Paints | Expect::PaintsNamed | Expect::Absent
+            )
+        };
+        if check.any_of.len() > 16
+            || check.subject.trim().is_empty()
+            || !supported(check.expect)
+            || check.any_of.iter().any(|alternative| {
+                alternative.subject.trim().is_empty() || !supported(alternative.expect)
+            })
+        {
+            return Err(format!(
+                "{}: check {:?} has an invalid any_of outcome",
+                file.display(),
+                check.id
+            ));
+        }
+    }
+
+    if check.subject_env.is_some() && check.subject_secret.is_some() {
         return Err(format!(
-            "{}: check {:?} must declare setup_type_into and setup_text together",
+            "{}: check {:?} cannot bind its subject from both an assertion and a secret",
             file.display(),
             check.id
         ));
@@ -974,6 +1080,32 @@ pub fn verdict(
     before: &[SemanticNode],
     after: &[SemanticNode],
 ) -> Result<(), String> {
+    if !check.any_of.is_empty() {
+        let mut failures = Vec::with_capacity(check.any_of.len() + 1);
+        let mut outcomes = Vec::with_capacity(check.any_of.len() + 1);
+        outcomes.push((check.subject.as_str(), check.expect));
+        outcomes.extend(
+            check
+                .any_of
+                .iter()
+                .map(|alternative| (alternative.subject.as_str(), alternative.expect)),
+        );
+        for (subject, expect) in outcomes {
+            let mut alternative = check.clone();
+            alternative.subject = subject.to_owned();
+            alternative.expect = expect;
+            alternative.any_of.clear();
+            match verdict(&alternative, before, after) {
+                Ok(()) => return Ok(()),
+                Err(error) => failures.push(error),
+            }
+        }
+        return Err(format!(
+            "none of the declared rendered outcomes matched: {}",
+            failures.join("; ")
+        ));
+    }
+
     let found = matching(after, &check.subject);
     match check.expect {
         Expect::Vanishes => {
@@ -2330,6 +2462,8 @@ mod tests {
             reveal_before_capture: None,
             setup_type_into: None,
             setup_text: None,
+            setup_text_env: None,
+            setup_secret: None,
             click: None,
             type_into: None,
             text: None,
@@ -2352,7 +2486,10 @@ mod tests {
             text_sized: false,
             destructive: false,
             subject: "Output level".into(),
+            subject_env: None,
+            subject_secret: None,
             expect: Expect::ValueChanges,
+            any_of: Vec::new(),
         };
         let node = |id, value: &str| SemanticNode {
             dom_id: None,

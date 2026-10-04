@@ -74,6 +74,7 @@ ps-qa qa dialog-cancel-dismisses # one check, by id
 ps-qa inventory                  # fast reachability counts on every surface
 ps-qa inventory --require-outcomes # fail every reachable control with no named verdict
 ps-qa reconcile inventory.toon   # map a saved CI inventory to current checks, no GUI
+ps-qa run-plan tests/ps-qa/run-plan.ron --app ps-qa.ron # guest and signed-in app suites
 ```
 
 `list` needs no running app. Everything else does. Exit code is 1 if any check
@@ -81,6 +82,79 @@ fails, so it drops into CI unchanged.
 
 `--trace` prints the node each check activates, which is how you tell "the
 control is broken" from "the check pressed the wrong thing".
+
+### Running guest and signed-in suites
+
+`run-plan` reads a strict RON plan and launches one fresh host for each ordered
+guest invocation and signed-in session. Each guest names its own AppProfile and
+declares either QA suites or a strict inventory step. Inventory may combine
+check directories and files into one named-outcome manifest. Paths are relative
+to the plan file.
+
+The plan contains environment-variable names for credentials, never their
+values; checks use `setup_secret: Some(Username)` or
+`setup_secret: Some(Password)` for login fields. A typed `Assertion` binding can
+provide a nonsecret check subject or form value without copying deployment
+configuration into a check. `subject_secret` can assert that a runtime username
+or password was not rendered; the value is resolved only inside its signed-in
+session and redacted from reports, including escaped JSON-string forms. A session
+may share credentials with another session only when both declare the same
+`identity_group`. `any_of` accepts one of a check's explicitly listed simple
+rendered outcomes; it does not add conditional actions. The runner removes inherited
+environment from every child host, then sets only `QA_INSPECT_PAGE` and a
+unique `CHUZZ_CONTROL_DIR` under `target/ps-qa/run-plan-control`; it suppresses
+the host's console output during the run.
+
+```ron
+(
+    version: 1,
+    environment: [
+        (id: "host", name: "CHUZZ_HEADLESS_BIN", kind: Host),
+        (id: "page", name: "QA_SITE_URL", kind: Page),
+        (id: "auth_ws", name: "QA_PRODUCTION_AUTH_WS_URL", kind: Assertion,
+            format: SecureWebSocket, default: Some("wss://auth.honey.id")),
+        (id: "merchant_user", name: "QA_MERCHANT_USERNAME", kind: Secret),
+        (id: "merchant_password", name: "QA_MERCHANT_PASSWORD", kind: Secret),
+    ],
+    host: "host",
+    page: "page",
+    login: Some((checks: ["login.ron"], selector: "login")),
+    guests: [
+        (
+            id: "public",
+            app_profile: "ps-qa.ron",
+            suites: [(checks: ["checks"], selector: "*")],
+        ),
+        (
+            id: "inventory",
+            app_profile: "inventory.ron",
+            inventory: Some((checks: ["checks", "isolated"], require_outcomes: true)),
+        ),
+    ],
+    sessions: [
+        (
+            id: "merchant_admin",
+            username: "merchant_user",
+            password: "merchant_password",
+            landing: "Home",
+            suites: [
+                (checks: ["members.ron"], selector: "app-members"),
+            ],
+        ),
+    ],
+)
+```
+
+Set `CHUZZ_HEADLESS_BIN`, `QA_SITE_URL`, and the declared credential variables
+in the runner environment, then invoke `ps-qa --app <session-profile.ron> run-plan <plan.ron>` when the plan has signed-in sessions, or omit `--app` for guest-only plans. Unknown
+plan fields, environment references, selectors, and login setup shapes fail
+before the first host starts. `run-plan` does not accept tracing or pixel
+capture options because either could expose rendered credential data.
+Assertion formats validate the expected value shape, and a check names a
+binding with `subject_env: Some("auth_ws")`. Guests and sessions run in
+declaration order; plans do not execute conditional actions or shell commands.
+Duplicate protected usernames are rejected unless the affected sessions name
+the same explicit `identity_group` and credentials.
 
 Paint assertions such as `Contrast`, `FullOpacity`, and `OpaqueBackground`
 describe the state after a check's input. A check that toggles a theme and asks

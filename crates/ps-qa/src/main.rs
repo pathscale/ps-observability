@@ -11,6 +11,7 @@ mod interaction;
 mod layout_report;
 mod paint_audit;
 mod paint_color;
+mod plan;
 mod qa;
 mod reach;
 mod report;
