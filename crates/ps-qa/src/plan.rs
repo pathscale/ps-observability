@@ -591,6 +591,29 @@ fn resolve_checks_path(base: &Path, checks: &mut PathBuf) -> Result<(), String> 
                 .into(),
         );
     }
+    if resolved.is_dir() {
+        let entries = std::fs::read_dir(&resolved)
+            .map_err(|_| "could not read run-plan checks directory".to_owned())?;
+        for entry in entries {
+            let entry = entry.map_err(|_| "could not read run-plan checks directory".to_owned())?;
+            let candidate = entry.path();
+            if !candidate
+                .extension()
+                .is_some_and(|extension| extension == "ron")
+                || candidate
+                    .file_name()
+                    .is_some_and(|name| name == "ps-qa.ron")
+            {
+                continue;
+            }
+            let resolved_file = candidate
+                .canonicalize()
+                .map_err(|_| "run-plan check files must stay under its plan directory")?;
+            if !resolved_file.starts_with(base) || !resolved_file.is_file() {
+                return Err("run-plan check files must stay under its plan directory".into());
+            }
+        }
+    }
     *checks = resolved;
     Ok(())
 }
