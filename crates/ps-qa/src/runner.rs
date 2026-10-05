@@ -746,25 +746,39 @@ async fn capture_stable_region(
     }
 }
 
-/// Wait only for the first authored hover frame, not for the whole animation.
+/// Recapture one already-identified subject until its pixels differ from the
+/// pre-action baseline, or the outcome deadline expires.
 ///
-/// Capturing immediately after pointer delivery races the renderer: a valid
-/// transition still has its pre-hover pixels until the next frame. A 100 ms
-/// ceiling keeps the interaction contract responsive while allowing that one
-/// frame to be produced.
+/// The action is not re-driven. The first sample is taken immediately: an
+/// unchanged frame before the deadline stays pending rather than failing, and
+/// there is no quiet sleep before that first read. When paint events were
+/// armed before the action, a committed frame is the wake source; otherwise
+/// the existing bounded poll fallback is used. Geometry, progress and name
+/// are not consulted.
 async fn wait_for_pixels_change(
     client: &mut Client,
+    node_id: u64,
     selector: &str,
     before: &CapturedImage,
-    timeout: Duration,
+    deadline: Instant,
+    event_driven: bool,
 ) -> std::result::Result<(), String> {
-    let deadline = std::time::Instant::now() + timeout;
-
     loop {
-        let after = capture_region(client, selector).await?;
-        match assess_pixel_change(before, &after, std::time::Instant::now() >= deadline)? {
+        let after = capture_node_region(client, node_id, selector).await?;
+        let now = Instant::now();
+        match assess_pixel_change(before, &after, now >= deadline)? {
             Some(()) => return Ok(()),
-            None => nagoya::sleep(Duration::from_millis(8)).await,
+            None => {
+                let remaining = deadline.saturating_duration_since(now);
+                if event_driven {
+                    let _ = client
+                        .wait_for_paint(remaining)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    nagoya::sleep(remaining.min(Duration::from_millis(25))).await;
+                }
+            }
         }
     }
 }
@@ -1986,6 +2000,12 @@ async fn run_qa_inner(
                     // not an id from the state the pointer just replaced.
                     let node_id = scroll_hover_target_into_view(client, hover.target()).await?;
                     let before = capture_region(client, &check.subject).await?;
+                    let subject_id = before.node_id.ok_or_else(|| {
+                        format!(
+                            "capture of {:?} did not identify the subject",
+                            check.subject
+                        )
+                    })?;
                     let event_driven = client
                         .arm_paint_events()
                         .await
@@ -2018,13 +2038,16 @@ async fn run_qa_inner(
                     // the final verdict.
                     let comparison = wait_for_pixels_change(
                         client,
+                        subject_id,
                         &check.subject,
                         &before,
-                        declared_outcome_timeout(check),
+                        Instant::now() + declared_outcome_timeout(check),
+                        event_driven,
                     )
                     .await;
                     if comparison.is_err()
-                        && let Ok(after) = capture_region(client, &check.subject).await
+                        && let Ok(after) =
+                            capture_node_region(client, subject_id, &check.subject).await
                         && let Err(error) = save_pixel_artifacts(&check.id, &before, &after)
                     {
                         eprintln!("could not save pixel artifacts for {}: {error}", check.id);
@@ -2125,9 +2148,13 @@ async fn run_qa_inner(
             && check.after_prepare_hover.is_none()
         {
             Some(match capture_node_id(&before.nodes, &check.subject) {
-                Ok(node_id) => capture_node_region(client, node_id, &check.subject)
-                    .await
-                    .map(|image| (node_id, image)),
+                Ok(node_id) => match capture_node_region(client, node_id, &check.subject).await {
+                    Ok(image) => match client.arm_paint_events().await {
+                        Ok(event_driven) => Ok((node_id, image, event_driven)),
+                        Err(error) => Err(error.to_string()),
+                    },
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(error),
             })
         } else {
@@ -2380,11 +2407,26 @@ async fn run_qa_inner(
             && let Some(before_pixels) = before_action_pixels
         {
             pixel_outcome = Some(match before_pixels {
-                Ok((node_id, before_pixels)) => {
-                    match capture_node_region(client, node_id, &check.subject).await {
-                        Ok(after_pixels) => pixels_change(&before_pixels, &after_pixels),
-                        Err(error) => Err(error),
+                Ok((node_id, before_pixels, event_driven)) => {
+                    let deadline = check_started.unwrap_or_else(Instant::now)
+                        + declared_outcome_timeout(check);
+                    let comparison = wait_for_pixels_change(
+                        client,
+                        node_id,
+                        &check.subject,
+                        &before_pixels,
+                        deadline,
+                        event_driven,
+                    )
+                    .await;
+                    if comparison.is_err()
+                        && let Ok(after) =
+                            capture_node_region(client, node_id, &check.subject).await
+                        && let Err(error) = save_pixel_artifacts(&check.id, &before_pixels, &after)
+                    {
+                        eprintln!("could not save pixel artifacts for {}: {error}", check.id);
                     }
+                    comparison
                 }
                 Err(error) => Err(error),
             });
