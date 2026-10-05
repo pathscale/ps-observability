@@ -37,7 +37,8 @@ use crate::computed_style::{
 use crate::diagnostics::{dom, metrics, nodes, panes, spill, transcript};
 use crate::inspector::{Client, inspect, inspect_subtree};
 use crate::interaction::{
-    click_named, hover_over, pointer_drag, press_key, scroll, scroll_events, type_keys, type_text,
+    TextEntryFailure, click_named, hover_over, pointer_drag, press_key, scroll, scroll_events,
+    type_keys, type_text,
 };
 use crate::layout_report::layout;
 use crate::target::{
@@ -1611,8 +1612,12 @@ async fn run_qa_inner(
         {
             match type_text(client, field, value).await {
                 Err(error) => {
+                    let category = error
+                        .downcast_ref::<TextEntryFailure>()
+                        .map(TextEntryFailure::category)
+                        .unwrap_or("unclassified_text_entry_failure");
                     open_error = Some(if is_secret {
-                        format!("could not establish credential setup in {field:?}")
+                        format!("could not establish credential setup in {field:?} ({category})")
                     } else {
                         format!("could not establish setup value in {field:?}: {error}")
                     });

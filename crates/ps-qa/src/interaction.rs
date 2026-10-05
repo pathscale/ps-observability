@@ -1,18 +1,18 @@
 //! Pointer, keyboard, and text input against a running application.
 
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use blitz_control_protocol::{
     AgentAction, AgentControlRequest, InputCommand, KeyPhase, Modifiers, PointerPhase,
-    SemanticNode, WheelPhase,
+    SemanticNode, WheelPhase, client::safe_response_code,
 };
 use eyre::{Result, bail, eyre};
 
 use crate::diagnostics::metrics_if_supported;
 use crate::inspector::{Client, inspect};
 use crate::target::{locate_control, selector_matches_node};
-use crate::timing::{pace, sleep_pace};
+use crate::timing::{check_timeout, pace, sleep_pace};
 use crate::{cli, reach, report};
 
 pub(crate) async fn hover_over(client: &mut Client, want: &str) -> Result<bool> {
@@ -210,8 +210,25 @@ fn is_text_field_role(role: &str) -> bool {
     )
 }
 
-/// The painted text-entry control whose semantic name mentions `want` on the active layer.
-fn find_text_field<'a>(nodes: &'a [SemanticNode], want: &str) -> Option<&'a SemanticNode> {
+/// The unique enabled, visible text field matching `want` on the active layer.
+/// Ambiguous matches fail closed instead of selecting the first matching node.
+fn unique_text_field<'a>(
+    fields: impl IntoIterator<Item = &'a SemanticNode>,
+) -> std::result::Result<Option<&'a SemanticNode>, &'static str> {
+    let mut found = None;
+    for field in fields {
+        if found.is_some() {
+            return Err("ambiguous_text_field_match");
+        }
+        found = Some(field);
+    }
+    Ok(found)
+}
+
+fn find_text_field<'a>(
+    nodes: &'a [SemanticNode],
+    want: &str,
+) -> std::result::Result<Option<&'a SemanticNode>, &'static str> {
     let modal_scope: HashSet<u64> = reach::dismissers(nodes)
         .first()
         .map(|(id, _)| reach::enclosing_dialog(nodes, *id))
@@ -230,6 +247,7 @@ fn find_text_field<'a>(nodes: &'a [SemanticNode], want: &str) -> Option<&'a Sema
         .filter(|node| {
             is_text_field_role(node.role.as_str())
                 && node.enabled
+                && node.visible
                 && node
                     .bounds
                     .is_some_and(|bounds| bounds[2] > 0.0 && bounds[3] > 0.0)
@@ -238,14 +256,17 @@ fn find_text_field<'a>(nodes: &'a [SemanticNode], want: &str) -> Option<&'a Sema
 
     let matches_name = |node: &&SemanticNode| want.is_empty() || selector_matches_node(node, want);
     for scope in [&modal_scope, &surface_scope] {
-        if let Some(field) = fields
-            .iter()
-            .find(|node| matches_name(node) && scope.contains(&node.id))
-        {
-            return Some(field);
+        let scoped = unique_text_field(
+            fields
+                .iter()
+                .copied()
+                .filter(|node| matches_name(node) && scope.contains(&node.id)),
+        )?;
+        if scoped.is_some() {
+            return Ok(scoped);
         }
     }
-    fields.into_iter().find(matches_name)
+    unique_text_field(fields.into_iter().filter(matches_name))
 }
 
 /// Drive real key events into a focused text field and price them.
@@ -403,9 +424,9 @@ pub(crate) fn parse_key_chord(name: &str) -> Result<(String, String, Modifiers)>
 
 pub(crate) async fn type_keys(client: &mut Client, count: usize, want: &str) -> Result<()> {
     let (snapshot, _) = inspect(client).await?;
-    let Some(field) = find_text_field(&snapshot.nodes, want) else {
-        bail!("no enabled, visible text field found; open a tab with a composer");
-    };
+    let field = find_text_field(&snapshot.nodes, want)
+        .map_err(|_| eyre!("multiple enabled, visible text fields match the selector"))?
+        .ok_or_else(|| eyre!("no enabled, visible text field found; open a tab with a composer"))?;
     println!(
         "typing into node {} role={} name={}",
         field.id,
@@ -445,21 +466,96 @@ pub(crate) async fn type_keys(client: &mut Client, count: usize, want: &str) -> 
     Ok(())
 }
 
-/// Set literal text on an exact semantic text-field node.
+/// A value-free stage label for runtime credential setup diagnostics.
+#[derive(Debug)]
+pub(crate) struct TextEntryFailure(&'static str);
+
+impl TextEntryFailure {
+    pub(crate) fn category(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for TextEntryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "text entry failed at {}", self.0)
+    }
+}
+
+impl std::error::Error for TextEntryFailure {}
+
+fn inspect_failure_category(error: &eyre::Report) -> &'static str {
+    match safe_response_code(error) {
+        Some("documentUnavailable") => "inspect_document_unavailable",
+        Some(_) => "inspect_rejected",
+        None => "inspect_transport_or_protocol_failure",
+    }
+}
+
+fn set_value_failure_category(error: &eyre::Report) -> &'static str {
+    match safe_response_code(error) {
+        Some("notEditable") => "set_value_not_editable",
+        Some("unknownNode") => "set_value_unknown_node",
+        Some("documentUnavailable") => "set_value_document_unavailable",
+        Some(_) => "set_value_rejected",
+        None => "set_value_transport_or_protocol_failure",
+    }
+}
+
+async fn wait_for_text_field_id(
+    client: &mut Client,
+    want: &str,
+    within: Duration,
+) -> Result<Option<u64>> {
+    let previous_timeout = client.request_timeout();
+    client.set_request_timeout(within);
+    let result: Result<Option<u64>> = async {
+        let deadline = Instant::now() + within;
+        let event_driven = client.arm_paint_events().await.unwrap_or(false);
+        loop {
+            let (snapshot, _) = inspect(client).await.map_err(|error| {
+                eyre::Report::new(TextEntryFailure(inspect_failure_category(&error)))
+            })?;
+            let field_id = find_text_field(&snapshot.nodes, want)
+                .map_err(|category| eyre::Report::new(TextEntryFailure(category)))?
+                .map(|field| field.id);
+            if field_id.is_some() {
+                return Ok(field_id);
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            if event_driven {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() {
+                    let _ = client.wait_for_paint(remaining).await?;
+                }
+            } else {
+                nagoya::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    .await;
+    client.set_request_timeout(previous_timeout);
+    result
+}
+
+/// Set literal text on one exact, enabled, visible semantic text-field node.
 pub(crate) async fn type_text(client: &mut Client, want: &str, text: &str) -> Result<u64> {
-    let (snapshot, _) = inspect(client).await?;
-    let field = find_text_field(&snapshot.nodes, want)
-        .ok_or_else(|| eyre!("no enabled, visible text field matching {want:?}"))?;
+    let node_id = wait_for_text_field_id(client, want, check_timeout(900))
+        .await?
+        .ok_or_else(|| eyre::Report::new(TextEntryFailure("matching_text_field_not_found")))?;
     if cli::trace() {
-        println!("        setting {want:?} (id {})", field.id);
+        println!("        setting {want:?} (id {node_id})");
     }
     client
         .agent(&AgentControlRequest::Act(AgentAction::SetValue {
-            node_id: field.id,
+            node_id,
             value: text.to_owned(),
         }))
-        .await?;
-    Ok(field.id)
+        .await
+        .map_err(|error| eyre::Report::new(TextEntryFailure(set_value_failure_category(&error))))?;
+    Ok(node_id)
 }
 
 /// Price a single click, such as switching to a tab.

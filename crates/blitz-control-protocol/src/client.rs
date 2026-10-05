@@ -253,6 +253,21 @@ pub fn is_unsupported(error: &eyre::Report) -> bool {
         .is_some_and(|refusal| refusal.code == "unsupported")
 }
 
+/// Return a bounded response category without exposing the inspector message.
+pub fn safe_response_code(error: &eyre::Report) -> Option<&'static str> {
+    let code = error
+        .downcast_ref::<InspectorResponseError>()?
+        .code
+        .as_str();
+    Some(match code {
+        "notEditable" => "notEditable",
+        "unknownNode" => "unknownNode",
+        "documentUnavailable" => "documentUnavailable",
+        "unsupportedRequest" => "unsupportedRequest",
+        _ => "other",
+    })
+}
+
 impl Client {
     fn queue_event(&mut self, event: DebugEvent) {
         if self.events.len() == MAX_QUEUED_EVENTS {
