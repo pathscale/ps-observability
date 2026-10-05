@@ -160,7 +160,11 @@ Paint assertions such as `Contrast`, `FullOpacity`, and `OpaqueBackground`
 describe the state after a check's input. A check that toggles a theme and asks
 for contrast measures the resulting theme. Contrast waits within the declared
 `outcome_timeout_ms` for transition frames to become readable and honors
-`stable_for_ms` when the check requires sustained contrast. The native CLI
+`stable_for_ms` when the check requires sustained contrast. Action-driven
+`PixelsChange` captures the subject once before the click, key, or scroll,
+drives that action once, and recaptures the same node against that baseline
+until the pixels differ or `outcome_timeout_ms` expires. `settle_after_ms` is
+the quiet window after the verdict, not a wait for those pixels. The native CLI
 regression verifies immediate and delayed repairs, and a persistent contrast
 regression that must fail:
 
@@ -271,7 +275,7 @@ tabs, then activates the exact semantic node id.
 | `Measures` | every subject meets the `expect_size` width/height contract |
 | `PixelsHold` | rendered pixels survive repeated pointer abuse unchanged |
 | `PixelsHoldAfterHover` | the initial neutral frame already equals the post-hover neutral frame |
-| `PixelsChange` | hover visibly changes the declared capture region |
+| `PixelsChange` | hover or a driven action visibly changes the declared capture region |
 | `VisibleInk` | the capture contains visible pixels distinct from its backdrop |
 | `InteriorInk` | visible content exists away from the control's border |
 | `OpaqueBackground` | computed background alpha is fully opaque |
