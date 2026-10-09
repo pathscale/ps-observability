@@ -2242,7 +2242,11 @@ async fn run_qa_inner(
 
         // Then the action, if this check is about one. A click that cannot be
         // dispatched is itself a failure, not a skip.
-        client.set_request_timeout(check_timeout(check.outcome_timeout_ms.max(900)));
+        client.set_request_timeout(check_timeout(
+            check
+                .outcome_timeout_ms
+                .max(qa::DEFAULT_OUTCOME_TIMEOUT_MS),
+        ));
         let mut action_error = open_error;
         let mut action_target = None;
         let mut action_node_id = None;
@@ -2445,11 +2449,7 @@ async fn run_qa_inner(
                     node_id,
                     &check.subject,
                     before_size,
-                    check_timeout(if check.outcome_timeout_ms == 0 {
-                        900
-                    } else {
-                        check.outcome_timeout_ms
-                    }),
+                    check_timeout(qa::effective_outcome_timeout_ms(check.outcome_timeout_ms)),
                 )
                 .await,
             );
@@ -2542,11 +2542,7 @@ async fn run_qa_inner(
         // must arrive inside the verdict budget. An overloaded runner can opt
         // into a visible multiplier; the default remains the strict contract.
         let elapsed = check_started.unwrap_or_else(Instant::now).elapsed();
-        let declared_outcome = if check.outcome_timeout_ms == 0 {
-            900
-        } else {
-            check.outcome_timeout_ms
-        };
+        let declared_outcome = qa::effective_outcome_timeout_ms(check.outcome_timeout_ms);
         let verdict_budget = check_timeout(1_250.max(declared_outcome.saturating_add(250)));
         if elapsed > verdict_budget {
             let timing = format!(
@@ -3033,11 +3029,7 @@ fn declared_open_timeout(check: &qa::Check) -> Duration {
 }
 
 fn declared_outcome_timeout(check: &qa::Check) -> Duration {
-    check_timeout(if check.outcome_timeout_ms == 0 {
-        900
-    } else {
-        check.outcome_timeout_ms
-    })
+    check_timeout(qa::effective_outcome_timeout_ms(check.outcome_timeout_ms))
 }
 
 /// Resolve an application-owned surface opener.

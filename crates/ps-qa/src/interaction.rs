@@ -11,7 +11,7 @@ use eyre::{Result, bail, eyre};
 
 use crate::diagnostics::metrics_if_supported;
 use crate::inspector::{Client, inspect};
-use crate::target::{locate_control, selector_matches_node};
+use crate::target::{exact_selector_matches_node, locate_control, selector_matches_node};
 use crate::timing::{check_timeout, pace, sleep_pace};
 use crate::{cli, reach, report};
 
@@ -246,7 +246,6 @@ fn find_text_field<'a>(
         .iter()
         .filter(|node| {
             is_text_field_role(node.role.as_str())
-                && node.enabled
                 && node.visible
                 && node
                     .bounds
@@ -256,17 +255,38 @@ fn find_text_field<'a>(
 
     let matches_name = |node: &&SemanticNode| want.is_empty() || selector_matches_node(node, want);
     for scope in [&modal_scope, &surface_scope] {
-        let scoped = unique_text_field(
-            fields
-                .iter()
-                .copied()
-                .filter(|node| matches_name(node) && scope.contains(&node.id)),
-        )?;
-        if scoped.is_some() {
-            return Ok(scoped);
+        let mut scoped: Vec<&SemanticNode> = fields
+            .iter()
+            .copied()
+            .filter(|node| matches_name(node) && scope.contains(&node.id))
+            .collect();
+        if scoped.is_empty() {
+            continue;
         }
+        // Resolve the active layer before exact-name preference: a background
+        // exact match must not displace a longer match inside the modal.
+        if !want.is_empty()
+            && scoped
+                .iter()
+                .any(|node| exact_selector_matches_node(node, want))
+        {
+            scoped.retain(|node| exact_selector_matches_node(node, want));
+        }
+        // Keep exact-match priority even when the matching field is disabled.
+        // An unusable match in a higher-priority scope must not select the background.
+        scoped.retain(|node| node.enabled);
+        return unique_text_field(scoped.into_iter());
     }
-    unique_text_field(fields.into_iter().filter(matches_name))
+    let mut global: Vec<&SemanticNode> = fields.into_iter().filter(matches_name).collect();
+    if !want.is_empty()
+        && global
+            .iter()
+            .any(|node| exact_selector_matches_node(node, want))
+    {
+        global.retain(|node| exact_selector_matches_node(node, want));
+    }
+    global.retain(|node| node.enabled);
+    unique_text_field(global.into_iter())
 }
 
 /// Drive real key events into a focused text field and price them.
