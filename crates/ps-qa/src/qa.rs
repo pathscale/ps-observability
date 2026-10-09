@@ -841,6 +841,16 @@ pub fn checks_from_paths(paths: &[std::path::PathBuf]) -> Result<Vec<Check>, Str
     Ok(all)
 }
 
+pub(crate) const DEFAULT_OUTCOME_TIMEOUT_MS: u64 = 900;
+
+pub(crate) const fn effective_outcome_timeout_ms(timeout_ms: u64) -> u64 {
+    if timeout_ms == 0 {
+        DEFAULT_OUTCOME_TIMEOUT_MS
+    } else {
+        timeout_ms
+    }
+}
+
 fn validate_check(
     check: &Check,
     file: &std::path::Path,
@@ -852,6 +862,20 @@ fn validate_check(
             check.id,
             file.display(),
             previous.display()
+        ));
+    }
+
+    let outcome_timeout_ms = effective_outcome_timeout_ms(check.outcome_timeout_ms);
+    if check.stable_for_ms >= outcome_timeout_ms {
+        return Err(format!(
+            concat!(
+                "{}: check {:?} has stable_for_ms={}ms, which must be less than its ",
+                "effective outcome_timeout_ms={}ms"
+            ),
+            file.display(),
+            check.id,
+            check.stable_for_ms,
+            outcome_timeout_ms
         ));
     }
 
