@@ -2243,6 +2243,9 @@ async fn run_qa_inner(
                 | qa::Expect::TransparentWindowTint
                 | qa::Expect::Contrast
                 | qa::Expect::FontSizeGrows
+                | qa::Expect::GpuNoErrors
+                | qa::Expect::GpuHasResource
+                | qa::Expect::GpuDraws(_)
         );
         let drives_action = check.click.is_some()
             || check.text.is_some()
@@ -2396,7 +2399,10 @@ async fn run_qa_inner(
          */
         // These verdicts describe the resulting paint, so read them after input.
         // Measuring before a theme toggle judged the previous theme instead.
-        if action_error.is_none() && check.expect == qa::Expect::OpaqueBackground {
+        if action_error.is_none() && gpu_expectation(check.expect) {
+            pixel_outcome =
+                Some(wait_for_gpu(client, check, check_started.unwrap_or_else(Instant::now)).await);
+        } else if action_error.is_none() && check.expect == qa::Expect::OpaqueBackground {
             pixel_outcome = Some(opaque_background(client, &check.subject).await);
         } else if action_error.is_none() && check.expect == qa::Expect::TransparentBackground {
             pixel_outcome = Some(transparent_background(client, &check.subject).await);
@@ -2659,6 +2665,139 @@ async fn run_qa_inner(
     };
     println!("{printable}");
     Ok(failed)
+}
+
+fn gpu_expectation(expect: qa::Expect) -> bool {
+    matches!(
+        expect,
+        qa::Expect::GpuNoErrors | qa::Expect::GpuHasResource | qa::Expect::GpuDraws(_)
+    )
+}
+
+async fn gpu_report(client: &mut Client) -> Result<blitz_control_protocol::WebGpuReport> {
+    match client
+        .diagnostics(&DiagnosticsRequest::WebGpuInspect)
+        .await?
+        .response
+    {
+        DebugResponse::WebGpu(report) => Ok(report),
+        other => bail!("asked for WebGPU inspection, got {other:?}"),
+    }
+}
+
+fn gpu_verdict(
+    check: &qa::Check,
+    report: &blitz_control_protocol::WebGpuReport,
+) -> std::result::Result<(), String> {
+    match check.expect {
+        qa::Expect::GpuNoErrors => {
+            if report.errors.validation_total == 0 && report.errors.uncaptured_total == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "WebGPU has {} validation and {} uncaptured error(s) since load ({} total)",
+                    report.errors.validation_total,
+                    report.errors.uncaptured_total,
+                    report.errors.total,
+                ))
+            }
+        }
+        qa::Expect::GpuHasResource => {
+            let (kind, label) = check
+                .subject
+                .split_once(':')
+                .ok_or_else(|| "GpuHasResource subject must be kind:label".to_owned())?;
+            if report
+                .resources
+                .iter()
+                .any(|resource| resource.details.kind_name() == kind && resource.label == label)
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "no live WebGPU resource matching {:?}",
+                    check.subject
+                ))
+            }
+        }
+        qa::Expect::GpuDraws(required) => {
+            let frame = report
+                .frames
+                .last()
+                .ok_or_else(|| "WebGPU has no submitted frame to inspect".to_owned())?;
+            if !frame.complete {
+                return Err(format!(
+                    "WebGPU frame {} was not completely sampled",
+                    frame.sequence
+                ));
+            }
+            let count = frame
+                .passes
+                .iter()
+                .filter(|pass| {
+                    pass.color_targets.iter().flatten().any(|target| {
+                        target.target == check.subject
+                            || target.resolve_target.as_deref() == Some(check.subject.as_str())
+                    }) || pass
+                        .depth_target
+                        .as_ref()
+                        .is_some_and(|target| target.target == check.subject)
+                })
+                .fold(0_u64, |count, pass| count.saturating_add(pass.draw_count()));
+            if count >= required {
+                Ok(())
+            } else {
+                Err(format!(
+                    "WebGPU frame {} drew {} time(s) into {:?}; expected at least {}",
+                    frame.sequence, count, check.subject, required,
+                ))
+            }
+        }
+        _ => Err("not a GPU expectation".to_owned()),
+    }
+}
+
+async fn wait_for_gpu(
+    client: &mut Client,
+    check: &qa::Check,
+    started: Instant,
+) -> std::result::Result<(), String> {
+    let deadline = started + declared_outcome_timeout(check);
+    let stable_for = Duration::from_millis(check.stable_for_ms);
+    let mut passing_since = None;
+    loop {
+        let report = gpu_report(client)
+            .await
+            .map_err(|error| error.to_string())?;
+        let verdict = gpu_verdict(check, &report);
+        let now = Instant::now();
+        if verdict.is_ok() {
+            let since = passing_since.get_or_insert(now);
+            if now.duration_since(*since) >= stable_for {
+                return Ok(());
+            }
+        } else {
+            passing_since = None;
+            // Cumulative errors cannot disappear without a new page load.
+            if check.expect == qa::Expect::GpuNoErrors {
+                return verdict;
+            }
+        }
+        if now >= deadline {
+            return verdict.and_then(|()| {
+                Err(format!(
+                    "GPU outcome did not remain complete for {}ms",
+                    stable_for.as_millis(),
+                ))
+            });
+        }
+        nagoya::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(25)),
+        )
+        .await;
+    }
 }
 
 fn outcome_verdict(
@@ -3013,7 +3152,9 @@ async fn settle_for_outcome(
             if let Some(node_id) = offscreen {
                 revealed_subject = true;
                 let _ = client
-                    .agent(&AgentControlRequest::Act(AgentAction::ScrollIntoView { node_id }))
+                    .agent(&AgentControlRequest::Act(AgentAction::ScrollIntoView {
+                        node_id,
+                    }))
                     .await;
                 continue;
             }
@@ -6216,6 +6357,13 @@ pub async fn run() -> Result<()> {
     }
 
     match cli.command {
+        cli::Command::Gpu => {
+            let report = gpu_report(&mut client).await?;
+            println!(
+                "{}",
+                toon_format::encode_default(&report).map_err(|error| eyre!(error.to_string()))?
+            );
+        }
         cli::Command::Metrics => {
             println!("\n== metrics ==");
             let envelope = client

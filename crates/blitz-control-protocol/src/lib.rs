@@ -83,6 +83,9 @@ pub mod in_process;
 pub mod latest;
 /// The embedder's answer to a request about the process, not the document.
 pub mod lifecycle;
+/// Page-owned WebGPU diagnostic reports.
+pub mod webgpu;
+pub use webgpu::*;
 /// The socket transport, listening half.
 ///
 /// Unix only. The transport is a Unix domain socket with owner-only
@@ -211,6 +214,12 @@ pub enum DiagnosticsRequest {
     /// host availability still depends on the renderer backend for that
     /// platform.
     Capture(CaptureRequest),
+    /// Inspect page-owned devices, live resources, errors and submitted frames.
+    ///
+    /// Asking renews a ten-second lease for pass and draw bookkeeping.
+    /// Hosts without a page WebGPU inspector return their unsupported
+    /// diagnostics error; absence of support is not an empty report.
+    WebGpuInspect,
 }
 
 /// What to draw, and how large.
@@ -277,6 +286,7 @@ pub enum DebugResponse {
     Idle(RevisionSet),
     WindowComposition(WindowComposition),
     Captured(CapturedImage),
+    WebGpu(WebGpuReport),
     /// One condensation level over the settled page, level-shaped so a caller
     /// asking for keywords is not handed the page's full text.
     Condensation(condense::Condensation),
@@ -1102,6 +1112,7 @@ fn response_summary(response: &DebugResponse) -> String {
         DebugResponse::Condensation(condensation) => {
             format!("condensed page, {} level", condensation.level_name())
         }
+        DebugResponse::WebGpu(_) => "WebGPU report".into(),
         DebugResponse::Error(error) => error.message.clone(),
     }
 }
