@@ -363,6 +363,9 @@ pub enum Command {
         name: String,
     },
 
+    /// Inspect page-owned WebGPU devices, resources, errors and frames as TOON.
+    Gpu,
+
     /// Render what the application actually drew and report the visible ink in
     /// it, for the whole window or one named node.
     ///

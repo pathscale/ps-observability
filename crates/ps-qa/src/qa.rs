@@ -82,6 +82,26 @@ impl Hover {
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Expect {
+    /// No uncaptured or validation WebGPU error has occurred since page load.
+    ///
+    /// The subject is ignored; use "gpu". Inspection drains recent messages,
+    /// but this assertion reads cumulative totals, so another inspector cannot
+    /// consume evidence and make an erroneous page pass.
+    GpuNoErrors,
+    /// A live WebGPU object has exactly the specified kind and JS label.
+    ///
+    /// Subject: "kind:label", for example "render-pipeline:bloom".
+    /// This checks the native registry, including subsequent label changes.
+    GpuHasResource,
+    /// The newest submitted WebGPU frame contains at least this many draws
+    /// into the named target.
+    ///
+    /// Subject: a texture label or "canvas:#id". Direct, indexed and indirect
+    /// draw calls all count. Multiple passes into the target are summed.
+    /// An incomplete sample fails and is polled again within the outcome
+    /// budget, because counts from before the inspection lease prove nothing
+    /// about a newer unsampled submission.
+    GpuDraws(u64),
     /// The named node exists, is visible, and has a non-zero box.
     ///
     /// Non-zero is the part that matters. A node with a box of `0x0` is in the
@@ -1050,6 +1070,36 @@ fn validate_check(
         ));
     }
 
+    if check.expect == Expect::GpuHasResource
+        && !check.subject.split_once(':').is_some_and(|(kind, _)| {
+            matches!(
+                kind,
+                "buffer"
+                    | "texture"
+                    | "sampler"
+                    | "shader-module"
+                    | "render-pipeline"
+                    | "compute-pipeline"
+                    | "bind-group"
+                    | "bind-group-layout"
+                    | "pipeline-layout"
+            )
+        })
+    {
+        return Err(format!(
+            "{}: check {:?} must use kind:label with GpuHasResource",
+            file.display(),
+            check.id,
+        ));
+    }
+    if matches!(check.expect, Expect::GpuDraws(_)) && check.subject.is_empty() {
+        return Err(format!(
+            "{}: check {:?} must name a GPU target with GpuDraws",
+            file.display(),
+            check.id,
+        ));
+    }
+
     if check.expect == Expect::Count && check.expect_count.is_none() {
         return Err(format!(
             "{}: check {:?} must declare expect_count with Count",
@@ -1633,6 +1683,9 @@ pub fn verdict(
                     ));
                 }
             }
+        }
+        Expect::GpuNoErrors | Expect::GpuHasResource | Expect::GpuDraws(_) => {
+            return Err("GPU expectations must be resolved by the live QA runner".to_owned());
         }
         Expect::PixelsHold
         | Expect::PixelsHoldAfterHover

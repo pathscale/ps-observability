@@ -383,10 +383,15 @@ pub(crate) fn set_node_value(
                     })
             };
             let Some(index) = index else {
-                return Err(debug_error("noSuchOption", "the select has no option with that value"));
+                return Err(debug_error(
+                    "noSuchOption",
+                    "the select has no option with that value",
+                ));
             };
             document.inner_mut().set_focus_to(node_id);
-            let changed = document.inner_mut().set_select_selected_index(node_id, index);
+            let changed = document
+                .inner_mut()
+                .set_select_selected_index(node_id, index);
             if changed {
                 document.inner_mut().snapshot_node(node_id);
                 let value = document.inner().select_value(node_id);

@@ -1474,7 +1474,14 @@ pub fn inspect_document(
                 && element.name.ns.as_ref() == "http://www.w3.org/2000/svg"
                 && matches!(
                     element.name.local.as_ref(),
-                    "path" | "line" | "polyline" | "polygon" | "rect" | "circle" | "ellipse" | "use"
+                    "path"
+                        | "line"
+                        | "polyline"
+                        | "polygon"
+                        | "rect"
+                        | "circle"
+                        | "ellipse"
+                        | "use"
                 )
             {
                 return None;
