@@ -331,6 +331,150 @@ impl Drop for HostProcess {
     }
 }
 
+/// A host this run launched. Replacing it uses the same binary, page and
+/// startup deadline; the check that lost the page is not run again.
+struct HostedSession {
+    host: std::path::PathBuf,
+    page: std::path::PathBuf,
+    startup_timeout: Duration,
+    quiet_output: bool,
+    clean_environment: bool,
+    process: HostProcess,
+    descriptor_path: std::path::PathBuf,
+}
+
+fn launch_host(
+    host: &std::path::Path,
+    page: &std::path::Path,
+    startup_timeout: Duration,
+    quiet_output: bool,
+    clean_environment: bool,
+) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
+    if !quiet_output && !clean_environment {
+        start_host(host, page, startup_timeout)
+    } else {
+        start_host_with_policy(host, page, startup_timeout, quiet_output, clean_environment)
+    }
+}
+
+impl HostedSession {
+    fn start(
+        host: &std::path::Path,
+        page: &std::path::Path,
+        startup_timeout: Duration,
+        quiet_output: bool,
+        clean_environment: bool,
+    ) -> std::result::Result<Self, String> {
+        let (process, descriptor_path) =
+            launch_host(host, page, startup_timeout, quiet_output, clean_environment)?;
+        Ok(Self {
+            host: host.to_path_buf(),
+            page: page.to_path_buf(),
+            startup_timeout,
+            quiet_output,
+            clean_environment,
+            process,
+            descriptor_path,
+        })
+    }
+
+    /// Stop the current process before the replacement is spawned, so a wedged
+    /// page cannot keep the control socket the next check has to attach to.
+    fn restart(&mut self) -> std::result::Result<(), String> {
+        let _ = self.process.child.kill();
+        let _ = self.process.child.wait();
+        if let Some(path) = self.process.control_dir.take()
+            && control_directory_is_real(&path)
+        {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        let (process, descriptor_path) = launch_host(
+            &self.host,
+            &self.page,
+            self.startup_timeout,
+            self.quiet_output,
+            self.clean_environment,
+        )?;
+        self.process = process;
+        self.descriptor_path = descriptor_path;
+        Ok(())
+    }
+}
+
+/// Verdict, settle samples and prepare retries for one check.
+type OneCheck = (std::result::Result<(), String>, u32, u32);
+
+/// The page worker or the inspector stopped answering. Ordinary check failures
+/// and harness mistakes (a bad manifest, a missing profile, a host that will
+/// not start) are not this.
+fn host_gave_up(error: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "pageUnresponsive",
+        "the page did not answer the control request",
+        "the page exceeded its Poll deadline",
+        "inspector did not answer within",
+        "the inspector closed the connection",
+        "sending to the inspector failed",
+        "reading from the inspector failed",
+    ];
+    MARKERS.iter().any(|marker| error.contains(*marker))
+}
+
+fn host_gave_up_report(error: &eyre::Report) -> bool {
+    let head = error.to_string();
+    host_gave_up(&head) || host_gave_up(&format!("{error:#}"))
+}
+
+fn host_failure_text(error: &eyre::Report) -> String {
+    let head = error.to_string();
+    if host_gave_up(&head) {
+        return head;
+    }
+    let chain = format!("{error:#}");
+    if host_gave_up(&chain) { chain } else { head }
+}
+
+/// How long to wait for an external inspector after a check lost it.
+///
+/// The budget is the one this check already declared: its open deadline, its
+/// outcome deadline, and the request timeout in force when it stopped.
+fn check_recovery_budget(client: &Client, check: &qa::Check) -> Duration {
+    client
+        .request_timeout()
+        .max(declared_open_timeout(check))
+        .max(declared_outcome_timeout(check))
+}
+
+async fn reconnect_hosted(client: &mut Client, hosted: &mut HostedSession) -> Result<()> {
+    hosted.restart().map_err(|error| eyre!(error))?;
+    let descriptor_path = hosted
+        .descriptor_path
+        .to_str()
+        .ok_or_else(|| eyre!("host descriptor path is not valid utf-8"))?;
+    let descriptor = inspector::discover(Some(descriptor_path))?;
+    let mut fresh = Client::connect(&descriptor.socket_path()).await?;
+    fresh.initialize().await?;
+    *client = fresh;
+    Ok(())
+}
+
+/// `tools/list` is answered by the control server and does not enter the page
+/// worker, so a dead page with a live inspector counts as an answer. A socket
+/// that never replies does not.
+async fn inspector_answers_again(client: &mut Client, budget: Duration) -> bool {
+    if budget.is_zero() {
+        return false;
+    }
+    let previous = client.request_timeout();
+    client.set_request_timeout(budget);
+    let answered = match client.tools_list().await {
+        Ok(_) => true,
+        Err(error) => !host_gave_up_report(&error),
+    };
+    client.set_request_timeout(previous);
+    answered
+}
+
 /// A node to park the pointer on between hovers.
 ///
 /// The largest painted node, which is the window or its root container: it is
@@ -1157,20 +1301,27 @@ async fn sweep_components(
         let mut launch_error: Option<String> = None;
 
         for check_id in &runs {
-            let started = match start_host(host, &dist, startup_timeout) {
-                Ok(started) => started,
+            let mut hosted = match HostedSession::start(host, &dist, startup_timeout, false, false)
+            {
+                Ok(hosted) => hosted,
                 Err(error) => {
                     launch_error = Some(error);
                     break;
                 }
             };
-            let (child, descriptor_path) = started;
-
-            let outcome = run_component(&descriptor_path, Some(check_id), checks_dir).await;
+            let descriptor_path = hosted.descriptor_path.clone();
+            let outcome = run_component(
+                &descriptor_path,
+                Some(check_id),
+                checks_dir,
+                Some(&mut hosted),
+            )
+            .await;
 
             // Dropped here, which kills this check's host before the next
-            // one starts.
-            drop(child);
+            // one starts. A check that lost the page already replaced the
+            // process for the checks that followed it inside the group.
+            drop(hosted);
 
             match outcome {
                 Ok(count) => component_failed += count,
@@ -1215,6 +1366,7 @@ async fn run_component(
     descriptor_path: &std::path::Path,
     selector: Option<&str>,
     checks_dir: Option<&std::path::Path>,
+    hosted: Option<&mut HostedSession>,
 ) -> Result<usize> {
     let descriptor = inspector::discover(descriptor_path.to_str())?;
     let mut client = Client::connect(&descriptor.socket_path()).await?;
@@ -1245,7 +1397,7 @@ async fn run_component(
         );
     }
 
-    let failed = run_qa(&mut client, selector, checks_dir).await?;
+    let failed = run_qa(&mut client, selector, checks_dir, hosted).await?;
     Ok(failed + uncovered.len())
 }
 
@@ -1342,8 +1494,9 @@ async fn run_qa(
     client: &mut Client,
     group: Option<&str>,
     checks_dir: Option<&std::path::Path>,
+    hosted: Option<&mut HostedSession>,
 ) -> Result<usize> {
-    run_qa_with_secrets(client, group, checks_dir, None).await
+    run_qa_with_secrets(client, group, checks_dir, None, hosted).await
 }
 
 async fn run_qa_with_secrets(
@@ -1351,9 +1504,18 @@ async fn run_qa_with_secrets(
     group: Option<&str>,
     checks_dir: Option<&std::path::Path>,
     secrets: Option<&plan::SessionSecrets>,
+    hosted: Option<&mut HostedSession>,
 ) -> Result<usize> {
     let checks_paths = checks_dir.map(|path| vec![path.to_path_buf()]);
-    run_qa_with_plan_values(client, group, checks_paths.as_deref(), secrets, None).await
+    run_qa_with_plan_values(
+        client,
+        group,
+        checks_paths.as_deref(),
+        secrets,
+        None,
+        hosted,
+    )
+    .await
 }
 
 async fn run_qa_with_plan_values(
@@ -1362,8 +1524,18 @@ async fn run_qa_with_plan_values(
     checks_paths: Option<&[std::path::PathBuf]>,
     secrets: Option<&plan::SessionSecrets>,
     assertion_values: Option<&HashMap<String, String>>,
+    hosted: Option<&mut HostedSession>,
 ) -> Result<usize> {
-    match run_qa_inner(client, group, checks_paths, secrets, assertion_values).await {
+    match run_qa_inner(
+        client,
+        group,
+        checks_paths,
+        secrets,
+        assertion_values,
+        hosted,
+    )
+    .await
+    {
         Err(error) => match secrets {
             Some(secrets) => Err(eyre!(secrets.redact(&error.to_string()))),
             None => Err(error),
@@ -1378,6 +1550,7 @@ async fn run_qa_inner(
     checks_paths: Option<&[std::path::PathBuf]>,
     secrets: Option<&plan::SessionSecrets>,
     assertion_values: Option<&HashMap<String, String>>,
+    mut hosted: Option<&mut HostedSession>,
 ) -> Result<usize> {
     let all = if let Some(paths) = checks_paths {
         qa::checks_from_paths(paths).map_err(eyre::Report::msg)?
@@ -1406,8 +1579,12 @@ async fn run_qa_inner(
     }
 
     let mut results: Vec<CheckResult<'_>> = Vec::new();
-    for check in &selected {
+    for index in 0..selected.len() {
+        let check = &selected[index];
         let full_check_started = Instant::now();
+        // `?` leaves this block instead of abandoning the group before the
+        // table exists. The check that stopped the page is not executed again.
+        let produced: std::result::Result<OneCheck, eyre::Report> = async {
         let mut retries = 0;
         // Navigation and disclosure materialization are suite setup. Give them
         // a bounded but realistic budget; the measured control action below
@@ -1445,6 +1622,9 @@ async fn run_qa_inner(
                 })
                 .await;
             if let Err(error) = navigated {
+                if host_gave_up_report(&error) {
+                    return Err(error);
+                }
                 open_error = Some(format!("could not navigate to {url:?}: {error}"));
             } else {
                 let target = check
@@ -1532,6 +1712,11 @@ async fn run_qa_inner(
                  * committing to either gesture broke the other set of checks.
                  */
                 let first_click = click_opener_quiet(client, want, named_document).await;
+                if let Err(error) = &first_click
+                    && host_gave_up_report(error)
+                {
+                    return Err(eyre!(error.to_string()));
+                }
                 let mut there = wait_for_navigation_arrival(
                     client,
                     destination,
@@ -1829,6 +2014,11 @@ async fn run_qa_inner(
             } else {
                 click_named_quiet(client, want).await.map(|_| ())
             };
+            if let Err(error) = &prepared
+                && host_gave_up_report(error)
+            {
+                return Err(eyre!(error.to_string()));
+            }
             if prepared.is_err() {
                 retries += 1;
                 // A retained sibling document may expose the same target name
@@ -2595,14 +2785,54 @@ async fn run_qa_inner(
                 ),
             }
         }
-        results.push(CheckResult {
-            check,
-            outcome,
-            duration_ms: full_check_started.elapsed().as_millis() as u64,
-            settle_iterations,
-            retries,
-        });
-        if check.settle_after_ms > 0 {
+        Ok((outcome, settle_iterations, retries))
+        }
+        .await;
+        let gave_up = match &produced {
+            Ok((outcome, _, _)) => outcome
+                .as_ref()
+                .err()
+                .is_some_and(|error| host_gave_up(error)),
+            Err(error) => host_gave_up_report(error),
+        };
+        match produced {
+            Ok((outcome, settle_iterations, retries)) => results.push(CheckResult {
+                check,
+                outcome,
+                duration_ms: full_check_started.elapsed().as_millis() as u64,
+                settle_iterations,
+                retries,
+            }),
+            Err(error) if gave_up => results.push(CheckResult {
+                check,
+                outcome: Err(host_failure_text(&error)),
+                duration_ms: full_check_started.elapsed().as_millis() as u64,
+                settle_iterations: 0,
+                retries: 0,
+            }),
+            Err(error) => return Err(error),
+        }
+        if gave_up && index + 1 < selected.len() {
+            if let Some(session) = hosted.as_deref_mut() {
+                reconnect_hosted(client, session).await?;
+            } else {
+                let budget = check_recovery_budget(client, check);
+                if !inspector_answers_again(client, budget).await {
+                    let id = &check.id;
+                    let message = format!("host stopped answering after {id}");
+                    for later in &selected[index + 1..] {
+                        results.push(CheckResult {
+                            check: later,
+                            outcome: Err(message.clone()),
+                            duration_ms: 0,
+                            settle_iterations: 0,
+                            retries: 0,
+                        });
+                    }
+                    break;
+                }
+            }
+        } else if !gave_up && check.settle_after_ms > 0 {
             nagoya::sleep(Duration::from_millis(check.settle_after_ms)).await;
         }
     }
@@ -3329,8 +3559,11 @@ fn named_document_is_active_with_permanent(
 async fn click_opener_quiet(client: &mut Client, want: &str, named_document: bool) -> Result<u64> {
     if named_document {
         let tab = format!("button:{want}{want}");
-        if let Ok(node_id) = click_named_quiet(client, &tab).await {
-            return Ok(node_id);
+        match click_named_quiet(client, &tab).await {
+            Ok(node_id) => return Ok(node_id),
+            // The gesture may already have landed. Do not send another.
+            Err(error) if host_gave_up_report(&error) => return Err(error),
+            Err(_) => {}
         }
     }
     click_named_quiet(client, want).await
@@ -6084,7 +6317,7 @@ async fn run_plan_host(
     login: Option<(&plan::CheckSuite, &str, &plan::SessionSecrets)>,
 ) -> Result<usize> {
     cli::set_app_profile(Some(app_profile.to_path_buf()));
-    let (child, descriptor_path) = start_host_with_policy(
+    let mut hosted = HostedSession::start(
         &plan.host,
         std::path::Path::new(&plan.page),
         Duration::from_secs(plan.startup_timeout_secs),
@@ -6092,7 +6325,7 @@ async fn run_plan_host(
         true,
     )
     .map_err(eyre::Report::msg)?;
-    let descriptor = inspector::discover(descriptor_path.to_str())?;
+    let descriptor = inspector::discover(hosted.descriptor_path.to_str())?;
     let mut client = Client::connect(&descriptor.socket_path()).await?;
     client.initialize().await?;
 
@@ -6104,12 +6337,13 @@ async fn run_plan_host(
             Some(&login_suite.checks),
             Some(credentials),
             Some(&plan.assertion_values),
+            Some(&mut hosted),
         )
         .await?;
         failed += login_failed;
         if login_failed > 0 {
             println!("SKIP signed-in suites: login checks failed");
-            drop(child);
+            drop(hosted);
             return Ok(failed);
         }
         let arrived = wait_for_arrival(&mut client, None, landing, Duration::from_secs(15))
@@ -6117,7 +6351,7 @@ async fn run_plan_host(
             .map_err(|error| eyre!(credentials.redact(&error.to_string())))?;
         if !arrived {
             println!("FAIL signed-in session: expected landing marker did not paint");
-            drop(child);
+            drop(hosted);
             return Ok(failed + 1);
         }
     }
@@ -6133,28 +6367,19 @@ async fn run_plan_host(
         .await?;
     } else {
         for suite in suites {
-            failed += if let Some((_, _, credentials)) = login {
-                run_qa_with_plan_values(
-                    &mut client,
-                    Some(&suite.selector),
-                    Some(&suite.checks),
-                    Some(credentials),
-                    Some(&plan.assertion_values),
-                )
-                .await?
-            } else {
-                run_qa_with_plan_values(
-                    &mut client,
-                    Some(&suite.selector),
-                    Some(&suite.checks),
-                    None,
-                    Some(&plan.assertion_values),
-                )
-                .await?
-            };
+            let credentials = login.map(|(_, _, credentials)| credentials);
+            failed += run_qa_with_plan_values(
+                &mut client,
+                Some(&suite.selector),
+                Some(&suite.checks),
+                credentials,
+                Some(&plan.assertion_values),
+                Some(&mut hosted),
+            )
+            .await?;
         }
     }
-    drop(child);
+    drop(hosted);
     Ok(failed)
 }
 
@@ -6325,11 +6550,23 @@ pub async fn run() -> Result<()> {
         startup_timeout,
     } = &cli.command
     {
-        let (child, descriptor_path) =
-            start_host(host, page, std::time::Duration::from_secs(*startup_timeout))
-                .map_err(|error| eyre!(error))?;
-        let result = run_component(&descriptor_path, selector.as_deref(), checks.as_deref()).await;
-        drop(child);
+        let mut hosted = HostedSession::start(
+            host,
+            page,
+            std::time::Duration::from_secs(*startup_timeout),
+            false,
+            false,
+        )
+        .map_err(|error| eyre!(error))?;
+        let descriptor_path = hosted.descriptor_path.clone();
+        let result = run_component(
+            &descriptor_path,
+            selector.as_deref(),
+            checks.as_deref(),
+            Some(&mut hosted),
+        )
+        .await;
+        drop(hosted);
         let failures = result?;
         if failures > 0 {
             std::process::exit(1);
@@ -6830,7 +7067,7 @@ pub async fn run() -> Result<()> {
             }
         }
         cli::Command::Qa { selector, checks } => {
-            let failed = run_qa(&mut client, selector.as_deref(), checks.as_deref()).await?;
+            let failed = run_qa(&mut client, selector.as_deref(), checks.as_deref(), None).await?;
             if failed > 0 {
                 std::process::exit(1);
             }
