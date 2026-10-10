@@ -361,6 +361,42 @@ pub(crate) fn set_node_value(
         .and_then(|element| element.text_input_data())
         .map(|input| input.editor.text().to_string());
     let Some(current) = current else {
+        // A native <select> takes the option whose value (or, failing that,
+        // label) matches, through the same path as choosing it with the
+        // keyboard: selectedness, restyle, then the input/change events.
+        let is_select = document
+            .inner()
+            .get_node(node_id)
+            .and_then(|node| node.element_data())
+            .is_some_and(|element| element.name.local.as_ref() == "select");
+        if is_select {
+            let index = {
+                let doc = document.inner();
+                let options = doc.select_options(node_id);
+                options
+                    .iter()
+                    .position(|option| doc.option_value(*option) == value)
+                    .or_else(|| {
+                        options
+                            .iter()
+                            .position(|option| doc.option_label(*option).trim() == value.trim())
+                    })
+            };
+            let Some(index) = index else {
+                return Err(debug_error("noSuchOption", "the select has no option with that value"));
+            };
+            document.inner_mut().set_focus_to(node_id);
+            let changed = document.inner_mut().set_select_selected_index(node_id, index);
+            if changed {
+                document.inner_mut().snapshot_node(node_id);
+                let value = document.inner().select_value(node_id);
+                document.dispatch_dom_event(DomEvent::new(
+                    node_id,
+                    DomEventData::Input(BlitzInputEvent { value }),
+                ));
+            }
+            return Ok(());
+        }
         let is_value_input = document
             .inner()
             .get_node(node_id)
