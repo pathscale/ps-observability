@@ -1462,6 +1462,23 @@ pub fn inspect_document(
                     .is_some_and(|rect| rect.width > 0.0 && rect.height > 0.0);
             let role = semantic_role(element);
             let name = semantic_name(element, node, &role, &inner, id, &labels);
+            // An unnamed SVG shape is drawing, not a node anyone addresses:
+            // browsers leave it out of the accessibility tree, and it has no
+            // box of its own here because its <svg> root paints it. Listing a
+            // wireframe's thousands of paths made every check report the page
+            // as retaining dead subtrees. Shapes are leaves, so no kept node
+            // loses its parent.
+            if role == "generic"
+                && name.is_empty()
+                && element_attr(element, "id").is_none()
+                && element.name.ns.as_ref() == "http://www.w3.org/2000/svg"
+                && matches!(
+                    element.name.local.as_ref(),
+                    "path" | "line" | "polyline" | "polygon" | "rect" | "circle" | "ellipse" | "use"
+                )
+            {
+                return None;
+            }
             let value = semantic_value(element, &inner, id);
             Some(SemanticNode {
                 dom_id: element_attr(element, "id").map(str::to_owned),
