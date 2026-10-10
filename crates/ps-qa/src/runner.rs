@@ -2920,6 +2920,7 @@ async fn settle_for_outcome(
     // When the whole tree was last serialised, so a scoped poll cannot go
     // permanently blind to the rest of the page. See the interval below.
     let mut last_full_probe: Option<std::time::Instant> = None;
+    let mut revealed_subject = false;
     // Arming discards the frames already queued, which is right before an
     // action and wrong after one: the commit this loop is waiting for may
     // already have arrived. A caller that armed before driving says so.
@@ -2988,6 +2989,34 @@ async fn settle_for_outcome(
             } else {
                 outcome_poll_scope(&after.nodes)
             };
+        }
+        // A subject that exists but sits outside the viewport (an earlier step
+        // scrolled the page) is revealed once, as a person would scroll to it.
+        // Painting is still judged on screen; only the scroll is supplied.
+        if !passing
+            && !revealed_subject
+            && matches!(check.expect, qa::Expect::Paints | qa::Expect::PaintsNamed)
+        {
+            let offscreen = qa::matching(&after.nodes, &check.subject)
+                .into_iter()
+                .find(|node| {
+                    node.bounds.is_some_and(|bounds| {
+                        bounds[2] > 0.0
+                            && bounds[3] > 0.0
+                            && crate::target::offscreen(
+                                bounds,
+                                crate::target::viewport_for_node_in(&after.nodes, node.id),
+                            )
+                    })
+                })
+                .map(|node| node.id);
+            if let Some(node_id) = offscreen {
+                revealed_subject = true;
+                let _ = client
+                    .agent(&AgentControlRequest::Act(AgentAction::ScrollIntoView { node_id }))
+                    .await;
+                continue;
+            }
         }
         if stability.observe(now, semantic_fingerprint(&after.nodes), passing, stable_for) {
             return Ok((after, None, iterations));

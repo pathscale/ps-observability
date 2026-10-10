@@ -507,15 +507,26 @@ async fn wait_for_text_field_id(
     want: &str,
     within: Duration,
 ) -> Result<Option<u64>> {
+    // `within` bounds the wait for the field, not one inspect: a busy page can
+    // take longer than that to answer a single request, which surfaced as a
+    // transport failure rather than as a slow page.
     let previous_timeout = client.request_timeout();
-    client.set_request_timeout(within);
+    client.set_request_timeout(within.max(previous_timeout));
     let result: Result<Option<u64>> = async {
         let deadline = Instant::now() + within;
         let event_driven = client.arm_paint_events().await.unwrap_or(false);
         loop {
-            let (snapshot, _) = inspect(client).await.map_err(|error| {
-                eyre::Report::new(TextEntryFailure(inspect_failure_category(&error)))
-            })?;
+            let snapshot = match inspect(client).await {
+                Ok((snapshot, _)) => snapshot,
+                Err(error) => {
+                    let category = inspect_failure_category(&error);
+                    if category == "inspect_transport_or_protocol_failure" && Instant::now() < deadline {
+                        nagoya::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    return Err(eyre::Report::new(TextEntryFailure(category)));
+                }
+            };
             let field_id = find_text_field(&snapshot.nodes, want)
                 .map_err(|category| eyre::Report::new(TextEntryFailure(category)))?
                 .map(|field| field.id);
@@ -548,6 +559,13 @@ pub(crate) async fn type_text(client: &mut Client, want: &str, text: &str) -> Re
     if cli::trace() {
         println!("        setting {want:?} (id {node_id})");
     }
+    // Reveal the field first, as a click does: an outcome that requires the
+    // field to be painted (a select whose new label must show) cannot pass for
+    // a field the page has scrolled out of the viewport. Best effort: a host
+    // that cannot scroll still gets the value.
+    let _ = client
+        .agent(&AgentControlRequest::Act(AgentAction::ScrollIntoView { node_id }))
+        .await;
     client
         .agent(&AgentControlRequest::Act(AgentAction::SetValue {
             node_id,
