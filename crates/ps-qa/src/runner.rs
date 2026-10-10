@@ -2122,10 +2122,25 @@ async fn run_qa_inner(
             && !check.press
             && let Some(want) = check.click.as_deref()
         {
-            match locate_control(client, want, &[]).await {
-                Ok((node_id, _)) => prepared_click = Some(node_id),
-                Err(error) => {
-                    open_error = Some(format!("could not locate {want:?}: {error}"));
+            // A click target may be legitimately disabled or not yet mounted
+            // while the page finishes earlier work (a generator, a fetch).
+            // Give it the same open allowance an arrival target gets, rather
+            // than failing on the first look.
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(check.open_timeout_ms.max(500));
+            loop {
+                match locate_control(client, want, &[]).await {
+                    Ok((node_id, _)) => {
+                        prepared_click = Some(node_id);
+                        break;
+                    }
+                    Err(error) if std::time::Instant::now() >= deadline => {
+                        open_error = Some(format!("could not locate {want:?}: {error}"));
+                        break;
+                    }
+                    Err(_) => {
+                        nagoya::sleep(std::time::Duration::from_millis(250)).await;
+                    }
                 }
             }
         }
