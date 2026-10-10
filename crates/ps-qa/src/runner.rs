@@ -2812,6 +2812,19 @@ async fn run_qa_inner(
             }),
             Err(error) => return Err(error),
         }
+        if !gave_up && check.settle_after_ms > 0 {
+            nagoya::sleep(Duration::from_millis(check.settle_after_ms)).await;
+        }
+        // qa-hosted only: <PS_QA_GPU_DUMP>/<group>.gpu.toon once this group's
+        // last check has finished, while the host is still up. A host that
+        // just stopped answering is not asked; the helper no-ops otherwise.
+        let group_done = !gave_up
+            && selected[index + 1..]
+                .iter()
+                .all(|later| later.group != check.group);
+        if group_done {
+            dump_qa_hosted_gpu(client, &check.group).await?;
+        }
         if gave_up && index + 1 < selected.len() {
             if let Some(session) = hosted.as_deref_mut() {
                 reconnect_hosted(client, session).await?;
@@ -2832,8 +2845,6 @@ async fn run_qa_inner(
                     break;
                 }
             }
-        } else if !gave_up && check.settle_after_ms > 0 {
-            nagoya::sleep(Duration::from_millis(check.settle_after_ms)).await;
         }
     }
 
@@ -2897,6 +2908,86 @@ async fn run_qa_inner(
     Ok(failed)
 }
 
+static QA_HOSTED_GPU_DUMP: std::sync::OnceLock<Option<std::path::PathBuf>> =
+    std::sync::OnceLock::new();
+
+fn note_qa_hosted_run() {
+    let dir = std::env::var_os("PS_QA_GPU_DUMP").and_then(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(value))
+        }
+    });
+    let _ = QA_HOSTED_GPU_DUMP.set(dir);
+}
+
+fn qa_hosted_gpu_dump_dir() -> Option<std::path::PathBuf> {
+    QA_HOSTED_GPU_DUMP.get().cloned().flatten()
+}
+
+/// `*` matches any run of characters, including an empty run, anywhere in
+/// `pattern`. It is not a literal. A pattern with no `*` is equality.
+fn gpu_glob_matches(pattern: &str, text: &str) -> bool {
+    let Some((prefix, rest)) = pattern.split_once('*') else {
+        return pattern == text;
+    };
+    if !text.starts_with(prefix) {
+        return false;
+    }
+    let text = &text[prefix.len()..];
+    if rest.is_empty() {
+        return true;
+    }
+    let mut skip = 0;
+    loop {
+        if gpu_glob_matches(rest, &text[skip..]) {
+            return true;
+        }
+        let Some(next) = text[skip..].chars().next() else {
+            return false;
+        };
+        skip += next.len_utf8();
+    }
+}
+
+/// Texture labels use [`gpu_glob_matches`]. Canvas report strings stay exact.
+fn gpu_draw_target_matches(subject: &str, target: &str) -> bool {
+    if target.starts_with("canvas:") {
+        subject == target
+    } else {
+        gpu_glob_matches(subject, target)
+    }
+}
+
+/// Write `<dir>/<group>.gpu.toon` for a `qa-hosted` run whose
+/// `PS_QA_GPU_DUMP` names a directory.
+///
+/// The bytes are what `ps-qa gpu` prints. A host that does not answer
+/// WebGPU inspection leaves no file and does not fail the group.
+async fn dump_qa_hosted_gpu(client: &mut Client, group: &str) -> Result<()> {
+    let Some(dir) = qa_hosted_gpu_dump_dir() else {
+        return Ok(());
+    };
+    if group.is_empty() || group.contains('/') || group.contains('\\') || group.contains('\0') {
+        return Err(eyre!(
+            "GPU dump group {group:?} is not a single path segment"
+        ));
+    }
+    let report = match gpu_report(client).await {
+        Ok(report) => report,
+        Err(_) => return Ok(()),
+    };
+    let encoded =
+        toon_format::encode_default(&report).map_err(|error| eyre!(error.to_string()))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating GPU dump directory {}", dir.display()))?;
+    let path = dir.join(format!("{group}.gpu.toon"));
+    std::fs::write(&path, format!("{encoded}\n"))
+        .with_context(|| format!("writing GPU dump {}", path.display()))?;
+    Ok(())
+}
+
 fn gpu_expectation(expect: qa::Expect) -> bool {
     matches!(
         expect,
@@ -2937,11 +3028,9 @@ fn gpu_verdict(
                 .subject
                 .split_once(':')
                 .ok_or_else(|| "GpuHasResource subject must be kind:label".to_owned())?;
-            if report
-                .resources
-                .iter()
-                .any(|resource| resource.details.kind_name() == kind && resource.label == label)
-            {
+            if report.resources.iter().any(|resource| {
+                resource.details.kind_name() == kind && gpu_glob_matches(label, &resource.label)
+            }) {
                 Ok(())
             } else {
                 Err(format!(
@@ -2966,12 +3055,13 @@ fn gpu_verdict(
                 .iter()
                 .filter(|pass| {
                     pass.color_targets.iter().flatten().any(|target| {
-                        target.target == check.subject
-                            || target.resolve_target.as_deref() == Some(check.subject.as_str())
-                    }) || pass
-                        .depth_target
-                        .as_ref()
-                        .is_some_and(|target| target.target == check.subject)
+                        gpu_draw_target_matches(&check.subject, &target.target)
+                            || target.resolve_target.as_deref().is_some_and(|resolve| {
+                                gpu_draw_target_matches(&check.subject, resolve)
+                            })
+                    }) || pass.depth_target.as_ref().is_some_and(|target| {
+                        gpu_draw_target_matches(&check.subject, &target.target)
+                    })
                 })
                 .fold(0_u64, |count, pass| count.saturating_add(pass.draw_count()));
             if count >= required {
@@ -6550,6 +6640,7 @@ pub async fn run() -> Result<()> {
         startup_timeout,
     } = &cli.command
     {
+        note_qa_hosted_run();
         let mut hosted = HostedSession::start(
             host,
             page,

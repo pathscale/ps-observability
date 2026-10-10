@@ -88,16 +88,23 @@ pub enum Expect {
     /// but this assertion reads cumulative totals, so another inspector cannot
     /// consume evidence and make an erroneous page pass.
     GpuNoErrors,
-    /// A live WebGPU object has exactly the specified kind and JS label.
+    /// A live WebGPU object has the specified kind and a matching JS label.
     ///
     /// Subject: "kind:label", for example "render-pipeline:bloom".
+    /// `*` in the label matches any run of characters, including an empty run,
+    /// anywhere in the label. "render-pipeline:renderPipeline_bloom*" and
+    /// "texture:*-light-map" match. A label with no `*` matches exactly, and
+    /// the kind is always exact. `*` is not a literal.
     /// This checks the native registry, including subsequent label changes.
     GpuHasResource,
     /// The newest submitted WebGPU frame contains at least this many draws
     /// into the named target.
     ///
-    /// Subject: a texture label or "canvas:#id". Direct, indexed and indirect
-    /// draw calls all count. Multiple passes into the target are summed.
+    /// Subject: a texture label or "canvas:#id". A texture label uses the same
+    /// `*` matching as [`GpuHasResource`](Expect::GpuHasResource). A canvas
+    /// target ("canvas:#id" or "canvas:@handle") stays exact. Direct, indexed
+    /// and indirect draw calls all count. Multiple passes into the target are
+    /// summed.
     /// An incomplete sample fails and is polled again within the outcome
     /// budget, because counts from before the inspection lease prove nothing
     /// about a newer unsampled submission.
