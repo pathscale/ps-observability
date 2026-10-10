@@ -259,6 +259,28 @@ pub(crate) fn capture_document_with_surface(
     })
 }
 
+/// Drain script work that is already queued before an observer reads the page.
+///
+/// An inspection or snapshot is an observer, not a frame driver: it runs
+/// pending microtasks and scripts but fires no timers, and it stops after a
+/// small budget. Polling with timers made every inspect run up to a hundred
+/// `setTimeout(0)` slices of a page that yields that way, so a page doing
+/// time-sliced work answered each request seconds late. Returns how many
+/// passes made progress and how many ran.
+fn drain_for_observer(document: &mut ScriptDocument) -> (u64, u64) {
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(16);
+    let started = std::time::Instant::now();
+    let (mut progressed, mut passes) = (0u64, 0u64);
+    while passes < 100 && started.elapsed() < BUDGET {
+        passes += 1;
+        if !document.poll_for_settle(None, false) {
+            break;
+        }
+        progressed += 1;
+    }
+    (progressed, passes)
+}
+
 /// Collect the same typed diagnostic snapshot from a standalone Blitz document
 /// that the windowed runtime exposes over its control socket.
 ///
@@ -273,13 +295,7 @@ pub fn snapshot_document(
 ) -> Result<DebugSnapshot, DebugError> {
     let started = std::time::Instant::now();
     let poll_started = std::time::Instant::now();
-    let mut polls = 0u64;
-    for _ in 0..100 {
-        polls += 1;
-        if !document.poll(None) {
-            break;
-        }
-    }
+    let polls = drain_for_observer(document).1;
     let poll_ms = poll_started.elapsed().as_secs_f64() * 1_000.0;
     // This forces a style and layout pass so the snapshot reports current
     // geometry. It is work the observer caused, so it is reported as snapshot
@@ -1364,13 +1380,7 @@ pub fn inspect_document(
      * every 25ms made scoped outcome latency proportional to the entire retained
      * application even though the response contained one pane.
      */
-    let mut ran_script = false;
-    for _ in 0..100 {
-        if !document.poll(None) {
-            break;
-        }
-        ran_script = true;
-    }
+    let ran_script = drain_for_observer(document).0 > 0;
     if ran_script {
         document.inner_mut().resolve(0.0);
     }
