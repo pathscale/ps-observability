@@ -323,11 +323,10 @@ impl Drop for HostProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(path) = &self.control_dir {
-            if control_directory_is_real(path) {
+        if let Some(path) = &self.control_dir
+            && control_directory_is_real(path) {
                 let _ = std::fs::remove_dir_all(path);
             }
-        }
     }
 }
 
@@ -1074,8 +1073,12 @@ fn write_storage_seed(
     let path = std::env::temp_dir().join(format!("qa-inspect-storage-{}.json", std::process::id()));
     let encoded = serde_json::to_vec(storage)
         .map_err(|error| format!("could not encode QA storage seed: {error}"))?;
-    std::fs::write(&path, encoded)
-        .map_err(|error| format!("could not write QA storage seed {}: {error}", path.display()))?;
+    std::fs::write(&path, encoded).map_err(|error| {
+        format!(
+            "could not write QA storage seed {}: {error}",
+            path.display()
+        )
+    })?;
     Ok(path)
 }
 

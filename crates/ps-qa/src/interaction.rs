@@ -11,8 +11,8 @@ use eyre::{Result, bail, eyre};
 
 use crate::diagnostics::metrics_if_supported;
 use crate::inspector::{Client, inspect};
-use crate::target::{locate_control, selector_matches_node};
 use crate::qa::KeyStep;
+use crate::target::{locate_control, selector_matches_node};
 use crate::timing::{check_timeout, pace, sleep_pace};
 use crate::{cli, reach, report};
 
@@ -590,7 +590,9 @@ async fn wait_for_text_field_id(
                 Ok((snapshot, _)) => snapshot,
                 Err(error) => {
                     let category = inspect_failure_category(&error);
-                    if category == "inspect_transport_or_protocol_failure" && Instant::now() < deadline {
+                    if category == "inspect_transport_or_protocol_failure"
+                        && Instant::now() < deadline
+                    {
                         nagoya::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
@@ -634,7 +636,9 @@ pub(crate) async fn type_text(client: &mut Client, want: &str, text: &str) -> Re
     // a field the page has scrolled out of the viewport. Best effort: a host
     // that cannot scroll still gets the value.
     let _ = client
-        .agent(&AgentControlRequest::Act(AgentAction::ScrollIntoView { node_id }))
+        .agent(&AgentControlRequest::Act(AgentAction::ScrollIntoView {
+            node_id,
+        }))
         .await;
     client
         .agent(&AgentControlRequest::Act(AgentAction::SetValue {

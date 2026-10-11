@@ -739,7 +739,7 @@ pub fn profile() -> &'static crate::app::AppProfile {
     let profiles = PROFILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut profiles = profiles.lock().expect("app profile cache lock poisoned");
     if let Some(profile) = profiles.get(&key) {
-        return *profile;
+        return profile;
     }
     // Broad driving commands validate their required profile before this
     // cache is reached. Targeted diagnostics deliberately do not require
