@@ -1,12 +1,7 @@
 name: Publish changed crates
 
+# Manual only; releases are normally published locally after the merge.
 on:
-  push:
-    branches: [master]
-    paths:
-      - crates/**
-      - Cargo.toml
-      - .github/workflows/publish.yml
   workflow_dispatch:
     inputs:
       dry_run:
