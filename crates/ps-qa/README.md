@@ -374,6 +374,11 @@ keys: [
 `Down` and `Up` are one phase. `Wait` only sleeps. Names are the same chords
 as `key`: `v`, `ArrowRight`, `Shift`, a space, `Meta+2`.
 
+The check's clock starts with the sequence, so every `Hold` and `Wait`
+counts against `outcome_timeout_ms`. Size it for the steps plus the outcome:
+four presses 800 ms apart need well over 2400 ms before the verdict even
+starts polling.
+
 Use `prepare` when a check needs a known semantic state before its measured
 action. ps-qa activates the preparation control by node id, waits for the
 renderer, and only then records the `before` snapshot. That keeps the check
