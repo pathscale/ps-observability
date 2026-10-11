@@ -1,9 +1,7 @@
 name: CI
 
+# Manual only: the gate is the local run before a PR merges.
 on:
-  push:
-    branches: [master]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
