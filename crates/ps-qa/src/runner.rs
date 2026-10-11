@@ -339,6 +339,13 @@ struct HostedSession {
     startup_timeout: Duration,
     quiet_output: bool,
     clean_environment: bool,
+    /// `QA_INSPECT_STORAGE` path for the standing host. `None` launches without
+    /// the variable. The file lives outside the ephemeral control directory;
+    /// `restart` deletes that directory before the next spawn.
+    storage: Option<std::path::PathBuf>,
+    /// Whether checks may restart this host to install a `storage` seed.
+    /// qa-hosted owns a throwaway host; run-plan keeps a signed-in one.
+    seeds_storage: bool,
     process: HostProcess,
     descriptor_path: std::path::PathBuf,
 }
@@ -349,11 +356,19 @@ fn launch_host(
     startup_timeout: Duration,
     quiet_output: bool,
     clean_environment: bool,
+    storage: Option<&std::path::Path>,
 ) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
     if !quiet_output && !clean_environment {
-        start_host(host, page, startup_timeout)
+        start_host(host, page, startup_timeout, storage)
     } else {
-        start_host_with_policy(host, page, startup_timeout, quiet_output, clean_environment)
+        start_host_with_policy(
+            host,
+            page,
+            startup_timeout,
+            quiet_output,
+            clean_environment,
+            storage,
+        )
     }
 }
 
@@ -365,14 +380,22 @@ impl HostedSession {
         quiet_output: bool,
         clean_environment: bool,
     ) -> std::result::Result<Self, String> {
-        let (process, descriptor_path) =
-            launch_host(host, page, startup_timeout, quiet_output, clean_environment)?;
+        let (process, descriptor_path) = launch_host(
+            host,
+            page,
+            startup_timeout,
+            quiet_output,
+            clean_environment,
+            None,
+        )?;
         Ok(Self {
             host: host.to_path_buf(),
             page: page.to_path_buf(),
             startup_timeout,
             quiet_output,
             clean_environment,
+            storage: None,
+            seeds_storage: false,
             process,
             descriptor_path,
         })
@@ -394,10 +417,19 @@ impl HostedSession {
             self.startup_timeout,
             self.quiet_output,
             self.clean_environment,
+            self.storage.as_deref(),
         )?;
         self.process = process;
         self.descriptor_path = descriptor_path;
         Ok(())
+    }
+}
+
+impl Drop for HostedSession {
+    fn drop(&mut self) {
+        if let Some(path) = self.storage.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -954,8 +986,9 @@ fn start_host(
     host: &std::path::Path,
     page: &std::path::Path,
     startup_timeout: Duration,
+    storage: Option<&std::path::Path>,
 ) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
-    start_host_with_policy(host, page, startup_timeout, false, false)
+    start_host_with_policy(host, page, startup_timeout, false, false, storage)
 }
 
 fn plan_control_directory() -> std::result::Result<std::path::PathBuf, String> {
@@ -1030,6 +1063,47 @@ fn control_directory_is_real(path: &std::path::Path) -> bool {
         .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
 }
 
+/// Write a check's `storage` map where the host can read it at launch.
+///
+/// The host reads the file once while starting, so it only has to outlive the
+/// spawn; the session removes it when the next check clears it or the session
+/// ends.
+fn write_storage_seed(
+    storage: &std::collections::BTreeMap<String, String>,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let path = std::env::temp_dir().join(format!("qa-inspect-storage-{}.json", std::process::id()));
+    let encoded = serde_json::to_vec(storage)
+        .map_err(|error| format!("could not encode QA storage seed: {error}"))?;
+    std::fs::write(&path, encoded)
+        .map_err(|error| format!("could not write QA storage seed {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+/// Install this check's `localStorage` seed, or clear one left by the check
+/// before it.
+///
+/// The host reads `QA_INSPECT_STORAGE` at launch and applies it before the
+/// page's scripts, so a different seed is a new process. A check with an empty
+/// map restarts only when the standing host was seeded.
+async fn stage_check_storage(
+    client: &mut Client,
+    session: &mut HostedSession,
+    storage: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    if storage.is_empty() {
+        let Some(path) = session.storage.take() else {
+            return Ok(());
+        };
+        let _ = std::fs::remove_file(path);
+        reconnect_hosted(client, session).await?;
+        return Ok(());
+    }
+    let path = write_storage_seed(storage).map_err(eyre::Report::msg)?;
+    session.storage = Some(path);
+    reconnect_hosted(client, session).await?;
+    Ok(())
+}
+
 fn contained_control_file(
     path: &std::path::Path,
     root: &std::path::Path,
@@ -1059,6 +1133,7 @@ fn start_host_with_policy(
     startup_timeout: Duration,
     quiet_output: bool,
     clean_environment: bool,
+    storage: Option<&std::path::Path>,
 ) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
     use std::io::BufRead;
 
@@ -1078,6 +1153,12 @@ fn start_host_with_policy(
     // a particular host's: `chuzz-headless` reads it, and a host with a
     // different one can read its own environment and ignore this.
     command.env("QA_INSPECT_PAGE", page);
+    // localStorage installed before the page's scripts. Same host interface:
+    // a JSON object whose values are strings. `chuzz-headless` exits 2 when
+    // the file is missing or invalid, so a check cannot pass on an empty store.
+    if let Some(path) = storage {
+        command.env("QA_INSPECT_STORAGE", path);
+    }
     if let Some(path) = &control_dir {
         command.env("CHUZZ_CONTROL_DIR", path);
         // The current Blitz protocol uses std::env::temp_dir(), while legacy
@@ -1580,6 +1661,15 @@ async fn run_qa_inner(
 
     let mut results: Vec<CheckResult<'_>> = Vec::new();
     for index in 0..selected.len() {
+        // The host applies QA_INSPECT_STORAGE at launch, before page scripts,
+        // so a check that carries entries restarts onto that file. The next
+        // check with an empty map restarts once without it. Only a session
+        // that allows it (qa-hosted) is restarted.
+        if let Some(session) = hosted.as_deref_mut()
+            && session.seeds_storage
+        {
+            stage_check_storage(client, session, &selected[index].storage).await?;
+        }
         let check = &selected[index];
         let full_check_started = Instant::now();
         // `?` leaves this block instead of abandoning the group before the
@@ -6739,6 +6829,7 @@ pub async fn run() -> Result<()> {
             false,
         )
         .map_err(|error| eyre!(error))?;
+        hosted.seeds_storage = true;
         let descriptor_path = hosted.descriptor_path.clone();
         let result = run_component(
             &descriptor_path,
@@ -8236,6 +8327,7 @@ mod tests {
             setup_text_env: None,
             setup_secret: None,
             click: click.map(str::to_owned),
+            storage: Default::default(),
             type_into: None,
             text: None,
             key: None,

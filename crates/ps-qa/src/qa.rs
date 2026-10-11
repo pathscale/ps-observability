@@ -756,6 +756,15 @@ pub struct Check {
     /// checks ordered, but moves their whole sequence to the final tail.
     #[serde(default)]
     pub destructive: bool,
+    /// `localStorage` entries installed before any page script runs.
+    ///
+    /// Values are arbitrary strings, often several kilobytes of JSON under one
+    /// key. A `qa-hosted` run writes the map as a JSON object and restarts the
+    /// host with `QA_INSPECT_STORAGE` set to that file, so the page boots with
+    /// the entries already present. The next check with an empty map restarts
+    /// without the variable. Empty leaves the standing host alone.
+    #[serde(default)]
+    pub storage: std::collections::BTreeMap<String, String>,
     /// The node the assertion is about.
     pub subject: String,
     /// RunPlan binding that supplies a nonsecret assertion subject.
@@ -2632,6 +2641,7 @@ mod tests {
             setup_text_env: None,
             setup_secret: None,
             click: None,
+            storage: Default::default(),
             type_into: None,
             text: None,
             key: Some("Right".into()),

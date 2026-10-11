@@ -64,6 +64,21 @@ a console message as though it were the answer.
 
 One connection serves a whole run.
 
+### Host interface
+
+A hosted run starts the host binary with no arguments. `QA_INSPECT_PAGE` names
+the page or site to serve. `QA_INSPECT_STORAGE`, when a check sets `storage`,
+is the path of a JSON object whose keys and values are strings. The host
+installs those entries into `localStorage` for the page origin before any page
+script runs. A missing, unreadable, or invalid file is fatal: the host prints
+`chuzz-headless: QA_INSPECT_STORAGE: ...` on stderr and exits 2, so the check
+cannot pass against an empty store.
+
+`qa-hosted` writes that object inside the plan tree and restarts the host with
+the variable set before the check. The next check with an empty `storage` map
+restarts once without the variable. The seed is not placed in the system
+temporary directory.
+
 ## Usage
 
 ```sh
@@ -101,7 +116,8 @@ session and redacted from reports, including escaped JSON-string forms. A sessio
 may share credentials with another session only when both declare the same
 `identity_group`. `any_of` accepts one of a check's explicitly listed simple
 rendered outcomes; it does not add conditional actions. The runner removes inherited
-environment from every child host, then sets only `QA_INSPECT_PAGE` and a
+environment from every child host, then sets only `QA_INSPECT_PAGE`,
+`QA_INSPECT_STORAGE` when the check seeds storage, and a
 unique `CHUZZ_CONTROL_DIR` under `target/ps-qa/run-plan-control`; it suppresses
 the host's console output during the run.
 
@@ -245,6 +261,10 @@ A check is a precondition, an action, and an assertion about the state after it:
     expect: Vanishes,
 )
 ```
+
+`storage` is an optional map of string `localStorage` entries. A hosted run
+writes them as a JSON object and installs them before the page's scripts.
+Omit the field and the check sees whatever the standing document already stored.
 
 Omitting `press` is deliberate and selects semantic node activation. Set
 `press: true` only when a suite explicitly tests coordinate hit-testing.
