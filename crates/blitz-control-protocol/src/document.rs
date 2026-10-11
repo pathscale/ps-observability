@@ -2918,6 +2918,9 @@ mod runtime_tests {
              </main>",
             DocumentConfig::default(),
         );
+        // from_html stops at the first script boundary; resume the parser so the
+        // text after the script is in the tree.
+        document.execute_scripts();
         document.inner_mut().resolve(0.0);
         let inner = document.inner();
         let labels = crate::document::LabelIndex::build(&inner);
