@@ -37,8 +37,8 @@ use crate::computed_style::{
 use crate::diagnostics::{dom, metrics, nodes, panes, spill, transcript};
 use crate::inspector::{Client, inspect, inspect_subtree};
 use crate::interaction::{
-    TextEntryFailure, click_named, hover_over, pointer_drag, press_key, scroll, scroll_events,
-    type_keys, type_text,
+    TextEntryFailure, click_named, hover_over, key_steps, pointer_drag, press_key, scroll,
+    scroll_events, type_keys, type_text,
 };
 use crate::layout_report::layout;
 use crate::target::{
@@ -2416,6 +2416,7 @@ async fn run_qa_inner(
         let mut check_started = (check.click.is_none()
             && check.text.is_none()
             && check.key.is_none()
+            && check.keys.is_empty()
             && check.pointer_drag.is_none()
             && check.scroll_over.is_none())
         .then(Instant::now);
@@ -2441,6 +2442,7 @@ async fn run_qa_inner(
         let drives_action = check.click.is_some()
             || check.text.is_some()
             || check.key.is_some()
+            || !check.keys.is_empty()
             || check.pointer_drag.is_some()
             || check.scroll_over.is_some();
         let action_paint_armed = if drives_action && !live_paint_expect {
@@ -2475,7 +2477,7 @@ async fn run_qa_inner(
         if action_error.is_none()
             && let Some(text) = check.text.as_deref()
         {
-            if check.key.is_none() && check.click.is_none() {
+            if check.key.is_none() && check.keys.is_empty() && check.click.is_none() {
                 check_started = Some(Instant::now());
             }
             if let Some(field) = check.type_into.as_deref() {
@@ -2492,7 +2494,7 @@ async fn run_qa_inner(
         if action_error.is_none()
             && let Some(want) = check.click.as_deref()
         {
-            if check.key.is_none() {
+            if check.key.is_none() && check.keys.is_empty() {
                 check_started = Some(Instant::now());
             }
             if check.expect == qa::Expect::TargetPaints && !check.press {
@@ -2548,6 +2550,12 @@ async fn run_qa_inner(
                 .unwrap_or("");
             if let Err(error) = press_key(client, key, 1, target, check.key_on.is_some()).await {
                 action_error = Some(format!("could not send {key:?}: {error}"));
+            }
+        }
+        if action_error.is_none() && !check.keys.is_empty() {
+            check_started = Some(Instant::now());
+            if let Err(error) = key_steps(client, &check.keys).await {
+                action_error = Some(format!("could not send key steps: {error}"));
             }
         }
         if action_error.is_none()
@@ -8232,6 +8240,7 @@ mod tests {
             text: None,
             key: None,
             key_on: None,
+            keys: Vec::new(),
             scroll_over: None,
             scroll_ticks: 0,
             scroll_delta: 0.0,

@@ -421,6 +421,24 @@ pub struct OutcomeAlternative {
     pub expect: Expect,
 }
 
+/// One phase of the timed keyboard sequence on [`Check`].
+///
+/// Hold and Wait take milliseconds. Every other variant names a key or a
+/// chord, parsed the same way as [`Check::key`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KeyStep {
+    /// Key down, then key up.
+    Press(String),
+    /// Key down, wait this many milliseconds, then key up.
+    Hold(String, u64),
+    /// Key down, leaving the key held for a later [`Up`](Self::Up).
+    Down(String),
+    /// Key up. Releases a key an earlier [`Down`](Self::Down) held.
+    Up(String),
+    /// Sleep this many milliseconds. Sends no key.
+    Wait(u64),
+}
+
 /// One thing that must be true of the running panel.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -590,6 +608,15 @@ pub struct Check {
     /// Unlike `type_into`, this accepts any value-bearing role, including a
     /// slider. Name resolution produces a node id before the action is sent.
     pub key_on: Option<String>,
+    /// Timed key sequence, sent after [`key`](Self::key) and before
+    /// [`scroll_over`](Self::scroll_over).
+    ///
+    /// A single chord is [`key`](Self::key). This is for a page that reacts to
+    /// a key staying down, or to down and up as separate phases. Each step is
+    /// delivered to the focused element, or to the document when nothing is
+    /// focused. Empty means the check sends no sequence.
+    #[serde(default)]
+    pub keys: Vec<KeyStep>,
     /// Move over this semantic node and send real wheel input after other actions.
     #[serde(default)]
     pub scroll_over: Option<String>,
@@ -895,6 +922,7 @@ fn validate_check(
         && check.prepare_unless.as_deref() == Some(check.subject.as_str())
         && check.click.is_none()
         && check.key.is_none()
+        && check.keys.is_empty()
         && check.type_into.is_none()
     {
         return Err(format!(
@@ -1029,6 +1057,7 @@ fn validate_check(
         && check.click.is_none()
         && check.text.is_none()
         && check.key.is_none()
+        && check.keys.is_empty()
         && check.scroll_over.is_none()
     {
         return Err(format!(
@@ -2022,6 +2051,14 @@ fn action_description(check: &Check) -> String {
     ) {
         action.push_str(&format!(", key {key:?} on {target:?}"));
     }
+    if !check.keys.is_empty() {
+        let description = format!("keys {:?}", check.keys);
+        if action == "observe only" {
+            action = description;
+        } else {
+            action.push_str(&format!(", {description}"));
+        }
+    }
     if let Some(target) = check.scroll_over.as_deref() {
         action.push_str(&format!(
             ", scroll {} x {:.0} over {target:?}",
@@ -2599,6 +2636,7 @@ mod tests {
             text: None,
             key: Some("Right".into()),
             key_on: Some("Output level".into()),
+            keys: Vec::new(),
             scroll_over: None,
             scroll_ticks: 0,
             scroll_delta: 0.0,

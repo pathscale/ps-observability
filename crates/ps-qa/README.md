@@ -335,6 +335,25 @@ When the expectation is `ValueChanges`, ps-qa carries that exact text-field
 node id through `SetValue` and compares its semantic value before and after.
 This prevents a neighbouring same-name editor from satisfying the check.
 
+`key` sends one chord. A page that reacts to a key staying down, or to down
+and up as separate phases, declares `keys`. The sequence runs after `key`
+and before `scroll_over`. Each step goes to the focused element, or to the
+document when nothing is focused:
+
+```ron
+keys: [
+    Press("v"),
+    Hold("ArrowRight", 400),
+    Down("Shift"),
+    Wait(120),
+    Up("Shift"),
+],
+```
+
+`Press` is down then up. `Hold` is down, wait the given milliseconds, then up.
+`Down` and `Up` are one phase. `Wait` only sleeps. Names are the same chords
+as `key`: `v`, `ArrowRight`, `Shift`, a space, `Meta+2`.
+
 Use `prepare` when a check needs a known semantic state before its measured
 action. ps-qa activates the preparation control by node id, waits for the
 renderer, and only then records the `before` snapshot. That keeps the check
@@ -470,3 +489,4 @@ guessing that an unrelated control such as `New document` is a document name.
 Paged lists can similarly declare `pagination_controls` name fragments. The
 inventory activates those exact semantic controls until all pages are mounted
 before it counts component instances.
+

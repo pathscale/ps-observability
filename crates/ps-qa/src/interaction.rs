@@ -12,6 +12,7 @@ use eyre::{Result, bail, eyre};
 use crate::diagnostics::metrics_if_supported;
 use crate::inspector::{Client, inspect};
 use crate::target::{locate_control, selector_matches_node};
+use crate::qa::KeyStep;
 use crate::timing::{check_timeout, pace, sleep_pace};
 use crate::{cli, reach, report};
 
@@ -332,18 +333,8 @@ pub(crate) async fn press_key(
     let (key, code, modifiers) = parse_key_chord(name)?;
 
     for _ in 0..count {
-        for phase in [KeyPhase::Down, KeyPhase::Up] {
-            client
-                .agent(&AgentControlRequest::Act(AgentAction::Input(
-                    InputCommand::Key {
-                        phase,
-                        key: key.clone(),
-                        code: code.clone(),
-                        modifiers,
-                    },
-                )))
-                .await?;
-        }
+        dispatch_key(client, &key, &code, modifiers, KeyPhase::Down).await?;
+        dispatch_key(client, &key, &code, modifiers, KeyPhase::Up).await?;
         sleep_pace().await;
     }
     Ok(())
@@ -356,6 +347,11 @@ pub(crate) async fn press_key(
 /// belong on both phases of the key event, so the application sees the actual
 /// shortcut rather than a plain character that merely resembles it.
 pub(crate) fn parse_key_chord(name: &str) -> Result<(String, String, Modifiers)> {
+    // A manifest writes the space key as `" "`. Trimming that would drop the
+    // only part and report an empty chord.
+    if !name.is_empty() && name.chars().all(char::is_whitespace) {
+        return Ok((" ".to_owned(), "Space".to_owned(), Modifiers::default()));
+    }
     let mut parts = name
         .split('+')
         .map(str::trim)
@@ -412,14 +408,88 @@ pub(crate) fn parse_key_chord(name: &str) -> Result<(String, String, Modifiers)>
         "escape" | "esc" => ("Escape", "Escape"),
         "delete" | "del" => ("Delete", "Delete"),
         "backspace" => ("Backspace", "Backspace"),
+        "shift" => {
+            modifiers.shift = true;
+            ("Shift", "ShiftLeft")
+        }
+        "ctrl" | "control" => {
+            modifiers.control = true;
+            ("Control", "ControlLeft")
+        }
+        "alt" | "option" => {
+            modifiers.alt = true;
+            ("Alt", "AltLeft")
+        }
+        "meta" | "cmd" | "command" => {
+            modifiers.meta = true;
+            ("Meta", "MetaLeft")
+        }
         "space" | "spacebar" => (" ", "Space"),
         other => {
             bail!(
-                "unknown key {other:?}: letters, digits, pageup, pagedown, home, end, arrows, tab, enter, escape, delete, backspace, space"
+                "unknown key {other:?}: letters, digits, pageup, pagedown, home, end, arrows, tab, enter, escape, delete, backspace, space, shift, ctrl, alt, meta"
             )
         }
     };
     Ok((key.to_owned(), code.to_owned(), modifiers))
+}
+
+/// One `InputCommand::Key` frame. [`press_key`] and [`key_steps`] both send
+/// through here, so a sequence uses the same wire shape as a chord.
+async fn dispatch_key(
+    client: &mut Client,
+    key: &str,
+    code: &str,
+    modifiers: Modifiers,
+    phase: KeyPhase,
+) -> Result<()> {
+    client
+        .agent(&AgentControlRequest::Act(AgentAction::Input(
+            InputCommand::Key {
+                phase,
+                key: key.to_owned(),
+                code: code.to_owned(),
+                modifiers,
+            },
+        )))
+        .await?;
+    Ok(())
+}
+
+/// Send a timed key sequence to the focused element, or the document.
+///
+/// Press is down then up. Hold waits the given milliseconds between those
+/// phases. Down and Up send one phase. Wait only sleeps. Names go through
+/// [`parse_key_chord`]. Nothing here focuses a control: the events land on
+/// whatever already has focus, and the document root when nothing does.
+pub(crate) async fn key_steps(client: &mut Client, steps: &[KeyStep]) -> Result<()> {
+    for step in steps {
+        match step {
+            KeyStep::Press(name) => {
+                let (key, code, modifiers) = parse_key_chord(name)?;
+                dispatch_key(client, &key, &code, modifiers, KeyPhase::Down).await?;
+                dispatch_key(client, &key, &code, modifiers, KeyPhase::Up).await?;
+            }
+            KeyStep::Hold(name, milliseconds) => {
+                let (key, code, modifiers) = parse_key_chord(name)?;
+                dispatch_key(client, &key, &code, modifiers, KeyPhase::Down).await?;
+                nagoya::sleep(Duration::from_millis(*milliseconds)).await;
+                dispatch_key(client, &key, &code, modifiers, KeyPhase::Up).await?;
+            }
+            KeyStep::Down(name) => {
+                let (key, code, modifiers) = parse_key_chord(name)?;
+                dispatch_key(client, &key, &code, modifiers, KeyPhase::Down).await?;
+            }
+            KeyStep::Up(name) => {
+                let (key, code, modifiers) = parse_key_chord(name)?;
+                dispatch_key(client, &key, &code, modifiers, KeyPhase::Up).await?;
+            }
+            KeyStep::Wait(milliseconds) => {
+                nagoya::sleep(Duration::from_millis(*milliseconds)).await;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn type_keys(client: &mut Client, count: usize, want: &str) -> Result<()> {
