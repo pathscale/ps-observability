@@ -2436,6 +2436,7 @@ async fn run_qa_inner(
                 | qa::Expect::GpuNoErrors
                 | qa::Expect::GpuHasResource
                 | qa::Expect::GpuDraws(_)
+                | qa::Expect::GpuTextureInk
         );
         let drives_action = check.click.is_some()
             || check.text.is_some()
@@ -2592,6 +2593,15 @@ async fn run_qa_inner(
         if action_error.is_none() && gpu_expectation(check.expect) {
             pixel_outcome =
                 Some(wait_for_gpu(client, check, check_started.unwrap_or_else(Instant::now)).await);
+        } else if action_error.is_none() && check.expect == qa::Expect::GpuTextureInk {
+            pixel_outcome = Some(
+                wait_for_gpu_texture_ink(
+                    client,
+                    check,
+                    check_started.unwrap_or_else(Instant::now),
+                )
+                .await,
+            );
         } else if action_error.is_none() && check.expect == qa::Expect::OpaqueBackground {
             pixel_outcome = Some(opaque_background(client, &check.subject).await);
         } else if action_error.is_none() && check.expect == qa::Expect::TransparentBackground {
@@ -2978,8 +2988,7 @@ async fn dump_qa_hosted_gpu(client: &mut Client, group: &str) -> Result<()> {
         Ok(report) => report,
         Err(_) => return Ok(()),
     };
-    let encoded =
-        toon_format::encode_default(&report).map_err(|error| eyre!(error.to_string()))?;
+    let encoded = toon_format::encode_default(&report).map_err(|error| eyre!(error.to_string()))?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating GPU dump directory {}", dir.display()))?;
     let path = dir.join(format!("{group}.gpu.toon"));
@@ -4072,7 +4081,15 @@ async fn capture(
         other => bail!("asked for a capture, got {other:?}"),
     };
 
-    let ink = measure_ink(&image)?;
+    report_captured(&image, scale, output)
+}
+
+fn report_captured(
+    image: &CapturedImage,
+    scale: f32,
+    output: Option<&std::path::Path>,
+) -> Result<()> {
+    let ink = measure_ink(image)?;
     let fingerprint = {
         use std::hash::{DefaultHasher, Hash as _, Hasher as _};
         let mut hasher = DefaultHasher::new();
@@ -4096,9 +4113,74 @@ async fn capture(
         println!("nothing was drawn: every pixel is the background colour");
     }
     if let Some(output) = output {
-        write_capture_ppm(&image, output)?;
+        write_capture_ppm(image, output)?;
     }
     Ok(())
+}
+
+async fn read_gpu_capture(client: &mut Client, target: &str) -> Result<CapturedImage> {
+    let previous_timeout = client.request_timeout();
+    client.set_request_timeout(Duration::from_secs(15));
+    let answer = client
+        .diagnostics(&DiagnosticsRequest::WebGpuCapture {
+            target: target.to_owned(),
+        })
+        .await;
+    client.set_request_timeout(previous_timeout);
+    let answer = answer?;
+    match answer.response {
+        DebugResponse::Captured(image) => Ok(image),
+        DebugResponse::Error(error) => bail!("{}: {}", error.code, error.message),
+        other => bail!("asked for a WebGPU capture, got {other:?}"),
+    }
+}
+
+async fn gpu_capture_command(
+    client: &mut Client,
+    target: &str,
+    output: Option<&std::path::Path>,
+) -> Result<()> {
+    let image = read_gpu_capture(client, target).await?;
+    report_captured(&image, 1.0, output)
+}
+
+async fn gpu_texture_ink(client: &mut Client, target: &str) -> std::result::Result<(), String> {
+    let image = read_gpu_capture(client, target)
+        .await
+        .map_err(|error| error.to_string())?;
+    let ink = measure_ink(&image).map_err(|error| error.to_string())?;
+    if ink.visible == 0 {
+        Err(format!(
+            "{target:?} occupies {}x{} but draws no pixels distinguishable from its background",
+            image.width, image.height
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn wait_for_gpu_texture_ink(
+    client: &mut Client,
+    check: &qa::Check,
+    started: Instant,
+) -> std::result::Result<(), String> {
+    let deadline = started + declared_outcome_timeout(check);
+    loop {
+        let verdict = gpu_texture_ink(client, &check.subject).await;
+        if verdict.is_ok() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return verdict;
+        }
+        nagoya::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(25)),
+        )
+        .await;
+    }
 }
 
 /// Audit every button in the running application.
@@ -7057,6 +7139,9 @@ pub async fn run() -> Result<()> {
             output,
         } => {
             capture(&mut client, &name, scale as f32, output.as_deref()).await?;
+        }
+        cli::Command::GpuCapture { target, output } => {
+            gpu_capture_command(&mut client, &target, output.as_deref()).await?;
         }
         cli::Command::Audit { family } => {
             let faults = run_audit(&mut client, family.as_deref()).await?;
