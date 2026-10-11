@@ -366,6 +366,19 @@ pub enum Command {
     /// Inspect page-owned WebGPU devices, resources, errors and frames as TOON.
     Gpu,
 
+    /// Copy one page WebGPU texture or canvas and report its visible ink the
+    /// same way `capture` reports a document render.
+    ///
+    /// `target` is `texture:<label>` or `canvas:#id`.
+    #[command(name = "gpu-capture")]
+    GpuCapture {
+        /// `texture:<label>` or `canvas:#id`.
+        target: String,
+        /// Save the readback as a binary PPM image.
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+    },
+
     /// Render what the application actually drew and report the visible ink in
     /// it, for the whole window or one named node.
     ///

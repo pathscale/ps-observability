@@ -109,6 +109,14 @@ pub enum Expect {
     /// budget, because counts from before the inspection lease prove nothing
     /// about a newer unsampled submission.
     GpuDraws(u64),
+    /// The named WebGPU texture or canvas drawing buffer contains visible ink.
+    ///
+    /// Subject: `texture:<label>` or `canvas:#id`. The host copies that target
+    /// to RGBA8, the same image a document Capture returns. Visible ink is the
+    /// same contrast test `ps-qa capture` prints: a pixel counts when its
+    /// luminance differs from the modal background by more than 24 and its
+    /// alpha is at least 32. A blank readback fails.
+    GpuTextureInk,
     /// The named node exists, is visible, and has a non-zero box.
     ///
     /// Non-zero is the part that matters. A node with a box of `0x0` is in the
@@ -1106,6 +1114,23 @@ fn validate_check(
             check.id,
         ));
     }
+    if check.expect == Expect::GpuTextureInk {
+        let labelled = check
+            .subject
+            .strip_prefix("texture:")
+            .is_some_and(|label| !label.is_empty());
+        let canvas = check
+            .subject
+            .strip_prefix("canvas:#")
+            .is_some_and(|id| !id.is_empty() && !id.chars().any(char::is_whitespace));
+        if !labelled && !canvas {
+            return Err(format!(
+                "{}: check {:?} must name texture:<label> or canvas:#id with GpuTextureInk",
+                file.display(),
+                check.id,
+            ));
+        }
+    }
 
     if check.expect == Expect::Count && check.expect_count.is_none() {
         return Err(format!(
@@ -1691,7 +1716,10 @@ pub fn verdict(
                 }
             }
         }
-        Expect::GpuNoErrors | Expect::GpuHasResource | Expect::GpuDraws(_) => {
+        Expect::GpuNoErrors
+        | Expect::GpuHasResource
+        | Expect::GpuDraws(_)
+        | Expect::GpuTextureInk => {
             return Err("GPU expectations must be resolved by the live QA runner".to_owned());
         }
         Expect::PixelsHold

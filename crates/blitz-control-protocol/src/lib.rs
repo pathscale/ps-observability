@@ -220,6 +220,13 @@ pub enum DiagnosticsRequest {
     /// Hosts without a page WebGPU inspector return their unsupported
     /// diagnostics error; absence of support is not an empty report.
     WebGpuInspect,
+    /// Copy one page-owned texture or canvas drawing buffer to RGBA8.
+    ///
+    /// `target` is `texture:<label>` or `canvas:#id`. The answer is
+    /// [`DebugResponse::Captured`], the same image a document Capture returns.
+    WebGpuCapture {
+        target: String,
+    },
 }
 
 /// What to draw, and how large.
@@ -272,6 +279,44 @@ pub struct CapturedImage {
     pub rgba_base64: String,
     /// The node this shows, when the request named one.
     pub node_id: Option<u64>,
+}
+
+#[cfg(feature = "capture")]
+impl CapturedImage {
+    /// Encode tightly packed straight RGBA8 as a document capture payload.
+    pub fn from_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Self, DebugError> {
+        let expected = u64::from(width)
+            .saturating_mul(u64::from(height))
+            .saturating_mul(4);
+        if width == 0 || height == 0 || expected != rgba.len() as u64 {
+            return Err(DebugError {
+                code: "invalidArgument".to_owned(),
+                message: format!(
+                    "RGBA8 capture is {width}x{height} but holds {} bytes",
+                    rgba.len()
+                ),
+            });
+        }
+        // Same frame ceiling as document capture: leave room for the JSON
+        // envelope inside the transport's fixed frame limit.
+        const FRAME_ENVELOPE_RESERVE: usize = 64 * 1024;
+        const MAX_BASE64_BYTES: usize = MAX_DEBUG_FRAME_BYTES - FRAME_ENVELOPE_RESERVE;
+        const MAX_RAW_BYTES: usize = (MAX_BASE64_BYTES / 4) * 3;
+        if rgba.len() > MAX_RAW_BYTES {
+            return Err(DebugError {
+                code: "captureTooLarge".to_owned(),
+                message: format!(
+                    "{width}x{height} cannot fit in one diagnostic frame; capture a smaller texture"
+                ),
+            });
+        }
+        Ok(Self {
+            width,
+            height,
+            rgba_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, rgba),
+            node_id: None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
