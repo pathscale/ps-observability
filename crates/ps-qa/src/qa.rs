@@ -368,6 +368,13 @@ pub enum Expect {
     /// carried from the before snapshot so a repeated accessible name cannot
     /// satisfy the assertion with a neighbouring row.
     ValueChanges,
+    /// The subject node's semantic value equals [`Check::expect_value`].
+    ///
+    /// Use this when a progressbar, meter or slider must expose one exact
+    /// value rather than merely a different one. That value is `aria-valuetext`
+    /// when the control has one, otherwise `aria-valuenow`, otherwise the
+    /// control's own value.
+    ValueIs,
     /// The exact semantic node's selected/pressed state changed.
     ///
     /// Radios and `aria-pressed` buttons expose selection as a boolean rather
@@ -638,6 +645,12 @@ pub struct Check {
     /// Exact family size for [`Expect::Count`].
     #[serde(default)]
     pub expect_count: Option<usize>,
+    /// Exact semantic value for [`Expect::ValueIs`].
+    ///
+    /// `aria-valuetext` when the control has one, otherwise `aria-valuenow`,
+    /// otherwise the control's own value.
+    #[serde(default)]
+    pub expect_value: Option<String>,
     /// Additional controls covered by this same rendered contract.
     ///
     /// Use this only for a repeated family produced from one component and
@@ -1173,6 +1186,20 @@ fn validate_check(
     if check.expect == Expect::Count && check.expect_count.is_none() {
         return Err(format!(
             "{}: check {:?} must declare expect_count with Count",
+            file.display(),
+            check.id,
+        ));
+    }
+    if check.expect == Expect::ValueIs && check.expect_value.is_none() {
+        return Err(format!(
+            "{}: check {:?} must declare expect_value with ValueIs",
+            file.display(),
+            check.id,
+        ));
+    }
+    if check.expect != Expect::ValueIs && check.expect_value.is_some() {
+        return Err(format!(
+            "{}: check {:?} declares expect_value without ValueIs",
             file.display(),
             check.id,
         ));
@@ -1858,6 +1885,29 @@ pub fn verdict(
                     format!("no painted node matching {:?} before action", check.subject)
                 })?;
             value_changed(before_node.id, before, after)?;
+        }
+        Expect::ValueIs => {
+            let want = check
+                .expect_value
+                .as_deref()
+                .ok_or_else(|| "ValueIs requires expect_value".to_owned())?;
+            if found
+                .iter()
+                .any(|node| state_readable(check, node) && node.value.as_deref() == Some(want))
+            {
+                return Ok(());
+            }
+            let seen = found.iter().rev().find_map(|node| {
+                if state_readable(check, node) {
+                    node.value.as_deref()
+                } else {
+                    None
+                }
+            });
+            return Err(match seen {
+                Some(value) => format!("value was {value:?}, expected {want:?}"),
+                None => "no value".to_owned(),
+            });
         }
         Expect::SelectionChanges => {
             let before_node = matching(before, &check.subject)
@@ -2653,6 +2703,7 @@ mod tests {
             compare: None,
             expect_size: None,
             expect_count: None,
+            expect_value: None,
             covers: Vec::new(),
             press: false,
             pointer_drag: None,

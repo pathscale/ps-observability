@@ -305,6 +305,7 @@ tabs, then activates the exact semantic node id.
 | `Contrast` | every matching painted subject meets its semantic contrast floor |
 | `FontSizeGrows` | the same subject's computed font size increases |
 | `ValueChanges` | the same semantic node exposes a different value after activation |
+| `ValueIs` | the subject's semantic value equals `expect_value` |
 | `SelectionChanges` | the same semantic node changes selected/pressed state |
 | `NameChanges` | the same semantic node exposes a different accessible name after the action |
 
@@ -354,6 +355,17 @@ Text is focused, selected, and exactly replaced by node id; no coordinate pointe
 When the expectation is `ValueChanges`, ps-qa carries that exact text-field
 node id through `SetValue` and compares its semantic value before and after.
 This prevents a neighbouring same-name editor from satisfying the check.
+
+`ValueIs` asserts the exact value instead. The semantic value is
+`aria-valuetext` when the control has one, otherwise `aria-valuenow`,
+otherwise the control's own value. The runner polls that value until it
+matches or `outcome_timeout_ms` expires:
+
+```ron
+subject: "Mana",
+expect: ValueIs,
+expect_value: Some("40 of 100"),
+```
 
 `key` sends one chord. A page that reacts to a key staying down, or to down
 and up as separate phases, declares `keys`. The sequence runs after `key`

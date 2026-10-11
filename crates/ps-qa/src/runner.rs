@@ -324,9 +324,10 @@ impl Drop for HostProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(path) = &self.control_dir
-            && control_directory_is_real(path) {
-                let _ = std::fs::remove_dir_all(path);
-            }
+            && control_directory_is_real(path)
+        {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -8342,6 +8343,7 @@ mod tests {
             compare: None,
             expect_size: None,
             expect_count: None,
+            expect_value: None,
             covers: Vec::new(),
             press: false,
             pointer_drag: None,
