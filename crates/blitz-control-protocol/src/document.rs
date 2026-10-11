@@ -1092,6 +1092,7 @@ fn semantic_value(
                 .checkbox_input_checked()
                 .map(|checked| checked.to_string())
         })
+        .or_else(|| element_attr(element, "aria-valuetext").map(str::to_string))
         .or_else(|| element_attr(element, "aria-valuenow").map(str::to_string))
         .or_else(|| element_attr(element, "value").map(str::to_string))
 }
