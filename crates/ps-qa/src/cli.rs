@@ -209,6 +209,12 @@ pub enum Command {
     /// The raw metrics response.
     Metrics,
 
+    /// Run a script in the page and print its JSON completion value.
+    Eval {
+        /// The script. Its last expression is the value printed.
+        script: String,
+    },
+
     /// The semantic tree.
     Tree,
 

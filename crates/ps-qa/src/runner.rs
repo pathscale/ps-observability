@@ -6967,6 +6967,17 @@ pub async fn run() -> Result<()> {
                 toon_format::encode_default(&report).map_err(|error| eyre!(error.to_string()))?
             );
         }
+        cli::Command::Eval { script } => {
+            match client
+                .diagnostics(&DiagnosticsRequest::Evaluate { script: script.clone() })
+                .await?
+                .response
+            {
+                DebugResponse::Evaluated(value) => println!("{value}"),
+                DebugResponse::Error(error) => bail!("{}: {}", error.code, error.message),
+                other => bail!("asked to evaluate a script, got {other:?}"),
+            }
+        }
         cli::Command::Metrics => {
             println!("\n== metrics ==");
             let envelope = client
