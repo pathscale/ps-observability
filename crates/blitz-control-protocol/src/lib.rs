@@ -227,6 +227,15 @@ pub enum DiagnosticsRequest {
     WebGpuCapture {
         target: String,
     },
+    /// Run a script in the page and return its completion value as JSON.
+    ///
+    /// The same evaluation a page console offers, so an agent driving a
+    /// headless page can read state no tree or capture exposes, such as a
+    /// media element's `currentTime`. Hosts that run no page script answer
+    /// with their unsupported diagnostics error.
+    Evaluate {
+        script: String,
+    },
 }
 
 /// What to draw, and how large.
@@ -335,6 +344,8 @@ pub enum DebugResponse {
     /// One condensation level over the settled page, level-shaped so a caller
     /// asking for keywords is not handed the page's full text.
     Condensation(condense::Condensation),
+    /// The JSON completion value of an [`DiagnosticsRequest::Evaluate`].
+    Evaluated(serde_json::Value),
     Error(DebugError),
 }
 
@@ -1158,6 +1169,7 @@ fn response_summary(response: &DebugResponse) -> String {
             format!("condensed page, {} level", condensation.level_name())
         }
         DebugResponse::WebGpu(_) => "WebGPU report".into(),
+        DebugResponse::Evaluated(_) => "evaluated script".into(),
         DebugResponse::Error(error) => error.message.clone(),
     }
 }
