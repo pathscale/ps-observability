@@ -456,7 +456,7 @@ fn mouse_button(button: u16) -> Result<MouseEventButton, DebugError> {
 
 #[cfg(test)]
 mod tests {
-    use blitz_dom::{Document as _, DocumentConfig};
+    use blitz_dom::DocumentConfig;
 
     use super::*;
     use crate::{AgentSnapshot, Modifiers};
