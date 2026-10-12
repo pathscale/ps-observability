@@ -196,10 +196,13 @@ fn read_descriptor(path: &Path) -> Result<Descriptor> {
         .with_context(|| format!("descriptor {} is not a DebugDescriptor", path.display()))?;
     if descriptor.protocol_version != DEBUG_PROTOCOL_VERSION {
         bail!(
-            "descriptor {} uses debug protocol {}, but this client speaks {}",
+            "descriptor {} uses debug protocol {}, but this client speaks {}; \
+             use a client built for protocol {} (for ps-qa, build it from the \
+             blitz-control-protocol release or checkout that the host was built against)",
             path.display(),
             descriptor.protocol_version,
-            DEBUG_PROTOCOL_VERSION
+            DEBUG_PROTOCOL_VERSION,
+            descriptor.protocol_version
         );
     }
     Ok(Descriptor {
