@@ -681,9 +681,9 @@ pub enum WheelPhase {
 #[serde(rename_all = "camelCase")]
 pub struct RevisionSet {
     pub document: u64,
-    /// Blitz does not version style, layout and paint separately from the
-    /// document, so these stay zero. Filling them with a copy of `document` would
-    /// suggest a per-stage change signal the runtime cannot actually provide.
+    /// Per-stage counters. A host fills one only when it can read that stage
+    /// from the runtime (blitz-dom counts Stylo traversals and layout passes);
+    /// a host that cannot leaves it at zero rather than copying `document`.
     pub style: u64,
     pub layout: u64,
     pub paint: u64,
