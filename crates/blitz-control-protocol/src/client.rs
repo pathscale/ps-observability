@@ -563,7 +563,7 @@ impl Client {
     /// An agent-control call, encoded from the server's own type.
     ///
     /// This is the whole reason the protocol crate exists. `AgentAction` is
-    /// adjacently tagged, so the `{"action":"click","node_id":9}` that reads
+    /// adjacently tagged, so the `{"action":"click","nodeId":9}` that reads
     /// correctly is not what the server accepts, and getting it wrong used to
     /// present as a hung application rather than as an encoding mistake.
     pub async fn agent(&mut self, request: &AgentControlRequest) -> Result<Answer> {

@@ -43,8 +43,8 @@
 //!
 //! These are the server's own definitions, and a client that hand-rolls the
 //! JSON gets them wrong in ways that do not look like encoding mistakes.
-//! `AgentAction` is adjacently tagged, so `{"action":"click","node_id":9}` is
-//! malformed where `{"action":"click","params":{"node_id":9}}` is correct, and
+//! `AgentAction` is adjacently tagged, so `{"action":"click","nodeId":9}` is
+//! malformed where `{"action":"click","params":{"nodeId":9}}` is correct, and
 //! the difference used to present as a hung application. Sharing the types
 //! makes that a compile error.
 //!
@@ -106,7 +106,14 @@ pub use endpoint_libs::libs::ws::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const DEBUG_PROTOCOL_VERSION: u32 = 1;
+/// Version 2 names every field inside a command camelCase (`nodeId`,
+/// `maxDepth`, `deltaX`). Version 1 field names are still accepted on input,
+/// so a version 2 host serves version 1 clients; a version 2 client refuses a
+/// version 1 descriptor instead of sending names that host cannot read.
+pub const DEBUG_PROTOCOL_VERSION: u32 = 2;
+/// Largest single frame either side may send or accept. Shared by every
+/// host, client and relay, so a supervisor never forwards a frame its peer
+/// would refuse.
 pub const MAX_DEBUG_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MCP_INITIALIZE: &str = "initialize";
 pub const MCP_INITIALIZED_NOTIFICATION: &str = "notifications/initialized";
@@ -149,11 +156,17 @@ pub enum IncomingRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "command", content = "params", rename_all = "camelCase")]
+#[serde(
+    tag = "command",
+    content = "params",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 #[non_exhaustive]
 pub enum AgentControlRequest {
     Inspect {
         root: Option<u64>,
+        #[serde(alias = "max_depth")]
         max_depth: u32,
     },
     Act(AgentAction),
@@ -182,7 +195,12 @@ pub enum AgentControlRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "command", content = "params", rename_all = "camelCase")]
+#[serde(
+    tag = "command",
+    content = "params",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 #[non_exhaustive]
 pub enum DiagnosticsRequest {
     Observe {
@@ -531,7 +549,12 @@ pub struct LayoutDiagnosticRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "action", content = "params", rename_all = "camelCase")]
+#[serde(
+    tag = "action",
+    content = "params",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 #[non_exhaustive]
 pub enum AgentAction {
     /// Give one semantic node keyboard focus without activating it.
@@ -540,30 +563,36 @@ pub enum AgentAction {
     /// delete or fork button by clicking it performs the action before the key
     /// under test is ever delivered.
     Focus {
+        #[serde(alias = "node_id")]
         node_id: u64,
     },
     /// Activate one semantic node without resolving it back through screen
     /// coordinates. The runtime dispatches pointer, mouse and click events in
     /// browser order directly to this target.
     Click {
+        #[serde(alias = "node_id")]
         node_id: u64,
     },
     /// Two activations in one runtime call, inside the platform's double-click
     /// interval. Used for rows whose single click only selects or folds them.
     DoubleClick {
+        #[serde(alias = "node_id")]
         node_id: u64,
     },
     /// Present one semantic node as hovered. The target is still named by id;
     /// the runtime owns any renderer-specific positioning needed to update CSS
     /// hover state.
     Hover {
+        #[serde(alias = "node_id")]
         node_id: u64,
     },
     SetValue {
+        #[serde(alias = "node_id")]
         node_id: u64,
         value: String,
     },
     ScrollIntoView {
+        #[serde(alias = "node_id")]
         node_id: u64,
     },
     /// Scroll a specific node's nearest scroll container by a delta.
@@ -574,15 +603,22 @@ pub enum AgentAction {
     /// undrivable from outside, so a bug that only appears further down a long
     /// page could not be reproduced without a human at the keyboard.
     ScrollBy {
+        #[serde(alias = "node_id")]
         node_id: u64,
+        #[serde(alias = "delta_x")]
         delta_x: f64,
+        #[serde(alias = "delta_y")]
         delta_y: f64,
     },
     Input(InputCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "input", rename_all = "camelCase")]
+#[serde(
+    tag = "input",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 #[non_exhaustive]
 pub enum InputCommand {
     Key {
@@ -599,7 +635,9 @@ pub enum InputCommand {
         modifiers: Modifiers,
     },
     Wheel {
+        #[serde(alias = "delta_x")]
         delta_x: f64,
+        #[serde(alias = "delta_y")]
         delta_y: f64,
         phase: WheelPhase,
         modifiers: Modifiers,
@@ -1511,7 +1549,7 @@ mod tests {
         assert_eq!(value["params"]["arguments"]["command"], "act");
         assert_eq!(value["params"]["arguments"]["params"]["action"], "click");
         assert_eq!(
-            value["params"]["arguments"]["params"]["params"]["node_id"],
+            value["params"]["arguments"]["params"]["params"]["nodeId"],
             9
         );
     }
