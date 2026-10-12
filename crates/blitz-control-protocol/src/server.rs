@@ -327,7 +327,7 @@ enum ConnectionInput {
     Message(Option<Result<WireMessage, StreamError>>),
     /// The newest event, carried directly. A `Latest` has no sender to drop,
     /// so there is no receive error to represent.
-    Event(DebugEvent),
+    Event(Box<DebugEvent>),
 }
 
 fn stream_wants_event(streams: &[DebugStream], event: &DebugEvent) -> bool {
@@ -365,7 +365,7 @@ async fn handle_connection(
                 Either::Right(((event, revision), _)) => {
                     seen = revision;
                     match event {
-                        Some(event) => ConnectionInput::Event(event),
+                        Some(event) => ConnectionInput::Event(Box::new(event)),
                         None => continue,
                     }
                 }
