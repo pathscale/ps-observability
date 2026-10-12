@@ -218,7 +218,118 @@ pub struct Client {
     stream: Box<dyn MessageStream>,
     next_id: i64,
     request_timeout: Duration,
+    terminal: Option<TerminalFailure>,
     events: VecDeque<DebugEvent>,
+}
+
+#[derive(Clone, Debug)]
+enum TerminalFailure {
+    RequestTimeout {
+        request_id: String,
+        phase: &'static str,
+        timeout: Duration,
+    },
+    Disconnected {
+        request_id: String,
+        phase: &'static str,
+        cause: String,
+    },
+}
+
+impl TerminalFailure {
+    fn report(&self) -> eyre::Report {
+        match self {
+            Self::RequestTimeout {
+                request_id,
+                phase,
+                timeout,
+            } => eyre::Report::new(InspectorRequestTimeout {
+                request_id: request_id.clone(),
+                phase,
+                timeout: *timeout,
+            }),
+            Self::Disconnected {
+                request_id,
+                phase,
+                cause,
+            } => eyre::Report::new(InspectorDisconnected {
+                request_id: request_id.clone(),
+                phase,
+                cause: cause.clone(),
+            }),
+        }
+    }
+
+    fn message(&self) -> String {
+        self.report().to_string()
+    }
+
+    fn is_timeout(&self) -> bool {
+        matches!(self, Self::RequestTimeout { .. })
+    }
+}
+
+/// A request exceeded its single transport deadline.
+#[derive(Clone, Debug)]
+pub struct InspectorRequestTimeout {
+    pub request_id: String,
+    pub phase: &'static str,
+    pub timeout: Duration,
+}
+
+impl std::fmt::Display for InspectorRequestTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "InspectorRequestTimeout: request {} timed out during {} after {:?}",
+            self.request_id, self.phase, self.timeout
+        )
+    }
+}
+
+impl std::error::Error for InspectorRequestTimeout {}
+
+/// The inspector connection ended or failed during a request.
+#[derive(Clone, Debug)]
+pub struct InspectorDisconnected {
+    pub request_id: String,
+    pub phase: &'static str,
+    pub cause: String,
+}
+
+impl std::fmt::Display for InspectorDisconnected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "InspectorDisconnected: request {} failed during {}: {}",
+            self.request_id, self.phase, self.cause
+        )
+    }
+}
+
+impl std::error::Error for InspectorDisconnected {}
+
+fn transport_disconnect_cause(error: &endpoint_libs::libs::ws::StreamError) -> String {
+    if matches!(error, endpoint_libs::libs::ws::StreamError::Closed) {
+        return "clean connection close".to_owned();
+    }
+
+    let mut source = Some(error as &dyn std::error::Error);
+    while let Some(cause) = source {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>()
+            && matches!(
+                io_error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            )
+        {
+            return format!("{:?}: {}", io_error.kind(), io_error);
+        }
+        source = cause.source();
+    }
+
+    error.to_string()
 }
 
 #[derive(Debug)]
@@ -301,6 +412,7 @@ impl Client {
             ))),
             next_id: 0,
             request_timeout: REQUEST_TIMEOUT,
+            terminal: None,
             events: VecDeque::new(),
         })
     }
@@ -318,6 +430,52 @@ impl Client {
         self.request_timeout
     }
 
+    pub fn is_terminal(&self) -> bool {
+        self.terminal.is_some()
+    }
+
+    pub fn terminal_is_timeout(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .is_some_and(TerminalFailure::is_timeout)
+    }
+
+    pub fn terminal_failure_message(&self) -> Option<String> {
+        self.terminal.as_ref().map(TerminalFailure::message)
+    }
+
+    fn ensure_available(&self) -> Result<()> {
+        match &self.terminal {
+            Some(failure) => Err(failure.report()),
+            None => Ok(()),
+        }
+    }
+
+    fn mark_timeout(&mut self, id: &JsonRpcId, phase: &'static str) -> eyre::Report {
+        let failure = TerminalFailure::RequestTimeout {
+            request_id: format!("{id:?}"),
+            phase,
+            timeout: self.request_timeout,
+        };
+        self.terminal = Some(failure.clone());
+        failure.report()
+    }
+
+    fn mark_disconnected(
+        &mut self,
+        id: &JsonRpcId,
+        phase: &'static str,
+        cause: String,
+    ) -> eyre::Report {
+        let failure = TerminalFailure::Disconnected {
+            request_id: format!("{id:?}"),
+            phase,
+            cause,
+        };
+        self.terminal = Some(failure.clone());
+        failure.report()
+    }
+
     fn next_id(&mut self) -> JsonRpcId {
         self.next_id += 1;
         JsonRpcId::Number(self.next_id)
@@ -333,21 +491,36 @@ impl Client {
         request: WireMessage,
         id: &JsonRpcId,
     ) -> Result<serde_json::Value> {
-        self.stream
-            .send(request)
-            .await
-            .map_err(|error| eyre!("sending to the inspector failed: {error}"))?;
+        self.ensure_available()?;
+        let deadline = Instant::now() + self.request_timeout;
+        let send_remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(send_remaining, self.stream.send(request)).await {
+            Err(_) => return Err(self.mark_timeout(id, "send")),
+            Ok(Err(error)) => {
+                let cause = transport_disconnect_cause(&error);
+                return Err(self.mark_disconnected(id, "send", cause));
+            }
+            Ok(Ok(())) => {}
+        }
+
         loop {
-            let message = timeout(self.request_timeout, self.stream.recv())
-                .await
-                .map_err(|_| {
-                    eyre!(
-                        "the inspector did not answer within {:?}",
-                        self.request_timeout
-                    )
-                })?
-                .ok_or_else(|| eyre!("the inspector closed the connection"))?
-                .map_err(|error| eyre!("reading from the inspector failed: {error}"))?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(self.mark_timeout(id, "receive"));
+            }
+
+            let message = match timeout(remaining, self.stream.recv()).await {
+                Err(_) => return Err(self.mark_timeout(id, "receive")),
+                Ok(None) => {
+                    return Err(self.mark_disconnected(id, "receive", "clean EOF".to_owned()));
+                }
+                Ok(Some(Err(error))) => {
+                    let cause = transport_disconnect_cause(&error);
+                    return Err(self.mark_disconnected(id, "receive", cause));
+                }
+                Ok(Some(Ok(message))) => message,
+            };
+
             let value = decode_wire_value(message).map_err(protocol_error)?;
             if peek_value_request_id(&value).as_ref() == Some(id) {
                 return Ok(value);
@@ -435,6 +608,7 @@ impl Client {
 
     /// Wait for the first real frame committed after an armed interaction.
     pub async fn wait_for_paint(&mut self, within: Duration) -> Result<bool> {
+        self.ensure_available()?;
         if let Some(index) = self
             .events
             .iter()
@@ -450,12 +624,18 @@ impl Client {
             if remaining.is_zero() {
                 return Ok(false);
             }
+            let id = JsonRpcId::Number(self.next_id);
             let message = match timeout(remaining, self.stream.recv()).await {
-                Ok(Some(message)) => message,
-                Ok(None) | Err(_) => return Ok(false),
+                Err(_) => return Ok(false),
+                Ok(None) => {
+                    return Err(self.mark_disconnected(&id, "paint", "clean EOF".to_owned()));
+                }
+                Ok(Some(Err(error))) => {
+                    let cause = transport_disconnect_cause(&error);
+                    return Err(self.mark_disconnected(&id, "paint", cause));
+                }
+                Ok(Some(Ok(message))) => message,
             };
-            let message = message
-                .map_err(|error| eyre!("reading paint event from inspector failed: {error}"))?;
             let value = decode_wire_value(message).map_err(protocol_error)?;
             match decode_diagnostics_event_value(value) {
                 Ok(DebugEvent::PaintCommitted { .. }) => return Ok(true),
@@ -492,6 +672,7 @@ impl Client {
 
     /// Collect pushed notifications for a while, as `watch` does.
     pub async fn drain(&mut self, seconds: f64) -> Result<Vec<serde_json::Value>> {
+        self.ensure_available()?;
         let deadline = Instant::now() + Duration::from_secs_f64(seconds);
         let mut out = Vec::new();
         loop {
@@ -501,11 +682,18 @@ impl Client {
             }
             match timeout(remaining, self.stream.recv()).await {
                 Err(_) => return Ok(out),
-                Ok(None) => return Ok(out),
+                Ok(None) => {
+                    let id = JsonRpcId::Number(self.next_id);
+                    return Err(self.mark_disconnected(&id, "drain", "clean EOF".to_owned()));
+                }
                 Ok(Some(Ok(message))) => {
                     out.push(decode_wire_value(message).map_err(protocol_error)?)
                 }
-                Ok(Some(Err(error))) => bail!("reading from the inspector failed: {error}"),
+                Ok(Some(Err(error))) => {
+                    let id = JsonRpcId::Number(self.next_id);
+                    let cause = transport_disconnect_cause(&error);
+                    return Err(self.mark_disconnected(&id, "drain", cause));
+                }
             }
         }
     }
@@ -631,9 +819,102 @@ mod tests {
                 );
             };
 
-            futures::future::join(server, client).await;
+            nagoya::timeout(
+                Duration::from_secs(2),
+                futures::future::join(server, client),
+            )
+            .await
+            .expect("transport fixture watchdog");
             let _ = std::fs::remove_file(socket);
         });
+    }
+
+    #[test]
+    fn notifications_do_not_renew_the_request_deadline() {
+        nagoya::block_on(async {
+            let socket = std::env::temp_dir().join(format!(
+                "ps-qa-notification-timeout-{}-{}.sock",
+                std::process::id(),
+                Instant::now().elapsed().as_nanos()
+            ));
+            let server_socket = socket.clone();
+            let server = async move {
+                let addr = Addr::path(server_socket.as_os_str().as_bytes()).expect("socket path");
+                let listener = TcpListener::bind(addr, client_reactor()).expect("bind fixture");
+                let (stream, _) = listener.accept().await.expect("accept client");
+                let mut stream =
+                    TransportStream::new(framed_json_neutral(NagoyaStream::new(stream)));
+                let _request = stream
+                    .recv()
+                    .await
+                    .expect("client stays connected")
+                    .expect("request is readable");
+                for _ in 0..40 {
+                    let event =
+                        encode_diagnostics_event(&DebugEvent::PaintCommitted { revision: 1 })
+                            .expect("encode notification");
+                    if stream.send(event).await.is_err() {
+                        break;
+                    }
+                    nagoya::sleep(Duration::from_millis(5)).await;
+                }
+            };
+
+            let client_socket = socket.clone();
+            let client = async move {
+                let mut client = Client::connect(&client_socket)
+                    .await
+                    .expect("connect fixture");
+                client.set_request_timeout(Duration::from_millis(100));
+
+                let started = Instant::now();
+                let error = client
+                    .initialize()
+                    .await
+                    .expect_err("notifications do not answer initialize");
+                assert!(
+                    error.downcast_ref::<InspectorRequestTimeout>().is_some(),
+                    "expected typed request timeout, got {error}"
+                );
+                assert!(started.elapsed() < Duration::from_millis(250));
+
+                let started = Instant::now();
+                let error = client
+                    .tools_list()
+                    .await
+                    .expect_err("a timed out stream is terminal");
+                assert!(
+                    error.downcast_ref::<InspectorRequestTimeout>().is_some(),
+                    "expected the stored terminal timeout, got {error}"
+                );
+                assert!(started.elapsed() < Duration::from_millis(25));
+            };
+
+            nagoya::timeout(
+                Duration::from_secs(2),
+                futures::future::join(server, client),
+            )
+            .await
+            .expect("notification fixture watchdog");
+            let _ = std::fs::remove_file(socket);
+        });
+    }
+
+    #[test]
+    fn transport_disconnect_classifies_typed_io_sources() {
+        for (kind, label) in [
+            (std::io::ErrorKind::UnexpectedEof, "UnexpectedEof"),
+            (std::io::ErrorKind::ConnectionReset, "ConnectionReset"),
+            (std::io::ErrorKind::BrokenPipe, "BrokenPipe"),
+        ] {
+            let error = endpoint_libs::libs::ws::StreamError::Other(eyre::Report::new(
+                std::io::Error::from(kind),
+            ));
+            assert!(
+                transport_disconnect_cause(&error).contains(label),
+                "typed I/O source {kind:?} was not preserved"
+            );
+        }
     }
 
     #[test]

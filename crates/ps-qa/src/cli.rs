@@ -101,6 +101,20 @@ pub struct Cli {
     )]
     pub timeout_scale: f64,
 
+    /// Maximum inspector request time in milliseconds.
+    ///
+    /// `PS_QA_REQUEST_TIMEOUT_MS` sets the default for a job. The command line
+    /// value takes precedence. Check-specific open and outcome budgets raise
+    /// this transport limit when they are longer.
+    #[arg(
+        long,
+        global = true,
+        env = "PS_QA_REQUEST_TIMEOUT_MS",
+        default_value_t = 15_000,
+        value_parser = clap::value_parser!(u64).range(1..=300_000)
+    )]
+    pub request_timeout_ms: u64,
+
     /// Report the node each step addressed, and why a step chose it.
     #[arg(long, global = true)]
     pub trace: bool,
@@ -634,6 +648,7 @@ static PACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 /// is set once before any check runs and read several frames below the CLI.
 static TIMEOUT_SCALE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1.0_f64.to_bits());
+static REQUEST_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(15_000);
 
 /// Record whether tracing was asked for. Called once, from `main`.
 pub fn set_trace(on: bool) {
@@ -666,6 +681,10 @@ pub fn set_timeout_scale(scale: f64) {
     TIMEOUT_SCALE.store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
+pub fn set_request_timeout_ms(milliseconds: u64) {
+    REQUEST_TIMEOUT_MS.store(milliseconds, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The active application profile. A RunPlan changes this between its separate
 /// guest hosts; ordinary CLI runs set it once from `main`.
 static APP: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
@@ -688,6 +707,10 @@ pub fn pace() -> f64 {
 /// The interaction and rendered-outcome deadline multiplier.
 pub fn timeout_scale() -> f64 {
     f64::from_bits(TIMEOUT_SCALE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn request_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(REQUEST_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Whether to name the node a step addressed, and why it chose it.
@@ -763,6 +786,20 @@ mod tests {
         assert!(parse_timeout_scale("0.5").is_err());
         assert!(parse_timeout_scale("11").is_err());
         assert!(parse_timeout_scale("not-a-number").is_err());
+    }
+
+    #[test]
+    fn request_timeout_flag_is_bounded_and_overrides_the_environment_value() {
+        let cli = Cli::try_parse_from(["ps-qa", "--request-timeout-ms", "2500", "nodes"])
+            .expect("valid command-line timeout");
+        assert_eq!(cli.request_timeout_ms, 2500);
+
+        for value in ["0", "300001", "not-a-number"] {
+            assert!(
+                Cli::try_parse_from(["ps-qa", "--request-timeout-ms", value, "nodes",]).is_err(),
+                "invalid request timeout {value:?} was accepted"
+            );
+        }
     }
 
     #[test]

@@ -13,6 +13,12 @@ place a `.sock` beside the `.json` descriptor, but clients should only derive
 that legacy fallback when an older descriptor omits a `unix://` address.
 
 The transport uses `endpoint-libs` framed JSON and MCP/JSON-RPC primitives.
+Client requests use one deadline across sending and receiving all frames.
+Notifications and replies for other request IDs do not restart that deadline.
+A timeout or terminal stream failure poisons the client connection. The
+client reports these cases as `InspectorRequestTimeout` and
+`InspectorDisconnected`, with the request ID, phase, and timeout or cause.
+EOF while waiting for paint is a disconnect error.
 `CaptureRequest::validate` defines the safe renderer allocation bounds, and
 encoded responses are rejected before crossing the transport's 16 MiB frame
 limit.

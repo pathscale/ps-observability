@@ -2127,19 +2127,6 @@ fn action_description(check: &Check) -> String {
     action
 }
 
-/// Count matching nodes per group, for the summary line.
-pub fn tally<'a>(results: &[(&'a Check, Result<(), String>)]) -> HashMap<&'a str, (usize, usize)> {
-    let mut by_group: HashMap<&str, (usize, usize)> = HashMap::new();
-    for (check, outcome) in results {
-        let entry = by_group.entry(check.group.as_str()).or_insert((0, 0));
-        entry.1 += 1;
-        if outcome.is_ok() {
-            entry.0 += 1;
-        }
-    }
-    by_group
-}
-
 #[cfg(test)]
 mod tests {
     use super::{

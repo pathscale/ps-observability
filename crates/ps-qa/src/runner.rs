@@ -477,6 +477,12 @@ fn check_recovery_budget(client: &Client, check: &qa::Check) -> Duration {
         .max(declared_outcome_timeout(check))
 }
 
+async fn connect_client(socket: &std::path::Path) -> Result<Client> {
+    let mut client = Client::connect(socket).await?;
+    client.set_request_timeout(cli::request_timeout());
+    Ok(client)
+}
+
 async fn reconnect_hosted(client: &mut Client, hosted: &mut HostedSession) -> Result<()> {
     hosted.restart().map_err(|error| eyre!(error))?;
     let descriptor_path = hosted
@@ -484,7 +490,7 @@ async fn reconnect_hosted(client: &mut Client, hosted: &mut HostedSession) -> Re
         .to_str()
         .ok_or_else(|| eyre!("host descriptor path is not valid utf-8"))?;
     let descriptor = inspector::discover(Some(descriptor_path))?;
-    let mut fresh = Client::connect(&descriptor.socket_path()).await?;
+    let mut fresh = connect_client(&descriptor.socket_path()).await?;
     fresh.initialize().await?;
     *client = fresh;
     Ok(())
@@ -835,7 +841,7 @@ async fn capture_node_region(
     // sub-second action contract for clicks and keys, but do not kill a valid
     // capture merely because shaping/rasterising its first frame is slower.
     let previous_timeout = client.request_timeout();
-    client.set_request_timeout(Duration::from_secs(15));
+    client.set_request_timeout(cli::request_timeout());
     let started = std::time::Instant::now();
     let answer = client
         .diagnostics(&DiagnosticsRequest::Capture(CaptureRequest {
@@ -1669,21 +1675,21 @@ async fn run_qa_inner(
         // so a check that carries entries restarts onto that file. The next
         // check with an empty map restarts once without it. Only a session
         // that allows it (qa-hosted) is restarted.
-        if let Some(session) = hosted.as_deref_mut()
-            && session.seeds_storage
-        {
-            stage_check_storage(client, session, &selected[index].storage).await?;
-        }
         let check = &selected[index];
         let full_check_started = Instant::now();
         // `?` leaves this block instead of abandoning the group before the
         // table exists. The check that stopped the page is not executed again.
         let produced: std::result::Result<OneCheck, eyre::Report> = async {
+        if let Some(session) = hosted.as_deref_mut()
+            && session.seeds_storage
+        {
+            stage_check_storage(client, session, &check.storage).await?;
+        }
         let mut retries = 0;
         // Navigation and disclosure materialization are suite setup. Give them
         // a bounded but realistic budget; the measured control action below
         // switches the transport to the sub-second contract.
-        client.set_request_timeout(Duration::from_secs(15));
+        client.set_request_timeout(cli::request_timeout().max(declared_open_timeout(check)));
         /*
          * Navigate first, and snapshot *after*, or the baseline is the wrong
          * surface entirely and every count is measured against a screen the
@@ -2547,7 +2553,7 @@ async fn run_qa_inner(
 
         // Then the action, if this check is about one. A click that cannot be
         // dispatched is itself a failure, not a skip.
-        client.set_request_timeout(check_timeout(check.outcome_timeout_ms.max(900)));
+        client.set_request_timeout(cli::request_timeout().max(declared_outcome_timeout(check)));
         let mut action_error = open_error;
         let mut action_target = None;
         let mut action_node_id = None;
@@ -2900,13 +2906,14 @@ async fn run_qa_inner(
         Ok((outcome, settle_iterations, retries))
         }
         .await;
-        let gave_up = match &produced {
-            Ok((outcome, _, _)) => outcome
-                .as_ref()
-                .err()
-                .is_some_and(|error| host_gave_up(error)),
-            Err(error) => host_gave_up_report(error),
-        };
+        let gave_up = client.is_terminal()
+            || match &produced {
+                Ok((outcome, _, _)) => outcome
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| host_gave_up(error)),
+                Err(error) => host_gave_up_report(error),
+            };
         match produced {
             Ok((outcome, settle_iterations, retries)) => results.push(CheckResult {
                 check,
@@ -2914,6 +2921,7 @@ async fn run_qa_inner(
                 duration_ms: full_check_started.elapsed().as_millis() as u64,
                 settle_iterations,
                 retries,
+                not_run: false,
             }),
             Err(error) if gave_up => results.push(CheckResult {
                 check,
@@ -2921,9 +2929,35 @@ async fn run_qa_inner(
                 duration_ms: full_check_started.elapsed().as_millis() as u64,
                 settle_iterations: 0,
                 retries: 0,
+                not_run: false,
             }),
             Err(error) => return Err(error),
         }
+        if client.is_terminal() {
+            if let Some(current) = results.last_mut() {
+                current.outcome = Err(client.terminal_failure_message().unwrap_or_else(|| {
+                    "InspectorDisconnected: inspector connection failed".to_owned()
+                }));
+            }
+
+            let reason = if client.terminal_is_timeout() {
+                "request timed out"
+            } else {
+                "app died"
+            };
+            for later in &selected[index + 1..] {
+                results.push(CheckResult {
+                    check: later,
+                    outcome: Err(reason.to_owned()),
+                    not_run: true,
+                    duration_ms: 0,
+                    settle_iterations: 0,
+                    retries: 0,
+                });
+            }
+            break;
+        }
+
         if !gave_up && check.settle_after_ms > 0 {
             nagoya::sleep(Duration::from_millis(check.settle_after_ms)).await;
         }
@@ -2937,7 +2971,7 @@ async fn run_qa_inner(
         if group_done {
             dump_qa_hosted_gpu(client, &check.group).await?;
         }
-        if gave_up && index + 1 < selected.len() {
+        if gave_up && !client.is_terminal() && index + 1 < selected.len() {
             if let Some(session) = hosted.as_deref_mut() {
                 reconnect_hosted(client, session).await?;
             } else {
@@ -2952,6 +2986,7 @@ async fn run_qa_inner(
                             duration_ms: 0,
                             settle_iterations: 0,
                             retries: 0,
+                            not_run: true,
                         });
                     }
                     break;
@@ -2960,17 +2995,32 @@ async fn run_qa_inner(
         }
     }
 
+    let passed = results
+        .iter()
+        .filter(|result| !result.not_run && result.outcome.is_ok())
+        .count();
     let failed = results
         .iter()
-        .filter(|result| result.outcome.is_err())
+        .filter(|result| !result.not_run && result.outcome.is_err())
         .count();
-    let tally_input: Vec<_> = results
-        .iter()
-        .map(|result| (result.check, result.outcome.clone()))
-        .collect();
-    let tally = qa::tally(&tally_input);
-    let mut groups: Vec<_> = tally.iter().collect();
-    groups.sort_by_key(|(name, _)| *name);
+    let not_run = results.iter().filter(|result| result.not_run).count();
+
+    let mut group_counts: HashMap<String, (usize, usize, usize, usize)> = HashMap::new();
+    for result in &results {
+        let counts = group_counts
+            .entry(result.check.group.clone())
+            .or_insert((0, 0, 0, 0));
+        counts.3 += 1;
+        if result.not_run {
+            counts.2 += 1;
+        } else if result.outcome.is_ok() {
+            counts.0 += 1;
+        } else {
+            counts.1 += 1;
+        }
+    }
+    let mut groups: Vec<_> = group_counts.into_iter().collect();
+    groups.sort_by(|left, right| left.0.cmp(&right.0));
 
     /*
      * TOON, for a caller that is a program - usually a language model.
@@ -2999,14 +3049,17 @@ async fn run_qa_inner(
      */
 
     let report = Report {
-        passed: results.len() - failed,
+        passed,
         failed,
+        not_run,
         groups: groups
             .into_iter()
-            .map(|(name, (passed, total))| GroupRow {
-                name: name.to_string(),
-                passed: *passed,
-                total: *total,
+            .map(|(name, (passed, failed, not_run, total))| GroupRow {
+                name,
+                passed,
+                failed,
+                not_run,
+                total,
             })
             .collect(),
         checks: results.iter().map(CheckRow::from).collect(),
@@ -3417,6 +3470,31 @@ fn merge_outcome_snapshot(
 /// three-second check gets a dozen chances to see a change outside its pane.
 const FULL_DOCUMENT_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
+async fn inspect_before_deadline(
+    client: &mut Client,
+    deadline: Instant,
+) -> Result<(AgentSnapshot, f64)> {
+    let previous = client.request_timeout();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    client.set_request_timeout(previous.min(remaining));
+    let result = inspect(client).await;
+    client.set_request_timeout(previous);
+    result
+}
+
+async fn inspect_subtree_before_deadline(
+    client: &mut Client,
+    root: u64,
+    deadline: Instant,
+) -> Result<(AgentSnapshot, f64)> {
+    let previous = client.request_timeout();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    client.set_request_timeout(previous.min(remaining));
+    let result = inspect_subtree(client, root).await;
+    client.set_request_timeout(previous);
+    result
+}
+
 /// Wait for the declared result, not merely for a tree that already contains
 /// the subject.
 ///
@@ -3501,18 +3579,18 @@ async fn settle_for_outcome(
     };
     loop {
         let mut after = if let Some(scoped) = scope.as_ref() {
-            match inspect_subtree(client, scoped.root).await {
+            match inspect_subtree_before_deadline(client, scoped.root, deadline).await {
                 Ok((snapshot, _)) => merge_outcome_snapshot(before, snapshot, &scoped.baseline_ids),
                 // Reconciliation can replace the pane root. Reacquire from one
                 // full snapshot instead of treating a stale id as failure.
                 Err(_) => {
-                    let full = inspect(client).await?.0;
+                    let full = inspect_before_deadline(client, deadline).await?.0;
                     scope = outcome_poll_scope(&full.nodes);
                     full
                 }
             }
         } else {
-            inspect(client).await?.0
+            inspect_before_deadline(client, deadline).await?.0
         };
         iterations += 1;
         let now = std::time::Instant::now();
@@ -3539,7 +3617,7 @@ async fn settle_for_outcome(
             // polling never saw a control a single fresh snapshot found at
             // once. Between probes the stability samples stay scoped, which is
             // what keeps this from serialising the document every turn.
-            after = inspect(client).await?.0;
+            after = inspect_before_deadline(client, deadline).await?.0;
             last_full_probe = Some(now);
             passing = outcome_verdict(
                 check,
@@ -3786,6 +3864,7 @@ async fn click_by_id(client: &mut Client, node_id: u64) -> Result<()> {
 struct Report {
     passed: usize,
     failed: usize,
+    not_run: usize,
     groups: Vec<GroupRow>,
     checks: Vec<CheckRow>,
 }
@@ -3793,6 +3872,7 @@ struct Report {
 struct CheckResult<'a> {
     check: &'a qa::Check,
     outcome: std::result::Result<(), String>,
+    not_run: bool,
     /// End-to-end check time, including setup and teardown around the measured
     /// interaction. The verdict's stricter action budget is enforced
     /// separately; this is artifact cost.
@@ -3807,6 +3887,8 @@ struct CheckResult<'a> {
 struct GroupRow {
     name: String,
     passed: usize,
+    failed: usize,
+    not_run: usize,
     total: usize,
 }
 
@@ -3827,7 +3909,9 @@ struct CheckRow {
 impl From<&CheckResult<'_>> for CheckRow {
     fn from(result: &CheckResult<'_>) -> Self {
         Self {
-            verdict: if result.outcome.is_ok() {
+            verdict: if result.not_run {
+                "not-run"
+            } else if result.outcome.is_ok() {
                 "pass"
             } else {
                 "fail"
@@ -4222,7 +4306,7 @@ fn report_captured(
 
 async fn read_gpu_capture(client: &mut Client, target: &str) -> Result<CapturedImage> {
     let previous_timeout = client.request_timeout();
-    client.set_request_timeout(Duration::from_secs(15));
+    client.set_request_timeout(cli::request_timeout());
     let answer = client
         .diagnostics(&DiagnosticsRequest::WebGpuCapture {
             target: target.to_owned(),
@@ -6731,6 +6815,7 @@ pub async fn run() -> Result<()> {
     cli::set_headless(cli.headless);
     cli::set_pace(cli.pace);
     cli::set_timeout_scale(cli.timeout_scale);
+    cli::set_request_timeout_ms(cli.request_timeout_ms);
     cli::set_capture_options(
         cli.trace_capture,
         cli.require_paint_events,

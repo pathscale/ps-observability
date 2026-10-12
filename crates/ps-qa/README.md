@@ -62,7 +62,17 @@ matched by JSON-RPC id, because the server also pushes notifications on the same
 socket — a client that returns the next frame it sees will eventually hand back
 a console message as though it were the answer.
 
-One connection serves a whole run.
+One connection serves a whole run. Inspector requests use a 15,000 ms
+transport timeout by default. Set `PS_QA_REQUEST_TIMEOUT_MS` or pass
+`--request-timeout-ms`; the flag takes precedence over the environment, and
+values must be between 1 and 300,000 ms. A check's declared open or outcome
+budget raises the transport timeout when it is longer. Polling still stops at
+the semantic deadline.
+
+A disconnected inspector or a transport timeout fails the current check and
+aborts the suite. Later selected checks appear as `verdict="not-run"` with
+zero duration, iterations, and retries. They do not count as passes or failures,
+and the aborted run keeps a nonzero exit status.
 
 ### Host interface
 
