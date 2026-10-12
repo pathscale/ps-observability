@@ -3470,16 +3470,25 @@ fn merge_outcome_snapshot(
 /// three-second check gets a dozen chances to see a change outside its pane.
 const FULL_DOCUMENT_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
+/// An outcome deadline that has already passed is the check's failure, not
+/// the transport's. Issuing the read with the remaining time as its request
+/// timeout would ask for a zero deadline, and a request that times out leaves
+/// the client terminal, so every later check would be reported not run.
+fn outcome_deadline_passed(deadline: Instant) -> Result<()> {
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
+        return Err(eyre::eyre!(
+            "OutcomeTimeout: the declared outcome deadline passed before the next read"
+        ));
+    }
+    Ok(())
+}
+
 async fn inspect_before_deadline(
     client: &mut Client,
     deadline: Instant,
 ) -> Result<(AgentSnapshot, f64)> {
-    let previous = client.request_timeout();
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    client.set_request_timeout(previous.min(remaining));
-    let result = inspect(client).await;
-    client.set_request_timeout(previous);
-    result
+    outcome_deadline_passed(deadline)?;
+    inspect(client).await
 }
 
 async fn inspect_subtree_before_deadline(
@@ -3487,12 +3496,8 @@ async fn inspect_subtree_before_deadline(
     root: u64,
     deadline: Instant,
 ) -> Result<(AgentSnapshot, f64)> {
-    let previous = client.request_timeout();
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    client.set_request_timeout(previous.min(remaining));
-    let result = inspect_subtree(client, root).await;
-    client.set_request_timeout(previous);
-    result
+    outcome_deadline_passed(deadline)?;
+    inspect_subtree(client, root).await
 }
 
 /// Wait for the declared result, not merely for a tree that already contains
