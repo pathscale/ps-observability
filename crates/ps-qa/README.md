@@ -36,7 +36,7 @@ The app writes a descriptor when built with its inspector feature:
 
 ```json
 {
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "pid": 62904,
   "address": "unix:///path/to/blitz-control.sock",
   "renderer": "blitz"

@@ -6969,7 +6969,9 @@ pub async fn run() -> Result<()> {
         }
         cli::Command::Eval { script } => {
             match client
-                .diagnostics(&DiagnosticsRequest::Evaluate { script: script.clone() })
+                .diagnostics(&DiagnosticsRequest::Evaluate {
+                    script: script.clone(),
+                })
                 .await?
                 .response
             {
