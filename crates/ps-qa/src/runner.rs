@@ -3321,7 +3321,20 @@ async fn wait_for_gpu_buffer(
         client.set_request_timeout(previous_timeout.min(remaining));
         let sample = gpu_buffer::read(client, &check.subject, offset, Some(length)).await;
         client.set_request_timeout(previous_timeout);
-        let verdict = match sample.map_err(|error| error.to_string())? {
+        let sample = match sample {
+            Err(error)
+                if Instant::now() >= deadline
+                    && error
+                        .downcast_ref::<inspector::InspectorRequestTimeout>()
+                        .is_some() =>
+            {
+                return Err(format!(
+                    "{last_failure}; OutcomeTimeout: GPUBuffer outcome deadline passed; {error}"
+                ));
+            }
+            result => result.map_err(|error| error.to_string())?,
+        };
+        let verdict = match sample {
             None => Err(format!(
                 "GPUBuffer {:?} is pending: no completed write yet",
                 check.subject
