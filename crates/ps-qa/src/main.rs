@@ -11,6 +11,7 @@ mod inspector;
 mod interaction;
 mod layout_report;
 mod outcome;
+mod page_targets;
 mod paint_audit;
 mod paint_color;
 mod plan;

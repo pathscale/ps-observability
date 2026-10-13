@@ -7207,6 +7207,13 @@ pub async fn run() -> Result<()> {
     }
 
     let mut client = Client::connect(&descriptor.socket_path()).await?;
+    if let Some(tab_id) = cli.tab_id {
+        client.select_target(Some(blitz_control_protocol::TargetSelector::Tab { tab_id }));
+    } else if cli.chrome {
+        client.select_target(Some(blitz_control_protocol::TargetSelector::Chrome(
+            blitz_control_protocol::Chrome::Chrome,
+        )));
+    }
     let initialize = client.initialize().await?;
     if verbose {
         println!("\n== initialize ==");
@@ -7217,6 +7224,20 @@ pub async fn run() -> Result<()> {
     }
 
     match cli.command {
+        cli::Command::Targets => {
+            let answer = client.agent(&AgentControlRequest::ListTargets).await?;
+            println!("{}", serde_json::to_string_pretty(&answer.response)?);
+        }
+        cli::Command::PageTargets { url } => {
+            crate::page_targets::gui(&descriptor.socket_path(), &descriptor.path, &url).await?;
+        }
+        cli::Command::HeadlessTarget => {
+            crate::page_targets::headless(&mut client).await?;
+        }
+        cli::Command::InspectionOff => {
+            crate::page_targets::inspection_off(&descriptor.socket_path(), &descriptor.path)
+                .await?;
+        }
         cli::Command::Gpu => {
             let report = gpu_report(&mut client).await?;
             println!(

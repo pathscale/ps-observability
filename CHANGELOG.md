@@ -10,6 +10,10 @@
 - Advertise the additive request through the derived diagnostics schema while keeping DEBUG_PROTOCOL_VERSION at 2.
 - Expose a typed pending-response classifier for clients retrying incomplete buffer samples.
 
+## ps-qa 0.9.2
+
+- Add target selection to ps-qa and GUI, headless, and inspection-off functional stages for tab identity, page-local input, journal replay, and lifecycle cleanup.
+
 ## ps-qa 0.9.1
 
 - Require blitz-control-protocol ^0.7.1 and add ps-qa gpu-buffer with aligned byte ranges, little-endian typed values, stride grouping, and TOON output.

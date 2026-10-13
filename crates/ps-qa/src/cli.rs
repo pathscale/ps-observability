@@ -71,6 +71,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub descriptor: Option<PathBuf>,
 
+    /// Select a browser page. Node guards are propagated from its inspection.
+    #[arg(long, global = true, conflicts_with = "chrome")]
+    pub tab_id: Option<u64>,
+
+    /// Select browser chrome explicitly; omission retains the host default.
+    #[arg(long, global = true, conflicts_with = "tab_id")]
+    pub chrome: bool,
+
     /// The application profile: which surfaces exist, what they are called, and
     /// which controls must not be pressed. Defaults to `ps-qa.ron` in the
     /// working directory. Application-driving sweeps fail clearly when neither
@@ -167,6 +175,17 @@ pub struct Cli {
 /// and the behaviour are the same edit.
 #[derive(Subcommand)]
 pub enum Command {
+    /// List every inspection target and its mounted identity and capabilities.
+    Targets,
+    /// Drive the page-target fixture through two GUI tabs, navigation and closure.
+    PageTargets {
+        /// Fixture URL to load in two tabs of a disposable GUI instance.
+        url: String,
+    },
+    /// Verify the headless sole-page discovery and legacy default.
+    HeadlessTarget,
+    /// Disable inspection in Settings and assert socket and descriptor removal.
+    InspectionOff,
     /// Tree size and a role histogram.
     Nodes,
 
