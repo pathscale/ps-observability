@@ -23,7 +23,7 @@ publish = true
 # a wheel event. `cargo tree -p ps-qa` is the check.
 [dependencies]
 libc = "^0.2.189"
-nagoya = { version = "^0.1.12", path = "../../../nagoya", features = ["reactor"] }
+nagoya = { version = "^0.1.12", features = ["reactor"] }
 blitz-control-protocol = { workspace = true, features = ["client"] }
 # The same framing the server uses, from the same crate, for the same reason as
 # the protocol types: a hand-rolled length-prefix reader is how the Python
