@@ -1,7 +1,16 @@
+//! Application resource caps, compiled into each binary (never a library).
+//!
+//! Every cap is a parameter: `--max-<name>` / `--warn-<name>` on the command line,
+//! stripped before the application parses its own arguments. Defaults come from the
+//! binary's `start` call. Resident size is measured, never virtual. Each cap warns
+//! once at its warn threshold (default 50%) naming the current stage, and the process
+//! exits naming the cap when the hard value is passed. No `unsafe` here: rustix and
+//! libproc provide the system calls.
+
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -16,9 +25,8 @@ const NAMES: [&str; 9] = [
     "iterations",
     "cache-entries",
 ];
-static CPU_HIT: AtomicBool = AtomicBool::new(false);
-static TURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static OWNED: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+static TURNS: AtomicU64 = AtomicU64::new(0);
+static OWNED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static STATE: OnceLock<Arc<Caps>> = OnceLock::new();
 
 pub struct Caps {
@@ -80,9 +88,13 @@ pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
             .strip_prefix("--max-")
             .map(|s| (s, false))
             .or_else(|| flag.strip_prefix("--warn-").map(|s| (s, true)));
-        if let Some((name, warning)) = cap
-            && let Some(index) = NAMES.iter().position(|n| *n == name)
-        {
+        let matched = cap.and_then(|(name, warning)| {
+            NAMES
+                .iter()
+                .position(|n| *n == name)
+                .map(|index| (index, warning))
+        });
+        if let Some((index, warning)) = matched {
             let value = inline.map(str::to_owned).unwrap_or_else(|| {
                 raw.next()
                     .and_then(|s| s.into_string().ok())
@@ -128,34 +140,7 @@ pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
         .unwrap_or_else(|_| fail("CAP_ALREADY_STARTED"));
     caps.tick();
     #[cfg(unix)]
-    unsafe {
-        let mut inherited: libc::rlimit = std::mem::zeroed();
-        for (resource, requested) in [(libc::RLIMIT_CPU, hard[1]), (libc::RLIMIT_NOFILE, hard[3])] {
-            if libc::getrlimit(resource, &mut inherited) != 0 {
-                fail(std::io::Error::last_os_error());
-            }
-            let soft = requested as libc::rlim_t;
-            if soft > inherited.rlim_max {
-                fail("CAP_INHERITED_HARD_LIMIT");
-            }
-            let hard = if resource == libc::RLIMIT_CPU {
-                soft.saturating_add(1).min(inherited.rlim_max)
-            } else {
-                inherited.rlim_max
-            };
-            let limit = libc::rlimit {
-                rlim_cur: soft,
-                rlim_max: hard,
-            };
-            if libc::setrlimit(resource, &limit) != 0 {
-                fail(std::io::Error::last_os_error());
-            }
-        }
-        if libc::signal(libc::SIGXCPU, cpu_stop as *const () as libc::sighandler_t) == libc::SIG_ERR
-        {
-            fail("CAP_CPU_SIGNAL_SETUP");
-        }
-    }
+    install_kernel_limits(&hard);
     let monitor = Arc::clone(&caps);
     let runtime = nagoya::runtime::Runtime::new(1);
     drop(runtime.spawn(async move {
@@ -167,13 +152,34 @@ pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
     caps
 }
 
+/// Kernel backstops. The 250 ms sampler names the CPU cap first; the kernel
+/// limit sits two seconds above it and kills the process if the sampler cannot.
 #[cfg(unix)]
-extern "C" fn cpu_stop(_: libc::c_int) {
-    const MESSAGE: &[u8] = b"CAP_MAX_CPU_SECS: source=RLIMIT_CPU\n";
-    unsafe {
-        libc::write(2, MESSAGE.as_ptr().cast(), MESSAGE.len());
+fn install_kernel_limits(hard: &[u64; 9]) {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    for (resource, requested, margin) in
+        [(Resource::Cpu, hard[1], 2), (Resource::Nofile, hard[3], 0)]
+    {
+        let inherited = getrlimit(resource);
+        let soft = requested.saturating_add(margin);
+        if inherited.maximum.is_some_and(|max| soft > max) {
+            fail("CAP_INHERITED_HARD_LIMIT");
+        }
+        let maximum = if margin > 0 {
+            Some(soft.saturating_add(1))
+                .map(|limit| inherited.maximum.map_or(limit, |max| limit.min(max)))
+        } else {
+            inherited.maximum
+        };
+        setrlimit(
+            resource,
+            Rlimit {
+                current: Some(soft),
+                maximum,
+            },
+        )
+        .unwrap_or_else(|e| fail(format!("CAP_KERNEL_LIMIT {e}")));
     }
-    CPU_HIT.store(true, Ordering::Relaxed);
 }
 
 #[cfg(not(test))]
@@ -204,19 +210,16 @@ pub fn stage(value: impl Into<Arc<str>>) {
         .unwrap_or_else(|_| fail("CAP_STAGE_LOCK")) = value.into();
 }
 pub fn hard(name: &str) -> u64 {
-    current().hard[NAMES
-        .iter()
-        .position(|n| *n == name)
-        .unwrap_or_else(|| fail("CAP_UNKNOWN_BUDGET"))]
+    current().hard[index(name)]
 }
 pub fn check(name: &str, value: u64) {
-    current().check(
-        NAMES
-            .iter()
-            .position(|n| *n == name)
-            .unwrap_or_else(|| fail("CAP_UNKNOWN_BUDGET")),
-        value,
-    );
+    current().check(index(name), value);
+}
+fn index(name: &str) -> usize {
+    NAMES
+        .iter()
+        .position(|n| *n == name)
+        .unwrap_or_else(|| fail("CAP_UNKNOWN_BUDGET"))
 }
 
 impl Caps {
@@ -230,7 +233,7 @@ impl Caps {
                 self.warn[index]
             );
         }
-        if value > self.hard[index] || (index == 1 && CPU_HIT.load(Ordering::Relaxed)) {
+        if value > self.hard[index] {
             let stage = self.stage.lock().unwrap_or_else(|_| fail("CAP_STAGE_LOCK"));
             stop_owned();
             fail(format!(
@@ -242,81 +245,55 @@ impl Caps {
         }
     }
     fn tick(&self) {
-        let (rss, threads, files, procs) =
-            sample().unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}")));
-        self.check(0, rss);
+        let sample = sample(self.hard[3], self.hard[4])
+            .unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}")));
+        self.check(0, sample.rss);
         self.check(2, self.started.elapsed().as_secs());
-        self.check(3, files);
-        self.check(4, procs);
-        self.check(5, threads);
+        self.check(3, sample.files);
+        self.check(4, sample.procs);
+        self.check(5, sample.threads);
         #[cfg(unix)]
-        unsafe {
-            let mut usage: libc::rusage = std::mem::zeroed();
-            if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
-                fail("CAP_CPU_METRICS_UNAVAILABLE");
-            }
-            self.check(1, (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as u64);
-        }
+        self.check(
+            1,
+            rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime).tv_sec as u64,
+        );
     }
+}
+
+struct Sample {
+    rss: u64,
+    threads: u64,
+    files: u64,
+    procs: u64,
 }
 
 #[cfg(target_os = "macos")]
-fn sample() -> std::io::Result<(u64, u64, u64, u64)> {
-    unsafe {
-        let mut info: libc::proc_taskinfo = std::mem::zeroed();
-        let size = std::mem::size_of_val(&info) as libc::c_int;
-        let pid = libc::getpid();
-        if libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTASKINFO,
-            0,
-            (&mut info as *mut libc::proc_taskinfo).cast(),
-            size,
-        ) != size
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        let fds = libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
-        if fds <= 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut slots: Vec<libc::proc_fdinfo> =
-            Vec::with_capacity(fds as usize / std::mem::size_of::<libc::proc_fdinfo>() + 16);
-        let fds = libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDLISTFDS,
-            0,
-            slots.as_mut_ptr().cast(),
-            (slots.capacity() * std::mem::size_of::<libc::proc_fdinfo>()) as i32,
-        );
-        if fds <= 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // A bounded child buffer includes one overflow slot.
-        let capacity = current().hard[4].min(65_536) as usize + 1;
-        let mut children = vec![0 as libc::pid_t; capacity];
-        let count = libc::proc_listchildpids(
-            pid,
-            children.as_mut_ptr().cast(),
-            (children.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
-        );
-        if count < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok((
-            info.pti_resident_size,
-            info.pti_threadnum as u64,
-            fds as u64 / std::mem::size_of::<libc::proc_fdinfo>() as u64,
-            children[..(count as usize / std::mem::size_of::<libc::pid_t>()).min(children.len())]
-                .iter()
-                .filter(|p| **p > 0)
-                .count() as u64,
-        ))
-    }
+fn sample(max_files: u64, max_procs: u64) -> std::io::Result<Sample> {
+    use libproc::file_info::ListFDs;
+    use libproc::proc_pid::{listpidinfo, pidinfo};
+    use libproc::processes::{ProcFilter, pids_by_type};
+    use libproc::task_info::TaskInfo;
+    let pid = std::process::id();
+    let info = pidinfo::<TaskInfo>(pid as i32, 0).map_err(std::io::Error::other)?;
+    // One slot past the cap so an overflow is still observed.
+    let files = listpidinfo::<ListFDs>(pid as i32, max_files.saturating_add(1) as usize)
+        .map_err(std::io::Error::other)?
+        .len() as u64;
+    let procs = pids_by_type(ProcFilter::ByParentProcess { ppid: pid })?
+        .into_iter()
+        .filter(|p| *p > 0)
+        .take(max_procs.saturating_add(1) as usize)
+        .count() as u64;
+    Ok(Sample {
+        rss: info.pti_resident_size,
+        threads: info.pti_threadnum as u64,
+        files,
+        procs,
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn sample() -> std::io::Result<(u64, u64, u64, u64)> {
+fn sample(_max_files: u64, _max_procs: u64) -> std::io::Result<Sample> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     let field = |key: &str| -> std::io::Result<u64> {
         status
@@ -333,18 +310,18 @@ fn sample() -> std::io::Result<(u64, u64, u64, u64)> {
             children.insert(pid.to_owned());
         }
     }
-    Ok((
-        field("VmRSS:")? * 1024,
-        field("Threads:")?,
-        std::fs::read_dir("/proc/self/fd")?
+    Ok(Sample {
+        rss: field("VmRSS:")? * 1024,
+        threads: field("Threads:")?,
+        files: std::fs::read_dir("/proc/self/fd")?
             .count()
             .saturating_sub(1) as u64,
-        children.len() as u64,
-    ))
+        procs: children.len() as u64,
+    })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn sample() -> std::io::Result<(u64, u64, u64, u64)> {
+fn sample(_max_files: u64, _max_procs: u64) -> std::io::Result<Sample> {
     Err(std::io::Error::other(
         "application resident caps require macOS or Linux",
     ))
@@ -373,22 +350,20 @@ pub fn turn(value: impl Into<Arc<str>>) {
     );
 }
 pub fn child(pid: u32) {
-    OWNED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(pid as i32);
+    OWNED.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
 }
 pub fn reaped(pid: u32) {
     OWNED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|p| *p != pid as i32);
+        .retain(|p| *p != pid);
 }
 fn stop_owned() {
     #[cfg(unix)]
     for pid in OWNED.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        unsafe {
-            libc::kill(-*pid, libc::SIGKILL);
+        // Registered children lead their own process group.
+        if let Some(group) = rustix::process::Pid::from_raw(*pid as i32) {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
     }
 }
