@@ -340,6 +340,7 @@ impl Drop for HostProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        crate::app_caps::reaped(self.child.id());
         if let Some(path) = &self.control_dir
             && control_directory_is_real(path)
         {
@@ -1246,6 +1247,11 @@ fn start_host_with_policy(
         // descriptor", which hides the one message that explains it.
         std::process::Stdio::inherit()
     });
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let spawned = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -1255,6 +1261,7 @@ fn start_host_with_policy(
             return Err(format!("launching {}: {error}", host.display()));
         }
     };
+    crate::app_caps::child(spawned.id());
     let mut child = HostProcess {
         child: spawned,
         control_dir,
@@ -1382,6 +1389,7 @@ async fn sweep_components(
     let mut verdicts: Vec<(String, bool, String)> = Vec::new();
 
     for id in &ids {
+        crate::app_caps::turn("ps-qa: check/sweep/navigation step");
         // A directory holding `index.html`, or `<id>.html` beside its siblings.
         // The host accepts either, so prefer whichever this build produced.
         let as_dir = dists.join(id);
@@ -1594,6 +1602,7 @@ fn resolve_assertion_subjects(
 ) -> std::result::Result<HashSet<String>, String> {
     let mut used = HashSet::new();
     for check in checks {
+        crate::app_caps::turn("ps-qa: check/sweep/navigation step");
         if let Some(binding) = check.subject_env.as_deref() {
             let value = values.get(binding).ok_or_else(|| {
                 format!(
@@ -1623,6 +1632,7 @@ fn resolve_secret_subjects(
     secrets: Option<&plan::SessionSecrets>,
 ) -> std::result::Result<(), String> {
     for check in checks {
+        crate::app_caps::turn("ps-qa: check/sweep/navigation step");
         if let Some(input) = check.subject_secret {
             let secrets = secrets.ok_or_else(|| {
                 format!(
@@ -4862,6 +4872,7 @@ async fn reveal_deferred_content(
         }
     }
     for step in 0..8 {
+        crate::app_caps::turn("ps-qa: check/sweep/navigation step");
         let (snapshot, _) = inspect(client).await?;
         if painted_named(&snapshot.nodes, want) {
             return Ok(step);
@@ -5419,7 +5430,7 @@ fn reconcile_inventory(
         controls: Vec<MissingRow>,
     }
 
-    let input = std::fs::read_to_string(inventory)?;
+    let input = crate::app_caps::read_string(inventory)?;
     let controls = saved_controls(&input).map_err(eyre::Report::msg)?;
     let checks = qa::checks(checks_dir).map_err(eyre::Report::msg)?;
     let mut outcome_declared = 0;
@@ -5653,6 +5664,7 @@ async fn run_inventory(
     let mut role_counts: std::collections::BTreeMap<String, [usize; 13]> =
         std::collections::BTreeMap::new();
     for surface in reach::surfaces() {
+        crate::app_caps::turn("ps-qa: check/sweep/navigation step");
         if !surface_selected(surface, only) {
             continue;
         }
@@ -5972,6 +5984,7 @@ async fn click_surface_path(
     opener: &str,
 ) -> Result<()> {
     for step in surface.via.iter().map(String::as_str).chain([opener]) {
+        crate::app_caps::turn("ps-qa: check/sweep/navigation step");
         click_named_quiet(client, step).await?;
     }
     Ok(())
@@ -6280,6 +6293,7 @@ async fn run_cover(
     };
 
     for surface in reach::surfaces() {
+        crate::app_caps::turn("ps-qa: check/sweep/navigation step");
         if !surface_selected(surface, only) {
             continue;
         }
@@ -6744,6 +6758,7 @@ fn preflight_plan(
         let mut username_inputs = 0;
         let mut password_inputs = 0;
         for check in &login_checks {
+            crate::app_caps::turn("ps-qa: check/sweep/navigation step");
             match check.setup_secret {
                 Some(qa::SecretInput::Username) => username_inputs += 1,
                 Some(qa::SecretInput::Password) => password_inputs += 1,
@@ -6769,6 +6784,7 @@ fn preflight_plan(
             let mut checks = load_suite(suite)?;
             validate_assertions(&mut checks, used)?;
             for check in checks {
+                crate::app_caps::turn("ps-qa: check/sweep/navigation step");
                 if check.setup_secret.is_some() {
                     bail!("runtime credentials may be used only by the run-plan login suite");
                 }

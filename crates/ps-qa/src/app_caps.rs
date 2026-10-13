@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const NAMES: [&str; 9] = ["rss", "cpu-secs", "wall-secs", "open-files", "procs", "threads", "input-bytes", "iterations", "cache-entries"];
+static CPU_HIT: AtomicBool = AtomicBool::new(false);
+static TURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OWNED: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 static STATE: OnceLock<Arc<Caps>> = OnceLock::new();
 
 pub struct Caps {
@@ -80,8 +83,10 @@ pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
         let mut inherited: libc::rlimit = std::mem::zeroed();
         for (resource, requested) in [(libc::RLIMIT_CPU, hard[1]), (libc::RLIMIT_NOFILE, hard[3])] {
             if libc::getrlimit(resource, &mut inherited) != 0 { fail(std::io::Error::last_os_error()); }
-            let soft = (requested as libc::rlim_t).min(inherited.rlim_cur).min(inherited.rlim_max);
-            let limit = libc::rlimit { rlim_cur: soft, rlim_max: inherited.rlim_max };
+            let soft = requested as libc::rlim_t;
+            if soft > inherited.rlim_max { fail("CAP_INHERITED_HARD_LIMIT"); }
+            let hard = if resource == libc::RLIMIT_CPU { soft.saturating_add(1).min(inherited.rlim_max) } else { inherited.rlim_max };
+            let limit = libc::rlimit { rlim_cur: soft, rlim_max: hard };
             if libc::setrlimit(resource, &limit) != 0 { fail(std::io::Error::last_os_error()); }
         }
         if libc::signal(libc::SIGXCPU, cpu_stop as *const () as libc::sighandler_t) == libc::SIG_ERR {
@@ -89,21 +94,16 @@ pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
         }
     }
     let monitor = Arc::clone(&caps);
-    std::thread::Builder::new().name("application-caps".into()).spawn(move || {
-        nagoya::block_on(async move {
-            loop {
-                nagoya::sleep(Duration::from_millis(250)).await;
-                monitor.tick();
-            }
-        });
-    }).unwrap_or_else(|error| fail(format!("CAP_MONITOR_START {error}")));
+    let runtime = nagoya::runtime::Runtime::new(1);
+    drop(runtime.spawn(async move {
+        loop { nagoya::sleep(Duration::from_millis(250)).await; monitor.tick(); }
+    }));
     caps
 }
 
 #[cfg(unix)]
 extern "C" fn cpu_stop(_: libc::c_int) {
-    const LINE: &[u8] = b"CAP_ERROR CAP_CPU_SECS_EXCEEDED source=RLIMIT_CPU\n";
-    unsafe { libc::write(2, LINE.as_ptr().cast(), LINE.len()); libc::_exit(78); }
+    CPU_HIT.store(true, Ordering::Relaxed);
 }
 
 pub fn current() -> &'static Arc<Caps> { STATE.get().unwrap_or_else(|| fail("CAP_NOT_STARTED")) }
@@ -127,8 +127,9 @@ impl Caps {
             let stage = self.stage.lock().unwrap_or_else(|_| fail("CAP_STAGE_LOCK"));
             eprintln!("CAP_WARN_{} current={} threshold={} stage={stage:?}", NAMES[index].replace('-', "_").to_uppercase(), value, self.warn[index]);
         }
-        if value > self.hard[index] {
+        if value > self.hard[index] || (index == 1 && CPU_HIT.load(Ordering::Relaxed)) {
             let stage = self.stage.lock().unwrap_or_else(|_| fail("CAP_STAGE_LOCK"));
+            stop_owned();
             fail(format!("CAP_{}_EXCEEDED current={} threshold={} stage={stage:?}", NAMES[index].replace('-', "_").to_uppercase(), value, self.hard[index]));
         }
     }
@@ -158,7 +159,10 @@ fn sample() -> std::io::Result<(u64,u64,u64,u64)> {
             return Err(std::io::Error::last_os_error());
         }
         let fds = libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
-        if fds < 0 { return Err(std::io::Error::last_os_error()); }
+        if fds <= 0 { return Err(std::io::Error::last_os_error()); }
+        let mut slots: Vec<libc::proc_fdinfo> = Vec::with_capacity(fds as usize / std::mem::size_of::<libc::proc_fdinfo>() + 16);
+        let fds = libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, slots.as_mut_ptr().cast(), (slots.capacity() * std::mem::size_of::<libc::proc_fdinfo>()) as i32);
+        if fds <= 0 { return Err(std::io::Error::last_os_error()); }
         // A bounded child buffer includes one overflow slot.
         let capacity = current().hard[4].min(65_536) as usize + 1;
         let mut children = vec![0 as libc::pid_t; capacity];
@@ -166,7 +170,7 @@ fn sample() -> std::io::Result<(u64,u64,u64,u64)> {
         if count < 0 { return Err(std::io::Error::last_os_error()); }
         Ok((info.pti_resident_size, info.pti_threadnum as u64,
             fds as u64 / std::mem::size_of::<libc::proc_fdinfo>() as u64,
-            1 + count as u64 / std::mem::size_of::<libc::pid_t>() as u64))
+            children[..(count as usize / std::mem::size_of::<libc::pid_t>()).min(children.len())].iter().filter(|p| **p > 0).count() as u64))
     }
 }
 
@@ -182,7 +186,7 @@ fn sample() -> std::io::Result<(u64,u64,u64,u64)> {
         let path = entry?.path().join("children");
         for pid in std::fs::read_to_string(path)?.split_whitespace() { children.insert(pid.to_owned()); }
     }
-    Ok((field("VmRSS:")? * 1024, field("Threads:")?, std::fs::read_dir("/proc/self/fd")?.count() as u64, 1 + children.len() as u64))
+    Ok((field("VmRSS:")? * 1024, field("Threads:")?, std::fs::read_dir("/proc/self/fd")?.count().saturating_sub(1) as u64, children.len() as u64))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -209,4 +213,12 @@ pub fn read_stdin() -> std::io::Result<String> {
     std::io::stdin().take(hard("input-bytes") + 1).read_to_end(&mut bytes)?;
     check("input-bytes", bytes.len() as u64);
     String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+pub fn turn(value: impl Into<Arc<str>>) { stage(value); check("iterations", TURNS.fetch_add(1, Ordering::Relaxed).saturating_add(1)); }
+pub fn child(pid: u32) { OWNED.lock().unwrap_or_else(|e| e.into_inner()).push(pid as i32); }
+pub fn reaped(pid: u32) { OWNED.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| *p != pid as i32); }
+fn stop_owned() {
+    #[cfg(unix)]
+    for pid in OWNED.lock().unwrap_or_else(|e| e.into_inner()).iter() { unsafe { libc::kill(-*pid, libc::SIGKILL); } }
 }
