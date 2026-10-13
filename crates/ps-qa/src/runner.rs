@@ -30,7 +30,6 @@ use crate::capture_analysis::{
     CHANNEL_TOLERANCE as CAPTURE_CHANNEL_TOLERANCE, measure_ink, measure_interior_ink,
     pixel_delta as captured_pixel_delta, pixels_change, pixels_hold,
     pixels_hold_with_tolerance as captured_pixels_hold, rgb_pixels_hold,
-    save_artifacts as save_pixel_artifacts, write_ppm as write_capture_ppm,
 };
 use crate::computed_style::{
     font_size, full_opacity, opaque_background, transparent_background, wait_for_larger_font,
@@ -980,7 +979,6 @@ async fn wait_for_pixels_change(
     before: &CapturedImage,
     deadline: Instant,
     event_driven: bool,
-    artifact_id: &str,
 ) -> std::result::Result<(), String> {
     let mut last_image = None;
     let result = async {
@@ -1031,12 +1029,6 @@ async fn wait_for_pixels_change(
         }
     }
     .await;
-    if result.is_err()
-        && let Some(after) = last_image.as_ref()
-        && let Err(error) = save_pixel_artifacts(artifact_id, before, after)
-    {
-        eprintln!("could not save pixel artifacts for {artifact_id}: {error}");
-    }
     result
 }
 
@@ -1085,13 +1077,7 @@ fn plan_control_directory() -> std::result::Result<std::path::PathBuf, String> {
     for _ in 0..32 {
         let sequence = NEXT_CONTROL_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = root.join(format!("{:x}-{sequence:x}", std::process::id()));
-        let mut directory = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            directory.mode(0o700);
-        }
-        match directory.create(&path) {
+        match blitz_control_protocol::guarded_writer::create_private_dir(&path) {
             Ok(()) => {
                 if !control_directory_is_real(&path) {
                     let _ = std::fs::remove_dir(&path);
@@ -1117,7 +1103,7 @@ fn ensure_plan_directory(
     name: &str,
 ) -> std::result::Result<std::path::PathBuf, String> {
     let path = parent.join(name);
-    match std::fs::create_dir(&path) {
+    match blitz_control_protocol::guarded_writer::create_dir(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
@@ -1149,8 +1135,18 @@ fn control_directory_is_real(path: &std::path::Path) -> bool {
 fn encode_storage_seed(
     storage: &std::collections::BTreeMap<String, String>,
 ) -> std::result::Result<String, String> {
+    register_storage_values(storage);
     serde_json::to_string(storage)
         .map_err(|error| format!("could not encode QA storage seed: {error}"))
+}
+
+fn register_storage_values(storage: &std::collections::BTreeMap<String, String>) {
+    for (key, value) in storage {
+        // Storage seeds can carry session material under application-owned
+        // keys, so keep both names and values in the writer's secret set.
+        blitz_control_protocol::guarded_writer::register_secret("QA_INSPECT_STORAGE", key);
+        blitz_control_protocol::guarded_writer::register_secret("QA_INSPECT_STORAGE", value);
+    }
 }
 
 /// Install this check's `localStorage` seed, or clear one left by the check
@@ -1724,6 +1720,9 @@ async fn run_qa_inner(
         );
     }
     let mut selected: Vec<qa::Check> = selected.into_iter().cloned().collect();
+    for check in &selected {
+        register_storage_values(&check.storage);
+    }
     if let Some(values) = assertion_values {
         resolve_assertion_subjects(&mut selected, values).map_err(eyre::Report::msg)?;
     }
@@ -2335,11 +2334,6 @@ async fn run_qa_inner(
                     .await
                     .map_err(|error| format!("after hover: {error}"))?;
                     let comparison = rgb_pixels_hold(&before, &after);
-                    if comparison.is_err()
-                        && let Err(error) = save_pixel_artifacts(&check.id, &before, &after)
-                    {
-                        eprintln!("could not save pixel artifacts for {}: {error}", check.id);
-                    }
                     comparison
                 }
                 .await;
@@ -2401,7 +2395,6 @@ async fn run_qa_inner(
                         &before,
                         Instant::now() + declared_outcome_timeout(check),
                         event_driven,
-                        &check.id,
                     )
                     .await
                 }
@@ -2815,7 +2808,6 @@ async fn run_qa_inner(
                         &before_pixels,
                         deadline,
                         event_driven,
-                        &check.id,
                     )
                     .await
                 }
@@ -3025,16 +3017,6 @@ async fn run_qa_inner(
         if !gave_up && check.settle_after_ms > 0 {
             nagoya::sleep(Duration::from_millis(check.settle_after_ms)).await;
         }
-        // qa-hosted only: <PS_QA_GPU_DUMP>/<group>.gpu.toon once this group's
-        // last check has finished, while the host is still up. A host that
-        // just stopped answering is not asked; the helper no-ops otherwise.
-        let group_done = !gave_up
-            && selected[index + 1..]
-                .iter()
-                .all(|later| later.group != check.group);
-        if group_done {
-            dump_qa_hosted_gpu()?;
-        }
         if gave_up && !client.is_terminal() && index + 1 < selected.len() {
             if let Some(session) = hosted.as_deref_mut() {
                 reconnect_hosted(client, session).await?;
@@ -3137,24 +3119,6 @@ async fn run_qa_inner(
     Ok(failed)
 }
 
-static QA_HOSTED_GPU_DUMP: std::sync::OnceLock<Option<std::path::PathBuf>> =
-    std::sync::OnceLock::new();
-
-fn note_qa_hosted_run() {
-    let dir = std::env::var_os("PS_QA_GPU_DUMP").and_then(|value| {
-        if value.is_empty() {
-            None
-        } else {
-            Some(std::path::PathBuf::from(value))
-        }
-    });
-    let _ = QA_HOSTED_GPU_DUMP.set(dir);
-}
-
-fn qa_hosted_gpu_dump_dir() -> Option<std::path::PathBuf> {
-    QA_HOSTED_GPU_DUMP.get().cloned().flatten()
-}
-
 /// `*` matches any run of characters, including an empty run, anywhere in
 /// `pattern`. It is not a literal. A pattern with no `*` is equality.
 fn gpu_glob_matches(pattern: &str, text: &str) -> bool {
@@ -3187,15 +3151,6 @@ fn gpu_draw_target_matches(subject: &str, target: &str) -> bool {
     } else {
         gpu_glob_matches(subject, target)
     }
-}
-
-/// Refuse the optional `PS_QA_GPU_DUMP` file output. Diagnostic labels and
-/// errors come from the inspected application and may contain secret values.
-fn dump_qa_hosted_gpu() -> Result<()> {
-    if qa_hosted_gpu_dump_dir().is_some() {
-        bail!("refusing to write GPU diagnostics to disk because they may contain secret values");
-    }
-    Ok(())
 }
 
 fn gpu_expectation(expect: qa::Expect) -> bool {
@@ -4430,12 +4385,7 @@ async fn drive_check_action(
     }
 }
 
-async fn capture(
-    client: &mut Client,
-    want: &str,
-    scale: f32,
-    output: Option<&std::path::Path>,
-) -> Result<()> {
+async fn capture(client: &mut Client, want: &str, scale: f32) -> Result<()> {
     let node_id = if want.is_empty() {
         None
     } else {
@@ -4475,14 +4425,10 @@ async fn capture(
         other => bail!("asked for a capture, got {other:?}"),
     };
 
-    report_captured(&image, scale, output)
+    report_captured(&image, scale)
 }
 
-fn report_captured(
-    image: &CapturedImage,
-    scale: f32,
-    output: Option<&std::path::Path>,
-) -> Result<()> {
+fn report_captured(image: &CapturedImage, scale: f32) -> Result<()> {
     let ink = measure_ink(image)?;
     let fingerprint = {
         use std::hash::{DefaultHasher, Hash as _, Hasher as _};
@@ -4505,9 +4451,6 @@ fn report_captured(
     );
     if ink.visible == 0 {
         println!("nothing was drawn: every pixel is the background colour");
-    }
-    if let Some(output) = output {
-        write_capture_ppm(image, output)?;
     }
     Ok(())
 }
@@ -4533,13 +4476,9 @@ async fn read_gpu_capture_sample(client: &mut Client, target: &str) -> Result<Ca
     }
 }
 
-async fn gpu_capture_command(
-    client: &mut Client,
-    target: &str,
-    output: Option<&std::path::Path>,
-) -> Result<()> {
+async fn gpu_capture_command(client: &mut Client, target: &str) -> Result<()> {
     let image = read_gpu_capture(client, target).await?;
-    report_captured(&image, 1.0, output)
+    report_captured(&image, 1.0)
 }
 
 fn gpu_texture_ink(image: &CapturedImage, target: &str) -> std::result::Result<(), String> {
@@ -7042,11 +6981,7 @@ pub async fn run() -> Result<()> {
     cli::set_pace(cli.pace);
     cli::set_timeout_scale(cli.timeout_scale);
     cli::set_request_timeout_ms(cli.request_timeout_ms);
-    cli::set_capture_options(
-        cli.trace_capture,
-        cli.require_paint_events,
-        cli.pixel_artifact_dir.clone(),
-    );
+    cli::set_capture_options(cli.trace_capture, cli.require_paint_events);
     cli::set_app_profile(cli.app.clone());
 
     // The inventory reads the check list, not the application, so it answers
@@ -7078,12 +7013,8 @@ pub async fn run() -> Result<()> {
     }
 
     if let cli::Command::RunPlan { plan } = &cli.command {
-        if cli.trace
-            || cli.trace_capture
-            || cli.require_paint_events
-            || cli.pixel_artifact_dir.is_some()
-        {
-            bail!("`run-plan` does not accept tracing or pixel capture options");
+        if cli.trace || cli.trace_capture || cli.require_paint_events {
+            bail!("`run-plan` does not accept tracing or paint-event options");
         }
         if cli.descriptor.is_some() {
             bail!("`run-plan` starts its own host and does not accept `--descriptor`");
@@ -7135,7 +7066,6 @@ pub async fn run() -> Result<()> {
         startup_timeout,
     } = &cli.command
     {
-        note_qa_hosted_run();
         let mut hosted = HostedSession::start(
             host,
             page,
@@ -7597,15 +7527,11 @@ pub async fn run() -> Result<()> {
                 _ => unreachable!("clap requires exactly one click selector"),
             }
         }
-        cli::Command::Capture {
-            name,
-            scale,
-            output,
-        } => {
-            capture(&mut client, &name, scale as f32, output.as_deref()).await?;
+        cli::Command::Capture { name, scale } => {
+            capture(&mut client, &name, scale as f32).await?;
         }
-        cli::Command::GpuCapture { target, output } => {
-            gpu_capture_command(&mut client, &target, output.as_deref()).await?;
+        cli::Command::GpuCapture { target } => {
+            gpu_capture_command(&mut client, &target).await?;
         }
         cli::Command::Audit { family } => {
             let faults = run_audit(&mut client, family.as_deref()).await?;

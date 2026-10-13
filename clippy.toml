@@ -1,0 +1,14 @@
+disallowed-methods = [
+  { path = "std::fs::write", reason = "Route file writes through the guarded writer, which refuses secret values." },
+  { path = "std::fs::File::create", reason = "Route file writes through the guarded writer, which refuses secret values." },
+  { path = "std::fs::OpenOptions::open", reason = "Route file writes through the guarded writer, which refuses secret values." },
+  { path = "std::fs::copy", reason = "Route file writes through the guarded writer, which refuses secret values." },
+  { path = "std::fs::rename", reason = "Route file writes through the guarded writer, which refuses secret values." },
+  { path = "std::fs::create_dir", reason = "Route output paths through the guarded writer, which refuses secret values in paths." },
+  { path = "std::fs::create_dir_all", reason = "Route output paths through the guarded writer, which refuses secret values in paths." },
+  { path = "std::fs::DirBuilder::create", reason = "Route output paths through the guarded writer, which refuses secret values in paths." },
+  { path = "std::io::copy", reason = "Route file copies through the guarded writer, which refuses secret values." },
+  { path = "std::io::Write::write", reason = "Route file writes through the guarded writer, which refuses secret values." },
+  { path = "std::io::Write::write_all", reason = "Route file writes through the guarded writer, which refuses secret values." },
+  { path = "std::io::Write::write_fmt", reason = "Route file writes through the guarded writer, which refuses secret values." },
+]

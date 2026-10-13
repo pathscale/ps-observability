@@ -1,5 +1,13 @@
 # Changelog
 
+## blitz-control-protocol 0.7.4
+
+- Route file writes through a secret-aware guard that refuses raw and encoded secret values before opening a destination.
+
+## ps-qa 0.9.5
+
+- Register run-plan credentials with the shared writer guard and remove file-output options for captured pixels and GPU reports.
+
 ## blitz-control-protocol 0.7.2
 
 - Add additive tab addressing, generation and document guards, target discovery, and bounded per-target diagnostic journals while keeping `DEBUG_PROTOCOL_VERSION` at 2.

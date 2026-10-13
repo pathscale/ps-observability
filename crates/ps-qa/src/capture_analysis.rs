@@ -11,8 +11,6 @@ use base64::Engine as _;
 use blitz_control_protocol::CapturedImage;
 use eyre::Result;
 
-use crate::cli;
-
 /// Subpixel edge coverage can vary by a few 8-bit levels between equivalent
 /// GPU captures. Four levels is the first difference treated as authored ink.
 pub(crate) const CHANNEL_TOLERANCE: u8 = 3;
@@ -306,25 +304,6 @@ pub(crate) fn measure_interior_ink(image: &CapturedImage) -> Result<Ink> {
         ));
     }
     measure_ink_bounds(image, inset_x, inset_y, right, bottom)
-}
-
-pub(crate) fn write_ppm(_image: &CapturedImage, _output: &std::path::Path) -> Result<()> {
-    Err(eyre::eyre!(
-        "refusing to write captured pixels to disk because they may contain secret values"
-    ))
-}
-
-pub(crate) fn save_artifacts(
-    _check_id: &str,
-    _before: &CapturedImage,
-    _after: &CapturedImage,
-) -> Result<()> {
-    let Some(_) = cli::pixel_artifact_dir() else {
-        return Ok(());
-    };
-    Err(eyre::eyre!(
-        "refusing to write captured pixels to disk because they may contain secret values"
-    ))
 }
 
 #[cfg(test)]

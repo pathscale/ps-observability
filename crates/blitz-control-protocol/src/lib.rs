@@ -75,6 +75,9 @@ pub mod condense;
 /// The core: reading, capturing and driving a document.
 #[cfg(feature = "engine")]
 pub mod document;
+/// Secret-aware file output shared by every workspace crate.
+#[allow(clippy::disallowed_methods)]
+pub mod guarded_writer;
 /// The in-process transport.
 #[cfg(feature = "engine")]
 pub mod in_process;

@@ -54,7 +54,8 @@ fn component_sweep_without_profile_returns_a_clear_error() {
             .expect("system clock is after the epoch")
             .as_nanos()
     ));
-    std::fs::create_dir(&working_directory).expect("create isolated working directory");
+    blitz_control_protocol::guarded_writer::create_dir(&working_directory)
+        .expect("create isolated working directory");
 
     let output = Command::new(env!("CARGO_BIN_EXE_ps-qa"))
         .current_dir(&working_directory)
@@ -114,4 +115,20 @@ fn a_named_descriptor_that_does_not_exist_is_an_error() {
         "a named descriptor must not fall through to discovery: {stderr}"
     );
     assert!(!stderr.contains("panicked at"), "{stderr}");
+}
+
+#[test]
+fn file_capture_options_are_rejected_by_the_cli() {
+    let invocations: &[&[&str]] = &[
+        &["capture", "--output", "capture.ppm"],
+        &["gpu-capture", "canvas:#view", "--output", "capture.ppm"],
+        &["--pixel-artifact-dir", "artifacts", "list"],
+    ];
+    for arguments in invocations {
+        let output = Command::new(env!("CARGO_BIN_EXE_ps-qa"))
+            .args(*arguments)
+            .output()
+            .expect("run the CLI");
+        assert!(!output.status.success());
+    }
 }

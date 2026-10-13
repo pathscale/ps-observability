@@ -129,6 +129,11 @@ environment from every child host, then sets only `QA_INSPECT_PAGE`,
 unique `CHUZZ_CONTROL_DIR` under `target/ps-qa/run-plan-control`; it suppresses
 the host's console output during the run.
 
+Runtime credentials and QA storage seed values are registered with the shared
+file guard. The guard checks output paths and bytes for raw, URL-encoded,
+JSON-escaped, and base64 forms of known secrets before opening a destination,
+then refuses with the path and variable name without including the value.
+
 ```ron
 (
     version: 1,
@@ -172,8 +177,9 @@ the host's console output during the run.
 Set `CHUZZ_HEADLESS_BIN`, `QA_SITE_URL`, and the declared credential variables
 in the runner environment, then invoke `ps-qa --app <session-profile.ron> run-plan <plan.ron>` when the plan has signed-in sessions, or omit `--app` for guest-only plans. Unknown
 plan fields, environment references, selectors, and login setup shapes fail
-before the first host starts. `run-plan` does not accept tracing or pixel
-capture options because either could expose rendered credential data.
+before the first host starts. Signed-in values stay in memory while login uses
+the control transport. The writer guard refuses file output containing a
+known secret form, and `run-plan` rejects trace and paint-event options.
 Assertion formats validate the expected value shape, and a check names a
 binding with `subject_env: Some("auth_ws")`. Guests and sessions run in
 declaration order; plans do not execute conditional actions or shell commands.
@@ -335,10 +341,8 @@ tabs, then activates the exact semantic node id.
 sampled frames. `ps-qa gpu-capture texture:preview` or
 `ps-qa gpu-capture canvas:#view` reads a texture or canvas and reports visible
 ink. Capture pixels are not saved to disk because they can include secret
-values. An explicit `--output` request returns a safe error, and automatic
-pixel-artifact writes are skipped with a safe diagnostic.
-The optional `PS_QA_GPU_DUMP` file output is also refused because diagnostic
-labels and errors come from the inspected application.
+values. Image output, automatic pixel artifacts, and GPU report file dumps are
+not available. Capture summaries and reports go to the process output stream.
 
 Buffer inspection reads completed GPU writes through the same diagnostics
 socket:

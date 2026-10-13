@@ -2731,25 +2731,27 @@ mod tests {
                 .expect("system clock is after the epoch")
                 .as_nanos()
         ));
-        std::fs::create_dir(&directory).expect("create check directory");
+        blitz_control_protocol::guarded_writer::create_dir(&directory)
+            .expect("create check directory");
         let check = |id: &str, open: &str| {
             format!(
                 "(id:\"{id}\",group:\"g\",what:\"w\",open:{open},hover:None,\
                  click:Some(\"Act\"),subject:\"Result\",expect:Paints)"
             )
         };
-        std::fs::write(
-            directory.join("a-settings.ron"),
+        blitz_control_protocol::guarded_writer::write_file(
+            &directory.join("a-settings.ron"),
             format!(
                 "[{},{}]",
                 check("settings-open", "Some(\"Settings\")"),
                 check("settings-edit", "None")
-            ),
+            )
+            .as_bytes(),
         )
         .expect("write the first file");
-        std::fs::write(
-            directory.join("b-registry.ron"),
-            format!("[{}]", check("registry-publish", "None")),
+        blitz_control_protocol::guarded_writer::write_file(
+            &directory.join("b-registry.ron"),
+            format!("[{}]", check("registry-publish", "None")).as_bytes(),
         )
         .expect("write the second file");
 
@@ -2765,9 +2767,9 @@ mod tests {
         );
 
         // Declaring the surface is the fix, and the whole directory then loads.
-        std::fs::write(
-            directory.join("b-registry.ron"),
-            format!("[{}]", check("registry-publish", "Some(\"Registry\")")),
+        blitz_control_protocol::guarded_writer::write_file(
+            &directory.join("b-registry.ron"),
+            format!("[{}]", check("registry-publish", "Some(\"Registry\")")).as_bytes(),
         )
         .expect("rewrite the second file");
         let loaded = checks(Some(&directory)).expect("both files declare where they start");

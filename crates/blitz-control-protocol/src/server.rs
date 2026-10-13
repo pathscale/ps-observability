@@ -1,7 +1,7 @@
-use std::fs::{OpenOptions, remove_file};
-use std::io::{self, Write};
+use std::fs::remove_file;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -21,7 +21,7 @@ use crate::{
     AgentControlRequest, DebugDescriptor, DebugEvent, DebugResponse, DebugStream,
     DiagnosticsRequest, IncomingRequest, decode_incoming_value, decode_wire_value,
     encode_diagnostics_event, encode_initialize_response, encode_response, encode_rpc_error,
-    encode_tools_list_response, peek_value_request_id,
+    encode_tools_list_response, guarded_writer, peek_value_request_id,
 };
 
 pub enum ControlBridgeRequest {
@@ -173,7 +173,7 @@ impl AgentControlServer {
         // as well, because defence that rests on one check is defence that
         // rests on nobody ever relaxing the directory.
         if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            guarded_writer::create_dir_all(parent)?;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
         let _ = remove_file(&socket_path);
@@ -694,71 +694,9 @@ fn descriptor_path(instance_id: &str) -> PathBuf {
 }
 
 fn write_descriptor(path: &Path, descriptor: &DebugDescriptor) -> io::Result<()> {
-    let content = serde_json::to_string_pretty(descriptor).map_err(io::Error::other)?;
-    if contains_secret_environment_value(&content) {
-        return Err(io::Error::other(
-            "refusing to write a descriptor that contains an environment secret",
-        ));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(content.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()
-}
-
-fn contains_secret_environment_value(content: &str) -> bool {
-    let variables: Vec<(String, String)> = std::env::vars_os()
-        .filter_map(|(name, value)| {
-            Some((
-                name.to_string_lossy().to_ascii_uppercase(),
-                value.into_string().ok()?,
-            ))
-        })
-        .collect();
-    let has_password = variables.iter().any(|(name, _)| {
-        name.contains("PASSWORD") || name.contains("PASSPHRASE") || name.ends_with("_PASS")
-    });
-
-    variables.iter().any(|(name, value)| {
-        if value.is_empty() {
-            return false;
-        }
-        let named_secret = name.contains("PASSWORD")
-            || name.contains("PASSPHRASE")
-            || name.ends_with("_PASS")
-            || name.contains("SEED")
-            || name.contains("PRIVATE_KEY")
-            || name.ends_with("_KEY")
-            || name == "KEY"
-            || name.contains("TOKEN")
-            || name.contains("SECRET")
-            || name.contains("COOKIE")
-            || name.contains("JWT")
-            || name.contains("SESSION")
-            || name.starts_with("AWS_")
-            || name.contains("DOPPLER")
-            || name.contains("HONEY")
-            || name.contains("HOOK");
-        let paired_username = has_password
-            && (name.contains("USERNAME") || name == "USER" || name.ends_with("_USER"));
-        if !named_secret && !paired_username {
-            return false;
-        }
-
-        if content.contains(value) {
-            return true;
-        }
-        serde_json::to_string(value)
-            .is_ok_and(|quoted| quoted.len() > 2 && content.contains(&quoted[1..quoted.len() - 1]))
-    })
+    let mut content = serde_json::to_string_pretty(descriptor).map_err(io::Error::other)?;
+    content.push('\n');
+    guarded_writer::write_file(path, content.as_bytes())
 }
 
 #[cfg(test)]
@@ -1097,7 +1035,7 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&dir).expect("scratch directory is created");
+        crate::guarded_writer::create_dir_all(&dir).expect("scratch directory is created");
 
         let write = |name: &str, pid: u32| {
             let path = dir.join(format!("{name}.json"));
@@ -1113,7 +1051,8 @@ mod tests {
                 },
             )
             .expect("descriptor is written");
-            std::fs::write(dir.join(format!("{name}.sock")), b"").expect("socket stub is written");
+            crate::guarded_writer::write_file(&dir.join(format!("{name}.sock")), b"")
+                .expect("socket stub is written");
             path
         };
 

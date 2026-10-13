@@ -161,10 +161,6 @@ pub struct Cli {
     #[arg(long, global = true, env = "PS_QA_HEADLESS")]
     pub headless: bool,
 
-    /// Save before/after PPM captures for failed pixel checks.
-    #[arg(long, global = true)]
-    pub pixel_artifact_dir: Option<PathBuf>,
-
     #[command(subcommand)]
     pub command: Command,
 }
@@ -432,9 +428,6 @@ pub enum Command {
     GpuCapture {
         /// `texture:<label>` or `canvas:#id`.
         target: String,
-        /// Save the readback as PPM. Refused because captures may reveal secrets.
-        #[arg(long)]
-        output: Option<std::path::PathBuf>,
     },
 
     /// Render what the application actually drew and report the visible ink in
@@ -451,9 +444,6 @@ pub enum Command {
         /// Render scale.
         #[arg(default_value_t = 1.0)]
         scale: f64,
-        /// Save rendered pixels as PPM. Refused because captures may reveal secrets.
-        #[arg(long)]
-        output: Option<std::path::PathBuf>,
     },
 
     /// Move, press and release a real pointer over the first match, which is
@@ -681,7 +671,6 @@ static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 static TRACE_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REQUIRE_PAINT_EVENTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-static PIXEL_ARTIFACT_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The inter-event delay, in seconds. Set once, from `main`, for the same
@@ -699,14 +688,9 @@ pub fn set_trace(on: bool) {
     TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub fn set_capture_options(
-    trace_capture: bool,
-    require_paint_events: bool,
-    pixel_artifact_dir: Option<PathBuf>,
-) {
+pub fn set_capture_options(trace_capture: bool, require_paint_events: bool) {
     TRACE_CAPTURE.store(trace_capture, std::sync::atomic::Ordering::Relaxed);
     REQUIRE_PAINT_EVENTS.store(require_paint_events, std::sync::atomic::Ordering::Relaxed);
-    let _ = PIXEL_ARTIFACT_DIR.set(pixel_artifact_dir);
 }
 
 /// Record whether unpainted controls may be targeted. Called once, from
@@ -776,10 +760,6 @@ pub fn headless() -> bool {
 
 pub fn require_paint_events() -> bool {
     REQUIRE_PAINT_EVENTS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub fn pixel_artifact_dir() -> Option<PathBuf> {
-    PIXEL_ARTIFACT_DIR.get().cloned().flatten()
 }
 
 impl Command {

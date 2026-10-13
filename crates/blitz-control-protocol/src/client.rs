@@ -1056,7 +1056,7 @@ mod tests {
                 .expect("system clock is after the epoch")
                 .as_nanos()
         ));
-        std::fs::write(
+        crate::guarded_writer::write_file(
             &path,
             serde_json::json!({
                 "protocolVersion": DEBUG_PROTOCOL_VERSION + 1,
@@ -1066,7 +1066,8 @@ mod tests {
                 "renderer": "fixture",
                 "rendererRevision": "test"
             })
-            .to_string(),
+            .to_string()
+            .as_bytes(),
         )
         .expect("write descriptor fixture");
         let error = read_descriptor(&path).expect_err("newer protocol must not be guessed");

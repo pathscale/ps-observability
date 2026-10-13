@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
+use blitz_control_protocol::guarded_writer;
 use serde::Deserialize;
 
 use crate::qa::SecretInput;
@@ -412,6 +413,12 @@ impl RunPlan {
                 require_binding(&by_id, &session.password, EnvironmentKind::Secret)?;
             let username = optional_environment(&username_binding.name)?;
             let password = optional_environment(&password_binding.name)?;
+            if let Some(username) = &username {
+                guarded_writer::register_secret(&username_binding.name, username);
+            }
+            if let Some(password) = &password {
+                guarded_writer::register_secret(&password_binding.name, password);
+            }
             let credentials = match (username, password) {
                 (Some(username), Some(password)) => Some(SessionSecrets { username, password }),
                 (None, None) if session.optional => None,
