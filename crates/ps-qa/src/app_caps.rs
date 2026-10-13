@@ -103,6 +103,8 @@ pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
 
 #[cfg(unix)]
 extern "C" fn cpu_stop(_: libc::c_int) {
+    const MESSAGE: &[u8] = b"CAP_MAX_CPU_SECS: source=RLIMIT_CPU\n";
+    unsafe { libc::write(2, MESSAGE.as_ptr().cast(), MESSAGE.len()); }
     CPU_HIT.store(true, Ordering::Relaxed);
 }
 
