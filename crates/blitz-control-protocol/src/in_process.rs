@@ -32,8 +32,8 @@
 use blitz_dom::Document as _;
 use blitz_script::ScriptDocument;
 use blitz_traits::events::{
-    BlitzImeEvent, BlitzInputEvent, BlitzWheelDelta, BlitzWheelEvent, DomEvent, DomEventData,
-    MouseEventButton, MouseEventButtons, Point, UiEvent,
+    BlitzImeEvent, BlitzInputEvent, BlitzWheelDelta, BlitzWheelEvent, BlitzWheelPhase, DomEvent,
+    DomEventData, MouseEventButton, MouseEventButtons, Point, UiEvent,
 };
 use keyboard_types::{Code, Key};
 
@@ -43,7 +43,7 @@ use crate::document::{
 };
 use crate::{
     AgentAction, AgentControlRequest, DebugError, DebugResponse, InputCommand, KeyPhase,
-    PointerPhase,
+    PointerPhase, WheelPhase,
 };
 
 /// How many polls an action gets to settle before it is reported as unsettled.
@@ -279,11 +279,16 @@ impl DocumentControl {
             InputCommand::Wheel {
                 delta_x,
                 delta_y,
+                phase,
                 modifiers,
-                ..
             } => {
                 let event = BlitzWheelEvent {
                     delta: BlitzWheelDelta::Pixels(delta_x, delta_y),
+                    phase: match phase {
+                        WheelPhase::Started => BlitzWheelPhase::Started,
+                        WheelPhase::Moved => BlitzWheelPhase::Moved,
+                        WheelPhase::Ended => BlitzWheelPhase::Ended,
+                    },
                     coords: crate::document::pointer_coords_for_document(document, self.pointer),
                     buttons: self.buttons,
                     mods: keyboard_modifiers(modifiers),
