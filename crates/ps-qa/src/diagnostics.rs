@@ -497,6 +497,7 @@ pub(crate) async fn dom(client: &mut Client, want: &str, depth: usize) -> Result
     }
     let grammar = want.starts_with('#')
         || want.starts_with('@')
+        || want.contains('[')
         || crate::target::selector_role(want).is_some();
     let matched: Vec<&SemanticNode> = snapshot
         .nodes

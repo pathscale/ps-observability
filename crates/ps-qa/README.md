@@ -214,11 +214,23 @@ ps-qa click "<name>"      # activate the first matching semantic node
 ps-qa nodes               # tree size and a role histogram
 ```
 
-`dom` takes either a selector or free text: `role:name`, `#id` and `@slot` mean
-what they mean in a check, and a bare word searches names, roles and values. A
-selector the document cannot answer at all, such as a role no node carries or
-an id nobody declares, is reported as such rather than as zero matches, which
-is the difference between "your selector" and "your page".
+Check targets are accessible names, `role:name`, `#dom-id` or `@slot`. Any of
+those forms can end in one exact attribute predicate:
+`<target>[<attr>='<value>']`, for example
+`#appName[aria-sort='ascending']` or
+`#copy-button-0[data-copied='true']`. Attribute names use
+lowercase ASCII letters, digits and hyphens; values use single quotes and are
+matched exactly. Predicates currently read `aria-*` and `data-*` attributes
+from the semantic snapshot. Malformed predicates and CSS selectors such as
+`div.card` fail while loading the check. Accessible names can still contain
+punctuation, including periods.
+
+`dom` takes either a selector or free text: the same `role:name`, `#dom-id`,
+`@slot` and attribute predicate forms work there, and a bare word searches
+names, roles and values. A selector the document cannot answer at all, such as
+a role no node carries or an id nobody declares, is reported as such rather
+than as zero matches, which is the difference between "your selector" and
+"your page".
 
 `press` remains a generic, explicit pointer-path diagnostic. Application suites
 use semantic activation by default: resolve a name with `find`, retain the node

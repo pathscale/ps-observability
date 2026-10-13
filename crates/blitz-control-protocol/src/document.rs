@@ -13,7 +13,7 @@
 //! wrong, not the platform. A runtime bridges Tauri to Blitz and owns a native
 //! window; it is not where an inspection service lives.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{
     AgentSnapshot, DebugError, DebugResponse, KeyPhase, Modifiers as ControlModifiers, SemanticNode,
@@ -362,6 +362,7 @@ pub fn snapshot_document(
                         .then_some(bounds)
                 }),
                 slot: element_attr(element, "data-slot").map(str::to_owned),
+                attributes: semantic_target_attributes(element),
             })
         })
         .collect();
@@ -493,6 +494,20 @@ pub(crate) fn element_attr<'a>(element: &'a blitz_dom::ElementData, name: &str) 
         // failed to build on stable. `as_ref` borrows the atom as a `&str`,
         // which is what this signature returns.
         .map(|attribute| attribute.value.as_ref())
+}
+
+fn semantic_target_attributes(element: &blitz_dom::ElementData) -> BTreeMap<String, String> {
+    element
+        .attrs()
+        .iter()
+        .filter_map(|attribute| {
+            let name = attribute.name.local.as_ref();
+            (name.starts_with("aria-") || name.starts_with("data-")).then(|| {
+                let value: &str = attribute.value.as_ref();
+                (name.to_owned(), value.to_owned())
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn semantic_role(element: &blitz_dom::ElementData) -> String {
@@ -1455,6 +1470,7 @@ pub fn inspect_document(
                     selected: false,
                     bounds,
                     slot: None,
+                    attributes: BTreeMap::new(),
                 });
             };
             let visible = candidate.visible
@@ -1503,6 +1519,7 @@ pub fn inspect_document(
                 selected: semantic_selected(element, &inner, id),
                 bounds,
                 slot: element_attr(element, "data-slot").map(str::to_owned),
+                attributes: semantic_target_attributes(element),
             })
         })
         .collect();
@@ -3691,6 +3708,7 @@ mod runtime_tests {
                 selected: false,
                 bounds: Some([0.0, 0.0, 100.0, 100.0]),
                 slot: None,
+                attributes: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -3727,6 +3745,7 @@ mod runtime_tests {
                 selected: false,
                 bounds: Some([0.0, 0.0, 100.0, 24.0]),
                 slot: None,
+                attributes: BTreeMap::new(),
             },
         )
         .unwrap();

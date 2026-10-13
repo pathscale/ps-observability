@@ -38,7 +38,7 @@
 use blitz_control_protocol::SemanticNode;
 use std::collections::HashMap;
 
-use crate::target::selector_matches_node;
+use crate::target::{selector_matches_node, validate_selector};
 
 /// A control to hover, and how many times to enter it.
 ///
@@ -1286,6 +1286,70 @@ fn validate_check(
         ));
     }
 
+    let mut selectors = Vec::new();
+    if check.subject_env.is_none()
+        && check.subject_secret.is_none()
+        && !matches!(
+            check.expect,
+            Expect::GpuNoErrors
+                | Expect::GpuHasResource
+                | Expect::GpuDraws(_)
+                | Expect::GpuTextureInk
+                | Expect::GpuBufferRange { .. }
+                | Expect::GpuBufferEquals { .. }
+                | Expect::GpuBufferAtLeast { .. }
+                | Expect::GpuBufferChanges { .. }
+        )
+    {
+        selectors.push(("subject", check.subject.as_str()));
+    }
+    for (field, selector) in [
+        ("arrival_subject", check.arrival_subject.as_deref()),
+        ("open", check.open.as_deref()),
+        ("prepare", check.prepare.as_deref()),
+        ("prepare_unless", check.prepare_unless.as_deref()),
+        ("prepare_until", check.prepare_until.as_deref()),
+        ("hover_unless", check.hover_unless.as_deref()),
+        ("reveal_before_capture", check.reveal_before_capture.as_deref()),
+        ("setup_type_into", check.setup_type_into.as_deref()),
+        ("click", check.click.as_deref()),
+        ("type_into", check.type_into.as_deref()),
+        ("key_on", check.key_on.as_deref()),
+        ("scroll_over", check.scroll_over.as_deref()),
+        ("compare", check.compare.as_deref()),
+    ] {
+        if let Some(selector) = selector {
+            selectors.push((field, selector));
+        }
+    }
+    if let Some(hover) = &check.hover {
+        selectors.push(("hover", hover.target()));
+    }
+    if let Some(hover) = &check.after_prepare_hover {
+        selectors.push(("after_prepare_hover", hover.target()));
+    }
+    if let Some(drag) = &check.pointer_drag {
+        selectors.push(("pointer_drag.from", drag.from.as_str()));
+        if let Some(to) = drag.to.as_deref() {
+            selectors.push(("pointer_drag.to", to));
+        }
+    }
+    for alternative in &check.any_of {
+        selectors.push(("any_of.subject", alternative.subject.as_str()));
+    }
+    for cover in &check.covers {
+        selectors.push(("covers", cover.as_str()));
+    }
+    for (field, selector) in selectors {
+        validate_selector(selector).map_err(|error| {
+            format!(
+                "{}: check {:?} has invalid {field} target: {error}",
+                file.display(),
+                check.id
+            )
+        })?;
+    }
+
     Ok(())
 }
 
@@ -2254,6 +2318,7 @@ mod tests {
             selected: false,
             bounds: Some([0.0, 0.0, width, height]),
             slot: None,
+            attributes: Default::default(),
         }
     }
 
@@ -2806,6 +2871,7 @@ mod tests {
             selected: false,
             bounds: Some([0.0, 0.0, 100.0, 20.0]),
             slot: None,
+            attributes: Default::default(),
         };
 
         assert!(verdict(&check, &[node(7, "0")], &[node(7, "1")]).is_ok());
@@ -2841,6 +2907,7 @@ mod tests {
             selected: false,
             bounds: Some([0.0, 0.0, 100.0, 24.0]),
             slot: None,
+            attributes: Default::default(),
         };
         let first = node(1, "Rename project alpha");
         let mut second = node(2, "Rename project beta");
@@ -2884,6 +2951,7 @@ mod tests {
             selected: false,
             bounds: Some([0.0, 0.0, 20.0, 20.0]),
             slot: None,
+            attributes: Default::default(),
         };
         let mut after = before.clone();
         after.selected = true;
@@ -2921,6 +2989,7 @@ mod tests {
             selected: false,
             bounds: Some([0.0, 0.0, 100.0, 20.0]),
             slot: None,
+            attributes: Default::default(),
         };
 
         assert!(name_changed(7, &[node(7, "Refreshed 1")], &[node(7, "Refreshed 2")]).is_ok());
@@ -2955,6 +3024,7 @@ mod tests {
             selected: false,
             bounds,
             slot: None,
+            attributes: Default::default(),
         };
         let error = verdict(
             &check,
@@ -2984,6 +3054,7 @@ mod tests {
             selected: false,
             bounds: Some([10.0, 10.0, 100.0, 20.0]),
             slot: Some("inline-edit".into()),
+            attributes: Default::default(),
         };
         let mut check = parse("");
         check.expect = Expect::PaintsNamed;
@@ -3017,6 +3088,7 @@ mod tests {
             selected: false,
             bounds: Some([-384.0, 40.0, 336.0, 24.0]),
             slot: None,
+            attributes: Default::default(),
         };
         let mut check = parse("");
         check.subject = "heading:Drawer outcome".into();
@@ -3048,6 +3120,7 @@ mod tests {
             selected: false,
             bounds: Some([x, y, 20.0, 20.0]),
             slot: None,
+            attributes: Default::default(),
         };
 
         assert!(verdict(&check, &[], &[node(1, 10.0, 10.0), node(2, 40.0, 10.0)]).is_ok());
@@ -3075,6 +3148,7 @@ mod tests {
             selected: false,
             bounds: Some([x, y, 20.0, 20.0]),
             slot: None,
+            attributes: Default::default(),
         };
         let container = SemanticNode {
             dom_id: None,
@@ -3090,6 +3164,7 @@ mod tests {
             selected: false,
             bounds: Some([10.0, 10.0, 190.0, 190.0]),
             slot: None,
+            attributes: Default::default(),
         };
 
         assert!(
@@ -3132,6 +3207,7 @@ mod tests {
             selected: false,
             bounds: Some(bounds),
             slot: Some(slot.into()),
+            attributes: Default::default(),
         };
 
         let wheel = node(1, "color-wheel-flower", [10.0, 110.0, 190.0, 190.0]);
@@ -3163,6 +3239,7 @@ mod tests {
             selected: false,
             bounds,
             slot: None,
+            attributes: Default::default(),
         };
 
         assert!(verdict(&check, &[], &[node(true, Some([0.0, 0.0, 20.0, 20.0]))]).is_ok());
@@ -3199,6 +3276,7 @@ mod tests {
             selected: false,
             bounds,
             slot: None,
+            attributes: Default::default(),
         };
         // What a host with no font catalogue reports for that button.
         let fontless = [cta(true, Some([24.0, 612.0, 0.0, 44.0]))];
@@ -3286,9 +3364,54 @@ mod tests {
             selected: false,
             bounds: Some([0.0, 0.0, 20.0, 20.0]),
             slot: None,
+            attributes: Default::default(),
         };
 
         assert!(verdict(&check, &[], &[node("button")]).is_ok());
         assert!(verdict(&check, &[], &[node("textbox")]).is_err());
+    }
+
+    #[test]
+    fn malformed_attribute_target_fails_check_loading() {
+        for (selector, message) in [
+            ("#appName[aria-sort=ascending]", "single quotes"),
+            (
+                "#appName[aria-sort='ascending'][data-copied='true']",
+                "only one attribute predicate",
+            ),
+            ("div.card", "CSS selectors are not supported"),
+        ] {
+            let mut check = parse("");
+            check.subject = selector.into();
+            let error = validate_check(
+                &check,
+                Path::new("sorting.ron"),
+                &mut HashMap::new(),
+            )
+            .expect_err("malformed target syntax is a plan load error");
+
+            assert!(error.contains("sorting.ron"), "{error}");
+            assert!(error.contains("invalid subject target"), "{error}");
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn present_accepts_a_node_with_an_exact_attribute_predicate() {
+        let mut check = parse("");
+        check.subject = "#appName[aria-sort='ascending']".into();
+        check.expect = Expect::Present;
+        let mut column = painted_node(7, "Application name", 120.0, 24.0);
+        column.dom_id = Some("appName".into());
+        column.role = "columnheader".into();
+        column
+            .attributes
+            .insert("aria-sort".into(), "ascending".into());
+
+        assert!(verdict(&check, &[], std::slice::from_ref(&column)).is_ok());
+        column
+            .attributes
+            .insert("aria-sort".into(), "descending".into());
+        assert!(verdict(&check, &[], &[column]).is_err());
     }
 }

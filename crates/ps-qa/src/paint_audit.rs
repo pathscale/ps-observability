@@ -411,6 +411,7 @@ mod tests {
             selected: false,
             bounds: Some([0.0, 0.0, 200.0, 24.0]),
             slot: None,
+            attributes: Default::default(),
         };
         assert!(!auditable(&disabled, ""));
     }

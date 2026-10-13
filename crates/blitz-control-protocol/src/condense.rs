@@ -607,6 +607,7 @@ mod tests {
             selected: false,
             bounds: None,
             slot: None,
+            attributes: Default::default(),
         }
     }
 

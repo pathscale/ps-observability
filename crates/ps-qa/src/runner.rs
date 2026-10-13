@@ -5451,6 +5451,7 @@ fn saved_control_node(control: &SavedControl) -> SemanticNode {
         selected: false,
         bounds: Some([0.0, 0.0, 1.0, 1.0]),
         slot: control.slot.clone(),
+        attributes: Default::default(),
     }
 }
 
@@ -7954,6 +7955,7 @@ mod tests {
             selected: false,
             bounds: Some([0.0, 0.0, 20.0, 20.0]),
             slot: None,
+            attributes: Default::default(),
         }
     }
 
@@ -8568,6 +8570,7 @@ mod tests {
             selected: false,
             bounds: Some([0.0, 0.0, 90.0, 24.0]),
             slot: None,
+            attributes: Default::default(),
         };
         let host = serve_silent_host(socket.clone(), vec![saved.clone()]);
 
@@ -8643,6 +8646,7 @@ mod tests {
             selected: false,
             bounds: Some([0.0, 0.0, 240.0, 28.0]),
             slot: None,
+            attributes: Default::default(),
         };
         let mut check = check("filter-value", Some("Apply"), "Filter");
         check.setup_type_into = Some("Filter".into());

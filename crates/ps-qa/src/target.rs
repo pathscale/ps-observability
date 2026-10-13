@@ -437,19 +437,137 @@ fn prioritize_actionable_candidates(candidates: &mut Vec<(&SemanticNode, [f64; 4
         candidates.sort_by_key(|(node, _)| (!node.visible, painted_bounds(node).is_none()));
     }
 }
-fn selector_slot(selector: &str) -> Option<&str> {
+#[derive(Clone, Copy)]
+struct AttributePredicate<'a> {
+    name: &'a str,
+    value: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct ParsedSelector<'a> {
+    base: &'a str,
+    attribute: Option<AttributePredicate<'a>>,
+}
+
+fn parse_selector(selector: &str) -> Result<ParsedSelector<'_>, String> {
+    if selector.is_empty() {
+        return Err("target must be an accessible name, role:name, #dom-id, or @slot".to_owned());
+    }
+
+    let Some(open) = selector.find('[') else {
+        if selector.contains(']') {
+            return Err("attribute predicate must be one final [name='value'] suffix".to_owned());
+        }
+        if looks_like_css_class_selector(selector) {
+            return Err(
+                "CSS selectors are not supported; use an accessible name, role:name, #dom-id, or @slot"
+                    .to_owned(),
+            );
+        }
+        return Ok(ParsedSelector {
+            base: selector,
+            attribute: None,
+        });
+    };
+
+    let base = &selector[..open];
+    if base.is_empty() || base.contains(']') {
+        return Err("use exactly one final [name='value'] attribute predicate".to_owned());
+    }
+    if !selector.ends_with(']') {
+        return Err("attribute predicate must end with ] and use single quotes".to_owned());
+    }
+    let predicate = &selector[open + 1..selector.len() - 1];
+    if predicate.matches('\'').count() > 2 {
+        return Err("only one attribute predicate is allowed".to_owned());
+    }
+    let Some((name, quoted_value)) = predicate.split_once('=') else {
+        return Err("attribute predicate must use [name='value']".to_owned());
+    };
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(
+            "attribute name must contain only lowercase letters, digits, or hyphens".to_owned(),
+        );
+    }
+    let Some(value) = quoted_value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    else {
+        return Err("attribute predicate value must be enclosed in single quotes".to_owned());
+    };
+    if value.contains('\'') {
+        return Err("attribute predicate values cannot contain a single quote".to_owned());
+    }
+    if looks_like_css_class_selector(base) {
+        return Err(
+            "CSS selectors are not supported; use an accessible name, role:name, #dom-id, or @slot"
+                .to_owned(),
+        );
+    }
+
+    Ok(ParsedSelector {
+        base,
+        attribute: Some(AttributePredicate { name, value }),
+    })
+}
+
+/// Check target syntax while loading a check, before it can become a
+/// never-matching accessible-name substring.
+pub(crate) fn validate_selector(selector: &str) -> Result<(), String> {
+    parse_selector(selector).map(|_| ())
+}
+
+fn looks_like_css_class_selector(selector: &str) -> bool {
+    const HTML_TAGS: &[&str] = &[
+        "a", "article", "aside", "button", "div", "footer", "form", "h1", "h2", "h3",
+        "h4", "h5", "h6", "header", "img", "input", "label", "li", "main", "nav", "ol",
+        "option", "p", "section", "select", "span", "svg", "table", "tbody", "td",
+        "textarea", "th", "tr", "ul",
+    ];
+    let Some((tag, classes)) = selector.split_once('.') else {
+        return false;
+    };
+    HTML_TAGS
+        .iter()
+        .any(|known| tag.eq_ignore_ascii_case(known))
+        && !classes.is_empty()
+        && classes.split('.').all(|class| {
+            !class.is_empty()
+                && class
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+}
+
+fn selector_slot_base(selector: &str) -> Option<&str> {
     selector.strip_prefix('@')
 }
 
-fn selector_dom_id(selector: &str) -> Option<&str> {
+fn selector_dom_id_base(selector: &str) -> Option<&str> {
     selector.strip_prefix('#').filter(|id| !id.is_empty())
 }
 
-pub(crate) fn selector_matches_node(node: &SemanticNode, selector: &str) -> bool {
-    if let Some(dom_id) = selector_dom_id(selector) {
+fn selector_slot(selector: &str) -> Option<&str> {
+    parse_selector(selector)
+        .ok()
+        .and_then(|parsed| selector_slot_base(parsed.base))
+}
+
+fn selector_dom_id(selector: &str) -> Option<&str> {
+    parse_selector(selector)
+        .ok()
+        .and_then(|parsed| selector_dom_id_base(parsed.base))
+}
+
+fn selector_matches_base(node: &SemanticNode, selector: &str) -> bool {
+    if let Some(dom_id) = selector_dom_id_base(selector) {
         return node.dom_id.as_deref() == Some(dom_id);
     }
-    if let Some(slot) = selector_slot(selector) {
+    if let Some(slot) = selector_slot_base(selector) {
         return node.slot.as_deref() == Some(slot);
     }
     if let Some((role, name)) = selector.split_once(':')
@@ -460,12 +578,49 @@ pub(crate) fn selector_matches_node(node: &SemanticNode, selector: &str) -> bool
     name_matches(&node.name, selector)
 }
 
+fn selector_matches_exact_base(node: &SemanticNode, selector: &str) -> bool {
+    if let Some(dom_id) = selector_dom_id_base(selector) {
+        return node.dom_id.as_deref() == Some(dom_id);
+    }
+    if let Some(slot) = selector_slot_base(selector) {
+        return node.slot.as_deref() == Some(slot);
+    }
+    if let Some((role, name)) = selector.split_once(':')
+        && role.eq_ignore_ascii_case(&node.role)
+    {
+        return node.name.eq_ignore_ascii_case(name);
+    }
+    node.name.eq_ignore_ascii_case(selector)
+}
+
+fn selector_attribute_matches(
+    node: &SemanticNode,
+    predicate: Option<AttributePredicate<'_>>,
+) -> bool {
+    let Some(predicate) = predicate else {
+        return true;
+    };
+    node.attributes
+        .get(predicate.name)
+        .is_some_and(|value| value == predicate.value)
+}
+
+pub(crate) fn selector_matches_node(node: &SemanticNode, selector: &str) -> bool {
+    let Ok(parsed) = parse_selector(selector) else {
+        return false;
+    };
+    selector_matches_base(node, parsed.base)
+        && selector_attribute_matches(node, parsed.attribute)
+}
+
 /// The role half of a `role:name` selector, when the selector has one.
 ///
 /// A role is a single token, which is what separates the selector grammar from
 /// an accessible name that happens to contain a colon: `link:crates.vip` names
 /// a role, `Default permission: Auto` does not.
 pub(crate) fn selector_role(selector: &str) -> Option<&str> {
+    let parsed = parse_selector(selector).ok()?;
+    let selector = parsed.base;
     if selector.starts_with('#') || selector.starts_with('@') {
         return None;
     }
@@ -482,26 +637,39 @@ pub(crate) fn selector_role(selector: &str) -> Option<&str> {
 /// matched" is how `Contrast` on `link:crates.vip` came back as a page with no
 /// painted text on it rather than as a selector nobody had implemented.
 pub(crate) fn unmatched_selector_reason(nodes: &[SemanticNode], selector: &str) -> Option<String> {
-    if selector.is_empty()
-        || nodes
-            .iter()
-            .any(|node| selector_matches_node(node, selector))
-    {
+    if selector.is_empty() {
         return None;
     }
-    if let Some(dom_id) = selector_dom_id(selector) {
+    let parsed = match parse_selector(selector) {
+        Ok(parsed) => parsed,
+        Err(error) => return Some(format!("invalid target selector: {error}")),
+    };
+    if nodes.iter().any(|node| selector_matches_node(node, selector)) {
+        return None;
+    }
+    if let Some(predicate) = parsed.attribute
+        && nodes
+            .iter()
+            .any(|node| selector_matches_base(node, parsed.base))
+    {
+        return Some(format!(
+            "no node matching {:?} carries attribute {:?} with the requested value",
+            parsed.base, predicate.name
+        ));
+    }
+    if let Some(dom_id) = selector_dom_id_base(parsed.base) {
         return Some(format!(
             "no node carries the DOM id {dom_id:?}; drop the leading '#' to match an \
              accessible name instead"
         ));
     }
-    if let Some(slot) = selector_slot(selector) {
+    if let Some(slot) = selector_slot_base(parsed.base) {
         return Some(format!(
             "no node carries the component slot {slot:?}; drop the leading '@' to match an \
              accessible name instead"
         ));
     }
-    let role = selector_role(selector)?;
+    let role = selector_role(parsed.base)?;
     if nodes
         .iter()
         .any(|node| node.role.eq_ignore_ascii_case(role))
@@ -513,25 +681,18 @@ pub(crate) fn unmatched_selector_reason(nodes: &[SemanticNode], selector: &str) 
     present.dedup();
     present.truncate(12);
     Some(format!(
-        "no node has role {role:?}, so {selector:?} can never match; roles present: {}",
+        "no node has role {role:?}, so {:?} can never match; roles present: {}",
+        parsed.base,
         present.join(", ")
     ))
 }
 
 pub(crate) fn exact_selector_matches_node(node: &SemanticNode, selector: &str) -> bool {
-    if let Some(dom_id) = selector_dom_id(selector) {
-        return node.dom_id.as_deref() == Some(dom_id);
-    }
-    // A slot is already exact: there is no substring reading of it to narrow.
-    if let Some(slot) = selector_slot(selector) {
-        return node.slot.as_deref() == Some(slot);
-    }
-    if let Some((role, name)) = selector.split_once(':')
-        && role.eq_ignore_ascii_case(&node.role)
-    {
-        return node.name.eq_ignore_ascii_case(name);
-    }
-    node.name.eq_ignore_ascii_case(selector)
+    let Ok(parsed) = parse_selector(selector) else {
+        return false;
+    };
+    selector_matches_exact_base(node, parsed.base)
+        && selector_attribute_matches(node, parsed.attribute)
 }
 
 pub(crate) fn retain_exact_candidates(
@@ -565,6 +726,7 @@ mod tests {
             selected: false,
             bounds: Some([0.0, 0.0, 20.0, 20.0]),
             slot: Some("button".into()),
+            attributes: Default::default(),
         }
     }
 
@@ -581,6 +743,59 @@ mod tests {
     fn dom_id_does_not_fall_back_to_the_accessible_name() {
         let anonymous = node(None, "settings-save");
         assert!(!selector_matches_node(&anonymous, "#settings-save"));
+    }
+
+    #[test]
+    fn one_attribute_predicate_matches_every_existing_target_form() {
+        let mut column = node(Some("appName"), "Application name");
+        column.role = "columnheader".into();
+        column.slot = Some("columnheader".into());
+        column
+            .attributes
+            .insert("aria-sort".into(), "ascending".into());
+
+        for selector in [
+            "#appName[aria-sort='ascending']",
+            "columnheader:Application name[aria-sort='ascending']",
+            "@columnheader[aria-sort='ascending']",
+            "Application name[aria-sort='ascending']",
+        ] {
+            assert!(selector_matches_node(&column, selector), "{selector}");
+            assert!(exact_selector_matches_node(&column, selector), "{selector}");
+        }
+    }
+
+    #[test]
+    fn attribute_predicate_requires_an_exact_present_value() {
+        let mut copied = node(Some("copy-button-0"), "Copy");
+        copied
+            .attributes
+            .insert("data-copied".into(), "false".into());
+        assert!(!selector_matches_node(
+            &copied,
+            "#copy-button-0[data-copied='true']"
+        ));
+
+        copied.attributes.clear();
+        assert!(!selector_matches_node(
+            &copied,
+            "#copy-button-0[data-copied='true']"
+        ));
+    }
+
+    #[test]
+    fn malformed_attribute_predicates_and_css_selectors_are_rejected() {
+        for selector in [
+            "#appName[aria-sort=ascending]",
+            "#appName[aria-sort='ascending'",
+            "#appName[aria-sort='ascending'][data-copied='true']",
+            "div.card",
+        ] {
+            assert!(validate_selector(selector).is_err(), "{selector}");
+            assert!(!selector_matches_node(&node(None, selector), selector));
+        }
+        validate_selector("#appName[aria-sort='ascending']")
+            .expect("the supported predicate grammar is valid");
     }
 
     #[test]

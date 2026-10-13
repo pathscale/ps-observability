@@ -98,6 +98,8 @@ pub use webgpu::*;
 #[cfg(all(feature = "server", unix))]
 pub mod server;
 
+use std::collections::BTreeMap;
+
 use endpoint_libs::libs::ws::mcp_wire::{INVALID_PARAMS, INVALID_REQUEST, parse};
 pub use endpoint_libs::libs::ws::{
     MessageStream, WireMessage,
@@ -794,6 +796,10 @@ pub struct SemanticNode {
     /// written against the name passes whether or not anything happened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<String>,
+    /// ARIA and data attributes that target predicates may compare exactly.
+    /// Other DOM attributes stay out of semantic snapshots.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attributes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1851,11 +1857,15 @@ mod tests {
             selected: false,
             bounds: Some([1.0, 2.0, 30.0, 20.0]),
             slot: Some("button".into()),
+            attributes: [("aria-sort".into(), "ascending".into())]
+                .into_iter()
+                .collect(),
         };
 
         let encoded = serde_json::to_value(&node).unwrap();
         assert_eq!(encoded["domId"], "settings-save");
         assert_eq!(encoded["id"], 42);
+        assert_eq!(encoded["attributes"]["aria-sort"], "ascending");
         assert_eq!(
             serde_json::from_value::<SemanticNode>(encoded).unwrap(),
             node

@@ -924,6 +924,7 @@ mod tests {
             selected: false,
             bounds,
             slot: None,
+            attributes: Default::default(),
         }
     }
 
