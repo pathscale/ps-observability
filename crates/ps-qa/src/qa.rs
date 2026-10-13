@@ -934,7 +934,7 @@ pub fn checks_from_paths(paths: &[std::path::PathBuf]) -> Result<Vec<Check>, Str
     // below for why it stops there.
     let mut established: Option<(std::path::PathBuf, String)> = None;
     for file in files {
-        let text = std::fs::read_to_string(&file)
+        let text = crate::app_caps::read_string(&file)
             .map_err(|error| format!("could not read {}: {error}", file.display()))?;
         let group: Vec<Check> = ron::from_str(&text)
             .map_err(|error| format!("could not parse {}: {error}", file.display()))?;

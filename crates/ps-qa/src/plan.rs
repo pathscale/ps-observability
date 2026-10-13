@@ -115,7 +115,7 @@ fn default_startup_timeout_secs() -> u64 {
 
 impl RunPlan {
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
+        let text = crate::app_caps::read_string(path)
             .map_err(|error| format!("could not read run plan {}: {error}", path.display()))?;
         let mut plan: Self = ron::from_str(&text)
             .map_err(|error| format!("could not parse run plan {}: {error}", path.display()))?;
