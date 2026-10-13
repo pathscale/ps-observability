@@ -169,7 +169,7 @@ pub struct Cli {
 ///
 /// The doc comment on each variant is what `--help` prints, so the description
 /// and the behaviour are the same edit.
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum Command {
     /// List every inspection target and its mounted identity and capabilities.
     Targets,
