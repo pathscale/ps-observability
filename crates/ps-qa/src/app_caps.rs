@@ -176,8 +176,23 @@ extern "C" fn cpu_stop(_: libc::c_int) {
     CPU_HIT.store(true, Ordering::Relaxed);
 }
 
+#[cfg(not(test))]
 pub fn current() -> &'static Arc<Caps> {
     STATE.get().unwrap_or_else(|| fail("CAP_NOT_STARTED"))
+}
+// Unit tests never run main(), so they get an uncapped instance instead of an exit.
+#[cfg(test)]
+pub fn current() -> &'static Arc<Caps> {
+    STATE.get_or_init(|| {
+        Arc::new(Caps {
+            hard: [u64::MAX - 1; 9],
+            warn: [u64::MAX - 1; 9],
+            warned: Default::default(),
+            args: Arc::from(Vec::new()),
+            stage: Mutex::new(Arc::from("test")),
+            started: Instant::now(),
+        })
+    })
 }
 pub fn args_os() -> impl Iterator<Item = OsString> {
     current().args.iter().cloned()
