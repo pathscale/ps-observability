@@ -1,5 +1,9 @@
 # Changelog
 
+## blitz-control-protocol 0.7.2
+
+- Add additive tab addressing, generation and document guards, target discovery, and bounded per-target diagnostic journals while keeping `DEBUG_PROTOCOL_VERSION` at 2.
+
 ## blitz-control-protocol 0.7.1
 
 - Add DiagnosticsRequest::WebGpuBuffer and DebugResponse::WebGpuBuffer with labeled buffer bytes, original usage, completed submit serial, writeBuffer provenance, and base64 payload.

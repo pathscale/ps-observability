@@ -223,6 +223,10 @@ pub struct Client {
     request_timeout: Duration,
     terminal: Option<TerminalFailure>,
     events: VecDeque<DebugEvent>,
+    notifications: VecDeque<serde_json::Value>,
+    lost_notifications: u64,
+    target_options: crate::TargetOptions,
+    target_context: Option<crate::TargetContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -393,6 +397,101 @@ pub fn safe_response_code(error: &eyre::Report) -> Option<&'static str> {
 }
 
 impl Client {
+    pub fn select_target(&mut self, target: Option<crate::TargetSelector>) {
+        self.target_options = crate::TargetOptions {
+            target,
+            ..Default::default()
+        };
+        self.target_context = None;
+    }
+
+    pub fn target_context(&self) -> Option<&crate::TargetContext> {
+        self.target_context.as_ref()
+    }
+
+    fn target_frame(&self, frame: WireMessage) -> Result<WireMessage> {
+        let mut value = decode_wire_value(frame).map_err(protocol_error)?;
+        if value["method"] != "tools/call" {
+            return Ok(WireMessage::Text(serde_json::to_string(&value)?.into()));
+        }
+        let tool = value["params"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let arguments = &mut value["params"]["arguments"];
+        let object = arguments
+            .as_object_mut()
+            .ok_or_else(|| eyre!("tool arguments must be an object"))?;
+        if !object.contains_key("target")
+            && object.get("allTargets") != Some(&serde_json::Value::Bool(true))
+            && let Some(target) = &self.target_options.target
+        {
+            object.insert("target".into(), serde_json::to_value(target)?);
+        }
+        let options: crate::TargetOptions = serde_json::from_value(arguments.clone())?;
+        let command = if tool == crate::AGENT_CONTROL_TOOL {
+            serde_json::from_value(arguments.clone())
+                .ok()
+                .map(crate::TargetCommand::Agent)
+        } else if tool == crate::DIAGNOSTICS_TOOL {
+            serde_json::from_value(arguments.clone())
+                .ok()
+                .map(crate::TargetCommand::Diagnostics)
+        } else {
+            None
+        };
+        if options.target == self.target_options.target
+            && !options.all_targets
+            && let (Some(context), Some(command)) = (&self.target_context, command)
+        {
+            let request = crate::TargetRequest { options, command };
+            if (request.uses_nodes()
+                || matches!(
+                    request.command,
+                    crate::TargetCommand::Agent(crate::AgentControlRequest::Act(_))
+                ))
+                && matches!(context.target_id, crate::TargetId::Tab(_))
+            {
+                let object = arguments.as_object_mut().expect("arguments object");
+                object
+                    .entry("expectedGeneration")
+                    .or_insert_with(|| context.generation.into());
+                object
+                    .entry("expectedDocumentId")
+                    .or_insert_with(|| context.document_id.into());
+            }
+        }
+        Ok(WireMessage::Text(serde_json::to_string(&value)?.into()))
+    }
+
+    fn queue_notification(&mut self, value: serde_json::Value) {
+        if value.get("method").is_none() || value.get("id").is_some() {
+            return;
+        }
+        if self.notifications.len() == MAX_QUEUED_EVENTS {
+            self.notifications.pop_front();
+            self.lost_notifications += 1;
+        }
+        self.notifications.push_back(value);
+    }
+
+    fn capture_target_context(&mut self, value: &serde_json::Value) {
+        let Some(context) = value.pointer("/result/structuredContent/context") else {
+            return;
+        };
+        let Ok(context) = serde_json::from_value::<crate::TargetContext>(context.clone()) else {
+            return;
+        };
+        let selected = self
+            .target_options
+            .target
+            .as_ref()
+            .map_or_else(crate::TargetId::chrome, crate::TargetSelector::id);
+        if context.target_id == selected {
+            self.target_context = Some(context);
+        }
+    }
+
     fn queue_event(&mut self, event: DebugEvent) {
         if self.events.len() == MAX_QUEUED_EVENTS {
             self.events.pop_front();
@@ -427,6 +526,10 @@ impl Client {
             request_timeout: REQUEST_TIMEOUT,
             terminal: None,
             events: VecDeque::new(),
+            notifications: VecDeque::new(),
+            lost_notifications: 0,
+            target_options: crate::TargetOptions::default(),
+            target_context: None,
         })
     }
 
@@ -505,6 +608,7 @@ impl Client {
         id: &JsonRpcId,
     ) -> Result<serde_json::Value> {
         self.ensure_available()?;
+        let request = self.target_frame(request)?;
         let deadline = Instant::now() + self.request_timeout;
         let send_remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(send_remaining, self.stream.send(request)).await {
@@ -536,8 +640,10 @@ impl Client {
 
             let value = decode_wire_value(message).map_err(protocol_error)?;
             if peek_value_request_id(&value).as_ref() == Some(id) {
+                self.capture_target_context(&value);
                 return Ok(value);
             }
+            self.queue_notification(value.clone());
             if let Ok(event) = decode_diagnostics_event_value(value) {
                 self.queue_event(event);
             }
@@ -650,6 +756,7 @@ impl Client {
                 Ok(Some(Ok(message))) => message,
             };
             let value = decode_wire_value(message).map_err(protocol_error)?;
+            self.queue_notification(value.clone());
             match decode_diagnostics_event_value(value) {
                 Ok(DebugEvent::PaintCommitted { .. }) => return Ok(true),
                 Ok(event) => self.queue_event(event),
@@ -687,7 +794,12 @@ impl Client {
     pub async fn drain(&mut self, seconds: f64) -> Result<Vec<serde_json::Value>> {
         self.ensure_available()?;
         let deadline = Instant::now() + Duration::from_secs_f64(seconds);
-        let mut out = Vec::new();
+        let mut out: Vec<_> = self.notifications.drain(..).collect();
+        if self.lost_notifications > 0 {
+            out.insert(0, serde_json::json!({"method": crate::DIAGNOSTICS_EVENT_NOTIFICATION, "params": {
+                "event": "clientNotificationOverflow", "value": {"dropped": std::mem::take(&mut self.lost_notifications)}
+            }}));
+        }
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -752,6 +864,10 @@ pub struct Answer {
 impl Answer {
     fn new(value: serde_json::Value) -> Result<Self> {
         let (_, response) = decode_response_value(value).map_err(protocol_error)?;
+        let response = match response {
+            DebugResponse::Targeted(reply) => *reply.response,
+            response => response,
+        };
         if let DebugResponse::Error(error) = &response {
             return Err(eyre::Report::new(InspectorResponseError {
                 code: error.code.clone(),

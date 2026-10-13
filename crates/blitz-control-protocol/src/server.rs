@@ -27,6 +27,22 @@ use crate::{
 pub enum ControlBridgeRequest {
     Agent(AgentControlRequest),
     Diagnostics(DiagnosticsRequest),
+    Targeted(crate::TargetRequest),
+}
+
+#[derive(Clone)]
+enum EventSource {
+    Latest(Arc<Latest<DebugEvent>>),
+    Journal(Arc<crate::journal::DiagnosticJournal>),
+}
+
+impl EventSource {
+    fn sequence(&self) -> u64 {
+        match self {
+            Self::Latest(events) => events.revision(),
+            Self::Journal(events) => events.sequence(),
+        }
+    }
 }
 
 /// Who is answering, and what they can answer.
@@ -122,13 +138,21 @@ impl AgentControlServer {
         host: Host,
         events: Arc<Latest<DebugEvent>>,
     ) -> io::Result<Self> {
-        Self::start_inner(bridge, host, Some(events))
+        Self::start_inner(bridge, host, Some(EventSource::Latest(events)))
+    }
+
+    pub fn start_with_journal(
+        bridge: ControlBridge,
+        host: Host,
+        events: Arc<crate::journal::DiagnosticJournal>,
+    ) -> io::Result<Self> {
+        Self::start_inner(bridge, host, Some(EventSource::Journal(events)))
     }
 
     fn start_inner(
         bridge: ControlBridge,
         host: Host,
-        events: Option<Arc<Latest<DebugEvent>>>,
+        events: Option<EventSource>,
     ) -> io::Result<Self> {
         let instance_id = instance_id();
         let descriptor_path = descriptor_path(&instance_id);
@@ -247,7 +271,7 @@ fn run(
     listener: BoundListener,
     bridge: ControlBridge,
     host: Host,
-    events: Option<Arc<Latest<DebugEvent>>>,
+    events: Option<EventSource>,
     shutdown: Arc<Flag>,
 ) {
     // One reactor, owned by this thread, driving the listener and every
@@ -328,10 +352,12 @@ enum ConnectionInput {
     /// The newest event, carried directly. A `Latest` has no sender to drop,
     /// so there is no receive error to represent.
     Event(Box<DebugEvent>),
+    Journal(crate::journal::JournalItem),
 }
 
 fn stream_wants_event(streams: &[DebugStream], event: &DebugEvent) -> bool {
     match event {
+        DebugEvent::DiagnosticLoss { stream, .. } => streams.contains(stream),
         DebugEvent::Snapshot(_) => streams.contains(&DebugStream::Snapshots),
         DebugEvent::Metrics(_) => streams.contains(&DebugStream::Metrics),
         DebugEvent::Console(_) => streams.contains(&DebugStream::Console),
@@ -344,18 +370,31 @@ async fn handle_connection(
     stream: TcpStream,
     bridge: ControlBridge,
     host: Host,
-    events: Option<Arc<Latest<DebugEvent>>>,
+    events: Option<EventSource>,
 ) {
     let mut stream = TransportStream::new(framed_json_neutral(NagoyaStream::new(stream)));
     let mut observed = Vec::<DebugStream>::new();
     // This reader's position in the event stream. Held here rather than in the
     // slot, because two connections read the same `Latest` from different
     // places and one catching up must not move the other.
-    let mut seen = events.as_ref().map_or(0, |latest| latest.revision());
+    let mut seen = events.as_ref().map_or(0, EventSource::sequence);
+    let mut target_options = crate::TargetOptions::default();
     loop {
         let input = if observed.is_empty() {
             ConnectionInput::Message(stream.recv().await)
-        } else if let Some(latest) = events.as_ref() {
+        } else if let Some(EventSource::Journal(journal)) = events.as_ref() {
+            use futures::future::{Either, select};
+            let message = stream.recv();
+            let changed = journal.next_after(seen);
+            futures::pin_mut!(message, changed);
+            match select(message, changed).await {
+                Either::Left((message, _)) => ConnectionInput::Message(message),
+                Either::Right((item, _)) => {
+                    seen = item.sequence();
+                    ConnectionInput::Journal(item)
+                }
+            }
+        } else if let Some(EventSource::Latest(latest)) = events.as_ref() {
             use futures::future::{Either, select};
             let message = stream.recv();
             let changed = latest.changed_since(seen);
@@ -375,6 +414,33 @@ async fn handle_connection(
         };
 
         let message = match input {
+            ConnectionInput::Journal(item) => {
+                let frame = match item {
+                    crate::journal::JournalItem::Overflow { first, last } => {
+                        crate::encode_diagnostic_overflow(first, last)
+                    }
+                    crate::journal::JournalItem::Event(record) => {
+                        let selected = target_options.all_targets
+                            || record.context.target_id
+                                == target_options.target.as_ref().map_or_else(
+                                    crate::TargetId::chrome,
+                                    crate::TargetSelector::id,
+                                );
+                        if !selected || !stream_wants_event(&observed, &record.event) {
+                            continue;
+                        }
+                        crate::encode_target_event(&record)
+                    }
+                };
+                let frame = frame.unwrap_or_else(|_| {
+                    crate::encode_diagnostic_overflow(seen, seen)
+                        .expect("the bounded overflow notification is serializable")
+                });
+                if stream.send(frame).await.is_err() {
+                    break;
+                }
+                continue;
+            }
             ConnectionInput::Event(event) => {
                 if !stream_wants_event(&observed, &event) {
                     continue;
@@ -405,6 +471,50 @@ async fn handle_connection(
                         Ok(IncomingRequest::ToolsList { id }) => {
                             encode_tools_list_response(id, host.diagnostics)
                         }
+                        Ok(IncomingRequest::Targeted { id, request }) => {
+                            let streams = match &request.command {
+                                crate::TargetCommand::Diagnostics(
+                                    DiagnosticsRequest::Observe { streams },
+                                ) => Some(streams.clone()),
+                                _ => None,
+                            };
+                            let options = request.options.clone();
+                            let baseline = events.as_ref().map_or(0, EventSource::sequence);
+                            let validation = request.validate_options().and_then(|()| {
+                                if streams.is_some()
+                                    && options
+                                        .after_sequence
+                                        .is_some_and(|sequence| sequence > baseline)
+                                {
+                                    Err(crate::target::error(
+                                        "invalidSequence",
+                                        "afterSequence exceeds the current journal sequence",
+                                    ))
+                                } else {
+                                    Ok(())
+                                }
+                            });
+                            let response = match validation {
+                                Err(error) => DebugResponse::Error(error),
+                                Ok(()) => bridge(ControlBridgeRequest::Targeted(request))
+                                    .recv()
+                                    .await
+                                    .unwrap_or_else(|| {
+                                        DebugResponse::Error(crate::target::error(
+                                            "bridgeClosed",
+                                            "the UI-thread bridge closed",
+                                        ))
+                                    }),
+                            };
+                            if matches!(response.unscoped(), DebugResponse::Ack)
+                                && let Some(streams) = streams
+                            {
+                                observed = streams;
+                                seen = options.after_sequence.unwrap_or(baseline);
+                                target_options = options;
+                            }
+                            encode_response(id, &response)
+                        }
                         Ok(IncomingRequest::Agent { id, request }) => {
                             let response = bridge(ControlBridgeRequest::Agent(request))
                                 .recv()
@@ -426,17 +536,34 @@ async fn handle_connection(
                             id,
                             request: DiagnosticsRequest::Observe { streams },
                         }) => {
-                            observed = streams;
-                            // Arming observation establishes a revision baseline.
-                            // Do not immediately replay a paint that happened
-                            // before the action the caller is about to drive.
-                            // The action about to run should not be answered with a
-                            // paint that happened before it. Advancing the cursor
-                            // to now is what `borrow_and_update` did on a watch.
-                            if let Some(latest) = events.as_ref() {
-                                seen = latest.revision();
+                            let baseline = events.as_ref().map_or(0, EventSource::sequence);
+                            let response =
+                                if matches!(events.as_ref(), Some(EventSource::Journal(_))) {
+                                    bridge(ControlBridgeRequest::Targeted(crate::TargetRequest {
+                                        options: crate::TargetOptions::default(),
+                                        command: crate::TargetCommand::Diagnostics(
+                                            DiagnosticsRequest::Observe {
+                                                streams: streams.clone(),
+                                            },
+                                        ),
+                                    }))
+                                    .recv()
+                                    .await
+                                    .unwrap_or_else(|| {
+                                        DebugResponse::Error(crate::target::error(
+                                            "bridgeClosed",
+                                            "the UI-thread bridge closed",
+                                        ))
+                                    })
+                                } else {
+                                    DebugResponse::Ack
+                                };
+                            if matches!(response.unscoped(), DebugResponse::Ack) {
+                                observed = streams;
+                                seen = baseline;
+                                target_options = crate::TargetOptions::default();
                             }
-                            encode_response(id, &DebugResponse::Ack)
+                            encode_response(id, &response)
                         }
                         Ok(IncomingRequest::Diagnostics { id, request }) => {
                             let response = bridge(ControlBridgeRequest::Diagnostics(request))

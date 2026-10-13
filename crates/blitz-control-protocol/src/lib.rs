@@ -83,6 +83,10 @@ pub mod in_process;
 pub mod latest;
 /// The embedder's answer to a request about the process, not the document.
 pub mod lifecycle;
+pub mod target;
+pub use target::*;
+#[cfg(any(feature = "server", feature = "client"))]
+pub mod journal;
 /// Page-owned WebGPU diagnostic reports.
 pub mod webgpu;
 pub use webgpu::*;
@@ -153,6 +157,10 @@ pub enum IncomingRequest {
         id: JsonRpcId,
         request: DiagnosticsRequest,
     },
+    Targeted {
+        id: JsonRpcId,
+        request: TargetRequest,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -164,6 +172,7 @@ pub enum IncomingRequest {
 )]
 #[non_exhaustive]
 pub enum AgentControlRequest {
+    ListTargets,
     Inspect {
         root: Option<u64>,
         #[serde(alias = "max_depth")]
@@ -365,6 +374,8 @@ impl CapturedImage {
 #[non_exhaustive]
 pub enum DebugResponse {
     Ack,
+    Targets(Vec<TargetInfo>),
+    Targeted(TargetReply),
     AgentSnapshot(AgentSnapshot),
     Snapshot(DebugSnapshot),
     Metrics(RendererMetrics),
@@ -405,6 +416,10 @@ pub struct WindowComposition {
 #[allow(clippy::large_enum_variant)] // wire shape is public; boxing would break consumers
 #[non_exhaustive]
 pub enum DebugEvent {
+    DiagnosticLoss {
+        stream: DebugStream,
+        lost: u64,
+    },
     Snapshot(DebugSnapshot),
     Metrics(RendererMetrics),
     Console(ConsoleEntry),
@@ -1113,13 +1128,13 @@ pub fn encode_tools_list_response(
     let mut tools = vec![serde_json::json!({
         "name": AGENT_CONTROL_TOOL,
         "description": "Inspect and operate the native Blitz semantic UI tree",
-        "inputSchema": schema_for::<AgentControlRequest>()?
+        "inputSchema": schema_for::<TargetEnvelope<AgentControlRequest>>()?
     })];
     if include_diagnostics {
         tools.push(serde_json::json!({
             "name": DIAGNOSTICS_TOOL,
             "description": "Observe Blitz DOM, layout, errors, and renderer metrics",
-            "inputSchema": schema_for::<DiagnosticsRequest>()?
+            "inputSchema": schema_for::<TargetEnvelope<DiagnosticsRequest>>()?
         }));
     }
     encode_rpc(JsonRpcMessage::Response(JsonRpcResponse::result(
@@ -1163,10 +1178,16 @@ pub fn encode_response(
     response: &DebugResponse,
 ) -> Result<WireMessage, DebugProtocolError> {
     #[derive(Serialize)]
+    #[serde(untagged)]
+    enum Payload<'a> {
+        Targeted(&'a TargetReply),
+        Plain(&'a DebugResponse),
+    }
+    #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct BorrowedToolCallResult<'a> {
         content: [TextContent; 1],
-        structured_content: &'a DebugResponse,
+        structured_content: Payload<'a>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     }
@@ -1191,8 +1212,11 @@ pub fn encode_response(
                 // MCP content concise and send the snapshot exactly once.
                 text: response_summary(response),
             }],
-            structured_content: response,
-            is_error: matches!(response, DebugResponse::Error(_)),
+            structured_content: match response {
+                DebugResponse::Targeted(reply) => Payload::Targeted(reply),
+                other => Payload::Plain(other),
+            },
+            is_error: matches!(response.unscoped(), DebugResponse::Error(_)),
         },
     })?);
     if matches!(&message, WireMessage::Text(text) if text.len() > MAX_DEBUG_FRAME_BYTES) {
@@ -1207,6 +1231,8 @@ pub fn encode_response(
 fn response_summary(response: &DebugResponse) -> String {
     match response {
         DebugResponse::Ack => "ok".into(),
+        DebugResponse::Targets(targets) => format!("{} inspection targets", targets.len()),
+        DebugResponse::Targeted(reply) => response_summary(&reply.response),
         DebugResponse::AgentSnapshot(snapshot) => {
             format!("semantic snapshot with {} nodes", snapshot.nodes.len())
         }
@@ -1253,7 +1279,12 @@ pub fn decode_response_value(
             .result
             .ok_or(DebugProtocolError::UnexpectedMessage)?,
     )?;
-    Ok((id, serde_json::from_value(result.structured_content)?))
+    let response = if result.structured_content.get("context").is_some() {
+        DebugResponse::Targeted(serde_json::from_value(result.structured_content)?)
+    } else {
+        serde_json::from_value(result.structured_content)?
+    };
+    Ok((id, response))
 }
 
 pub fn encode_agent_event(event: &AgentControlEvent) -> Result<WireMessage, DebugProtocolError> {
@@ -1266,6 +1297,29 @@ pub fn decode_agent_event(message: WireMessage) -> Result<AgentControlEvent, Deb
 
 pub fn encode_diagnostics_event(event: &DebugEvent) -> Result<WireMessage, DebugProtocolError> {
     encode_notification(DIAGNOSTICS_EVENT_NOTIFICATION, event)
+}
+
+pub fn encode_target_event(event: &DiagnosticRecord) -> Result<WireMessage, DebugProtocolError> {
+    let frame = encode_notification(DIAGNOSTICS_EVENT_NOTIFICATION, event)?;
+    match &frame {
+        WireMessage::Text(text) if text.len() > MAX_DEBUG_FRAME_BYTES => {
+            Err(DebugProtocolError::PayloadTooLarge(text.len()))
+        }
+        _ => Ok(frame),
+    }
+}
+
+pub fn encode_diagnostic_overflow(
+    first: u64,
+    last: u64,
+) -> Result<WireMessage, DebugProtocolError> {
+    encode_notification(
+        DIAGNOSTICS_EVENT_NOTIFICATION,
+        &serde_json::json!({
+            "event": "diagnosticOverflow",
+            "value": {"code": "diagnosticOverflow", "firstSequence": first, "lastSequence": last}
+        }),
+    )
 }
 
 pub fn decode_diagnostics_event(message: WireMessage) -> Result<DebugEvent, DebugProtocolError> {
@@ -1327,15 +1381,52 @@ fn decode_incoming_tool_call(
             "missing tools/call params",
         ))
     })?)?;
+    let targeted = [
+        "target",
+        "expectedGeneration",
+        "expectedDocumentId",
+        "allTargets",
+        "afterSequence",
+    ]
+    .iter()
+    .any(|key| params.arguments.get(*key).is_some());
     match params.name.as_str() {
-        AGENT_CONTROL_TOOL => Ok(IncomingRequest::Agent {
-            id,
-            request: serde_json::from_value(params.arguments)?,
-        }),
-        DIAGNOSTICS_TOOL => Ok(IncomingRequest::Diagnostics {
-            id,
-            request: serde_json::from_value(params.arguments)?,
-        }),
+        AGENT_CONTROL_TOOL => {
+            let envelope: TargetEnvelope<AgentControlRequest> =
+                serde_json::from_value(params.arguments)?;
+            if targeted || matches!(envelope.request, AgentControlRequest::ListTargets) {
+                Ok(IncomingRequest::Targeted {
+                    id,
+                    request: TargetRequest {
+                        options: envelope.options,
+                        command: TargetCommand::Agent(envelope.request),
+                    },
+                })
+            } else {
+                Ok(IncomingRequest::Agent {
+                    id,
+                    request: envelope.request,
+                })
+            }
+        }
+        DIAGNOSTICS_TOOL => {
+            let envelope: TargetEnvelope<DiagnosticsRequest> =
+                serde_json::from_value(params.arguments)?;
+            if targeted {
+                Ok(IncomingRequest::Targeted {
+                    id,
+                    request: TargetRequest {
+                        options: envelope.options,
+                        command: TargetCommand::Diagnostics(envelope.request),
+                    },
+                })
+            } else {
+                Ok(IncomingRequest::Diagnostics {
+                    id,
+                    request: envelope.request,
+                })
+            }
+        }
         _ => Err(DebugProtocolError::UnexpectedTool(params.name)),
     }
 }

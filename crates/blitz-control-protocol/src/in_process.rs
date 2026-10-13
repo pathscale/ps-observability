@@ -146,7 +146,8 @@ impl DocumentControl {
                     ),
                 }
             }
-            AgentControlRequest::Navigate { .. }
+            AgentControlRequest::ListTargets
+            | AgentControlRequest::Navigate { .. }
             | AgentControlRequest::Relaunch
             | AgentControlRequest::Quit => control_error(
                 "unsupportedRequest",
