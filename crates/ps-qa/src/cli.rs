@@ -386,6 +386,25 @@ pub enum Command {
     /// Inspect page-owned WebGPU devices, resources, errors and frames as TOON.
     Gpu,
 
+    /// Read one labeled page-owned GPUBuffer as indexed TOON values.
+    #[command(name = "gpu-buffer")]
+    GpuBuffer {
+        /// GPUBuffer label, with * matching any run of characters.
+        label: String,
+        /// Byte offset, a multiple of four.
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        /// Byte length, a multiple of four. Omit to read to the end.
+        #[arg(long)]
+        length: Option<u64>,
+        /// Little-endian element interpretation.
+        #[arg(long = "as", value_enum, default_value = "u32")]
+        r#as: crate::gpu_buffer::Format,
+        /// Elements per TOON row, for example four for vec4.
+        #[arg(long, default_value_t = 1)]
+        stride: usize,
+    },
+
     /// Copy one page WebGPU texture or canvas and report its visible ink the
     /// same way `capture` reports a document render.
     ///

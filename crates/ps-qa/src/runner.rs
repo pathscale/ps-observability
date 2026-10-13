@@ -46,7 +46,7 @@ use crate::target::{
     painted_named, resolved_action_target, selector_matches_node, viewport_of,
 };
 use crate::timing::{check_timeout, sleep_pace};
-use crate::{app, audit, cli, inspector, paint_audit, plan, qa, reach, report, sweep};
+use crate::{app, audit, cli, gpu_buffer, inspector, paint_audit, plan, qa, reach, report, sweep};
 
 /// Wait only for the destination a navigation check declared.
 ///
@@ -6966,6 +6966,22 @@ pub async fn run() -> Result<()> {
                 "{}",
                 toon_format::encode_default(&report).map_err(|error| eyre!(error.to_string()))?
             );
+        }
+        cli::Command::GpuBuffer {
+            label,
+            offset,
+            length,
+            r#as,
+            stride,
+        } => {
+            if stride == 0 {
+                bail!("GPUBuffer stride must be at least 1");
+            }
+            client.set_request_timeout(cli::request_timeout());
+            let sample = gpu_buffer::read(&mut client, &format!("buffer:{label}"), offset, length)
+                .await?
+                .ok_or_else(|| eyre!("GPUBuffer {label:?} is pending: no completed write yet"))?;
+            sample.print(r#as, stride)?;
         }
         cli::Command::Eval { script } => {
             match client

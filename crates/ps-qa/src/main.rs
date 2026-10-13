@@ -6,6 +6,7 @@ mod capture_analysis;
 mod cli;
 mod computed_style;
 mod diagnostics;
+mod gpu_buffer;
 mod inspector;
 mod interaction;
 mod layout_report;
