@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blitz_control_protocol::{
@@ -2538,6 +2539,10 @@ async fn run_qa_inner(
                 | qa::Expect::GpuHasResource
                 | qa::Expect::GpuDraws(_)
                 | qa::Expect::GpuTextureInk
+                | qa::Expect::GpuBufferRange { .. }
+                | qa::Expect::GpuBufferEquals { .. }
+                | qa::Expect::GpuBufferAtLeast { .. }
+                | qa::Expect::GpuBufferChanges { .. }
         );
         let drives_action = check.click.is_some()
             || check.text.is_some()
@@ -2701,6 +2706,10 @@ async fn run_qa_inner(
         if action_error.is_none() && gpu_expectation(check.expect) {
             pixel_outcome =
                 Some(wait_for_gpu(client, check, check_started.unwrap_or_else(Instant::now)).await);
+        } else if action_error.is_none() && check.expect.gpu_buffer_span().is_some() {
+            pixel_outcome = Some(
+                wait_for_gpu_buffer(client, check, check_started.unwrap_or_else(Instant::now)).await,
+            );
         } else if action_error.is_none() && check.expect == qa::Expect::GpuTextureInk {
             pixel_outcome = Some(
                 wait_for_gpu_texture_ink(
@@ -3274,6 +3283,95 @@ async fn wait_for_gpu(
                     stable_for.as_millis(),
                 ))
             });
+        }
+        nagoya::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(25)),
+        )
+        .await;
+    }
+}
+
+async fn wait_for_gpu_buffer(
+    client: &mut Client,
+    check: &qa::Check,
+    started: Instant,
+) -> std::result::Result<(), String> {
+    let (offset, length) = check
+        .expect
+        .gpu_buffer_span()
+        .ok_or_else(|| "not a GPUBuffer expectation".to_owned())?;
+    let deadline = started + declared_outcome_timeout(check);
+    let stable_for = Duration::from_millis(check.stable_for_ms);
+    let mut passing_since = None;
+    let mut baseline: Option<Arc<gpu_buffer::Sample>> = None;
+    let mut last_failure = format!("GPUBuffer {:?} has no completed sample", check.subject);
+    loop {
+        if let Err(error) = outcome_deadline_passed(deadline) {
+            return Err(format!("{last_failure}; {error}"));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "{last_failure}; OutcomeTimeout: GPUBuffer outcome deadline passed"
+            ));
+        }
+        let previous_timeout = client.request_timeout();
+        client.set_request_timeout(previous_timeout.min(remaining));
+        let sample = gpu_buffer::read(client, &check.subject, offset, Some(length)).await;
+        client.set_request_timeout(previous_timeout);
+        let verdict = match sample.map_err(|error| error.to_string())? {
+            None => Err(format!(
+                "GPUBuffer {:?} is pending: no completed write yet",
+                check.subject
+            )),
+            Some(sample) => match check.expect {
+                qa::Expect::GpuBufferRange {
+                    r#as,
+                    min,
+                    max,
+                    allow_non_finite,
+                    ..
+                } => sample.range(r#as, min, max, allow_non_finite),
+                qa::Expect::GpuBufferEquals { r#as, value, .. } => sample.equals(r#as, value),
+                qa::Expect::GpuBufferAtLeast { r#as, value, .. } => sample.at_least(r#as, value),
+                qa::Expect::GpuBufferChanges { .. } => {
+                    if baseline.as_ref().is_none_or(|before| before.submit == 0) {
+                        baseline = Some(Arc::clone(&sample));
+                        sample.changes(&sample)
+                    } else {
+                        sample.changes(baseline.as_ref().expect("baseline checked above"))
+                    }
+                }
+                _ => Err("not a GPUBuffer expectation".to_owned()),
+            },
+        };
+        let now = Instant::now();
+        if now > deadline {
+            return Err(format!(
+                "{}; OutcomeTimeout: GPUBuffer outcome deadline passed",
+                verdict
+                    .err()
+                    .unwrap_or_else(|| "GPUBuffer sample arrived after its deadline".to_owned())
+            ));
+        }
+        match verdict {
+            Ok(()) => {
+                let since = passing_since.get_or_insert(now);
+                if now.duration_since(*since) >= stable_for {
+                    return Ok(());
+                }
+                last_failure = format!(
+                    "GPUBuffer {:?} outcome did not remain complete for {}ms",
+                    check.subject,
+                    stable_for.as_millis()
+                );
+            }
+            Err(error) => {
+                passing_since = None;
+                last_failure = error;
+            }
         }
         nagoya::sleep(
             deadline

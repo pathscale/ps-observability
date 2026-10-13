@@ -80,7 +80,7 @@ impl Hover {
 /// unconstructed the moment one check was strengthened to `PaintsMore`; it is
 /// still the correct assertion for anything that mounts without painting.
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Expect {
     /// No uncaptured or validation WebGPU error has occurred since page load.
     ///
@@ -117,6 +117,43 @@ pub enum Expect {
     /// luminance differs from the modal background by more than 24 and its
     /// alpha is at least 32. A blank readback fails.
     GpuTextureInk,
+    /// Every typed element in the byte range is inside the inclusive bounds.
+    ///
+    /// Subject: buffer:<label>, with the same * matching as GpuHasResource.
+    /// NaN and infinity fail unless allow_non_finite explicitly permits them;
+    /// permitted non-finite elements are skipped when judging the bounds.
+    GpuBufferRange {
+        offset: u64,
+        length: u64,
+        r#as: crate::gpu_buffer::Format,
+        min: f64,
+        max: f64,
+        #[serde(default)]
+        allow_non_finite: bool,
+    },
+    /// One typed element at the byte offset equals value. Non-finite f32 fails.
+    ///
+    /// Subject: buffer:<label>. For u8 the aligned read fetches four bytes and
+    /// judges the first byte. f32 values are compared in f32 representation.
+    GpuBufferEquals {
+        offset: u64,
+        r#as: crate::gpu_buffer::Format,
+        value: f64,
+    },
+    /// One typed element at the byte offset is at least value.
+    ///
+    /// Subject: buffer:<label>. Non-finite f32 fails, including positive infinity.
+    GpuBufferAtLeast {
+        offset: u64,
+        r#as: crate::gpu_buffer::Format,
+        value: f64,
+    },
+    /// Two snapshots in the outcome window differ in bytes and submit serial.
+    ///
+    /// Subject: buffer:<label>. Both serials must name completed submits;
+    /// zero and repeated serials cannot prove a new GPU write. This assertion
+    /// compares raw bytes without interpreting them as a numeric type.
+    GpuBufferChanges { offset: u64, length: u64 },
     /// The named node exists, is visible, and has a non-zero box.
     ///
     /// Non-zero is the part that matters. A node with a box of `0x0` is in the
@@ -389,6 +426,20 @@ pub enum Expect {
     /// Following the node id prevents an unrelated new status row from
     /// satisfying the outcome.
     NameChanges,
+}
+
+impl Expect {
+    /// The byte range to ask the host for, including four-byte scalar reads.
+    pub fn gpu_buffer_span(self) -> Option<(u64, u64)> {
+        match self {
+            Self::GpuBufferRange { offset, length, .. }
+            | Self::GpuBufferChanges { offset, length } => Some((offset, length)),
+            Self::GpuBufferEquals { offset, .. } | Self::GpuBufferAtLeast { offset, .. } => {
+                Some((offset, 4))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A pointer gesture starting at a named control's painted center.
@@ -1136,6 +1187,33 @@ fn validate_check(
         ));
     }
 
+    if let Some((offset, length)) = check.expect.gpu_buffer_span() {
+        let validate = || -> Result<(), String> {
+            crate::gpu_buffer::validate_target(&check.subject)?;
+            crate::gpu_buffer::validate_span(offset, Some(length))?;
+            if length == 0 {
+                return Err("GPUBuffer checks require a nonempty byte range".to_owned());
+            }
+            match check.expect {
+                Expect::GpuBufferRange { r#as, min, max, .. } => {
+                    r#as.bound(min)?;
+                    r#as.bound(max)?;
+                    if min > max {
+                        return Err("GPUBuffer min must not exceed max".to_owned());
+                    }
+                }
+                Expect::GpuBufferEquals { r#as, value, .. }
+                | Expect::GpuBufferAtLeast { r#as, value, .. } => {
+                    r#as.scalar(value)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+        validate()
+            .map_err(|message| format!("{}: check {:?}: {message}", file.display(), check.id))?;
+    }
+
     if check.expect == Expect::GpuHasResource
         && !check.subject.split_once(':').is_some_and(|(kind, _)| {
             matches!(
@@ -1784,7 +1862,11 @@ pub fn verdict(
         Expect::GpuNoErrors
         | Expect::GpuHasResource
         | Expect::GpuDraws(_)
-        | Expect::GpuTextureInk => {
+        | Expect::GpuTextureInk
+        | Expect::GpuBufferRange { .. }
+        | Expect::GpuBufferEquals { .. }
+        | Expect::GpuBufferAtLeast { .. }
+        | Expect::GpuBufferChanges { .. } => {
             return Err("GPU expectations must be resolved by the live QA runner".to_owned());
         }
         Expect::PixelsHold
