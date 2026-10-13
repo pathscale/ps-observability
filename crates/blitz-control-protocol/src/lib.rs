@@ -245,6 +245,19 @@ pub enum DiagnosticsRequest {
     WebGpuCapture {
         target: String,
     },
+    /// Read bytes from one labeled page-owned GPUBuffer.
+    ///
+    /// The target is buffer:<label>, with * matching any run of characters.
+    /// Zero or multiple matches are errors naming the label or matching labels.
+    /// Offset and length are bytes and must be multiples of four. An absent
+    /// length reads to the end. Hosts return the previous completed write
+    /// while a newer submit is pending, or error code pending when no
+    /// completed write is available. They do not wait for that newer submit.
+    WebGpuBuffer {
+        target: String,
+        offset: u64,
+        length: Option<u64>,
+    },
     /// Run a script in the page and return its completion value as JSON.
     ///
     /// The same evaluation a page console offers, so an agent driving a
@@ -359,6 +372,7 @@ pub enum DebugResponse {
     WindowComposition(WindowComposition),
     Captured(CapturedImage),
     WebGpu(WebGpuReport),
+    WebGpuBuffer(WebGpuBufferSnapshot),
     /// One condensation level over the settled page, level-shaped so a caller
     /// asking for keywords is not handed the page's full text.
     Condensation(condense::Condensation),
@@ -1207,6 +1221,12 @@ fn response_summary(response: &DebugResponse) -> String {
             format!("condensed page, {} level", condensation.level_name())
         }
         DebugResponse::WebGpu(_) => "WebGPU report".into(),
+        DebugResponse::WebGpuBuffer(snapshot) => {
+            format!(
+                "WebGPU buffer {:?} at submit {}",
+                snapshot.label, snapshot.submit
+            )
+        }
         DebugResponse::Evaluated(_) => "evaluated script".into(),
         DebugResponse::Error(error) => error.message.clone(),
     }

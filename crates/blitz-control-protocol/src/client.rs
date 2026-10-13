@@ -367,6 +367,16 @@ pub fn is_unsupported(error: &eyre::Report) -> bool {
         .is_some_and(|refusal| refusal.code == "unsupported")
 }
 
+/// Whether a host has no completed GPUBuffer write available yet.
+///
+/// This is an incomplete diagnostic sample, so a caller can retry within its
+/// outcome deadline. Other host refusals and transport errors stay failures.
+pub fn is_pending(error: &eyre::Report) -> bool {
+    error
+        .downcast_ref::<InspectorResponseError>()
+        .is_some_and(|refusal| refusal.code == "pending")
+}
+
 /// Return a bounded response category without exposing the inspector message.
 pub fn safe_response_code(error: &eyre::Report) -> Option<&'static str> {
     let code = error

@@ -196,3 +196,25 @@ pub struct WebGpuDepthTarget {
     pub stencil_load_op: Option<String>,
     pub stencil_store_op: Option<String>,
 }
+
+/// Bytes from the newest completed write of a labeled page-owned GPUBuffer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WebGpuBufferSnapshot {
+    /// The matched GPUBuffer label, including any subsequent label changes.
+    pub label: String,
+    /// Whole buffer size in bytes.
+    pub size: u64,
+    /// Page-declared GPUBufferUsage bits before the host adds COPY_SRC.
+    pub usage: u32,
+    /// Byte offset of the returned range.
+    pub offset: u64,
+    /// Newest completed queue submit that wrote this buffer. Zero means no
+    /// submit has written it, for example a mappedAtCreation-only buffer.
+    pub submit: u64,
+    /// Whether the last write came from queue.writeBuffer rather than a pass
+    /// or GPU copy.
+    pub written_by_write_buffer: bool,
+    /// Bytes in the requested range, encoded like CapturedImage.rgba_base64.
+    pub data_base64: String,
+}
