@@ -264,7 +264,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 fn safe_path(path: &Path, secrets: &[Secret]) -> String {
     let mut displayed = path.to_string_lossy().into_owned();
     let mut forms: Vec<Vec<u8>> = secrets.iter().flat_map(Secret::forms).collect();
-    forms.sort_by(|left, right| right.len().cmp(&left.len()));
+    forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
     for form in forms {
         if let Ok(form) = std::str::from_utf8(&form)
             && !form.is_empty()
