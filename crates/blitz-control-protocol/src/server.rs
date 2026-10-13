@@ -756,9 +756,8 @@ fn contains_secret_environment_value(content: &str) -> bool {
         if content.contains(value) {
             return true;
         }
-        serde_json::to_string(value).is_ok_and(|quoted| {
-            quoted.len() > 2 && content.contains(&quoted[1..quoted.len() - 1])
-        })
+        serde_json::to_string(value)
+            .is_ok_and(|quoted| quoted.len() > 2 && content.contains(&quoted[1..quoted.len() - 1]))
     })
 }
 
