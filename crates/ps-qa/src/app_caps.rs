@@ -80,20 +80,20 @@ pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
             .strip_prefix("--max-")
             .map(|s| (s, false))
             .or_else(|| flag.strip_prefix("--warn-").map(|s| (s, true)));
-        if let Some((name, warning)) = cap {
-            if let Some(index) = NAMES.iter().position(|n| *n == name) {
-                let value = inline.map(str::to_owned).unwrap_or_else(|| {
-                    raw.next()
-                        .and_then(|s| s.into_string().ok())
-                        .unwrap_or_else(|| fail(format!("CAP_BAD_PARAMETER flag={flag}")))
-                });
-                if warning {
-                    supplied[index] = Some(number(&value));
-                } else {
-                    hard[index] = number(&value);
-                }
-                continue;
+        if let Some((name, warning)) = cap
+            && let Some(index) = NAMES.iter().position(|n| *n == name)
+        {
+            let value = inline.map(str::to_owned).unwrap_or_else(|| {
+                raw.next()
+                    .and_then(|s| s.into_string().ok())
+                    .unwrap_or_else(|| fail(format!("CAP_BAD_PARAMETER flag={flag}")))
+            });
+            if warning {
+                supplied[index] = Some(number(&value));
+            } else {
+                hard[index] = number(&value);
             }
+            continue;
         }
         args.push(arg);
     }
@@ -179,17 +179,8 @@ extern "C" fn cpu_stop(_: libc::c_int) {
 pub fn current() -> &'static Arc<Caps> {
     STATE.get().unwrap_or_else(|| fail("CAP_NOT_STARTED"))
 }
-pub fn args_os() -> std::vec::IntoIter<OsString> {
-    current().args.to_vec().into_iter()
-}
-pub fn args() -> std::vec::IntoIter<String> {
-    args_os()
-        .map(|s| {
-            s.into_string()
-                .unwrap_or_else(|_| fail("CAP_NON_UTF8_ARGUMENT"))
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
+pub fn args_os() -> impl Iterator<Item = OsString> {
+    current().args.iter().cloned()
 }
 pub fn stage(value: impl Into<Arc<str>>) {
     *current()
@@ -357,15 +348,6 @@ pub fn read_bytes(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
 pub fn read_string(path: impl AsRef<Path>) -> std::io::Result<String> {
     String::from_utf8(read_bytes(path)?)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-pub fn read_stdin() -> std::io::Result<String> {
-    stage("read stdin");
-    let mut bytes = Vec::new();
-    std::io::stdin()
-        .take(hard("input-bytes") + 1)
-        .read_to_end(&mut bytes)?;
-    check("input-bytes", bytes.len() as u64);
-    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 pub fn turn(value: impl Into<Arc<str>>) {

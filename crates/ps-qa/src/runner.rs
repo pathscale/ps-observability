@@ -982,7 +982,7 @@ async fn wait_for_pixels_change(
     event_driven: bool,
 ) -> std::result::Result<(), String> {
     let mut last_image = None;
-    let result = async {
+    async {
         loop {
             let after = match crate::outcome::read(client, deadline, async |client| {
                 capture_node_sample(client, node_id, selector).await
@@ -1029,8 +1029,7 @@ async fn wait_for_pixels_change(
             }
         }
     }
-    .await;
-    result
+    .await
 }
 
 /// Decide one capture in the bounded pixel-change wait.
@@ -2343,8 +2342,7 @@ async fn run_qa_inner(
                     )
                     .await
                     .map_err(|error| format!("after hover: {error}"))?;
-                    let comparison = rgb_pixels_hold(&before, &after);
-                    comparison
+                    rgb_pixels_hold(&before, &after)
                 }
                 .await;
                 pixel_outcome = Some(measured);
