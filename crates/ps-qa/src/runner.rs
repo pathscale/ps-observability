@@ -6992,7 +6992,10 @@ async fn run_plan(
 
 pub async fn run() -> Result<()> {
     let cli = <cli::Cli as clap::Parser>::parse_from(crate::app_caps::args_os());
-    crate::app_caps::stage(std::sync::Arc::<str>::from(format!("ps-qa {:?}", cli.command)));
+    crate::app_caps::stage(std::sync::Arc::<str>::from(format!(
+        "ps-qa {:?}",
+        cli.command
+    )));
     cli::set_trace(cli.trace);
     cli::set_headless(cli.headless);
     cli::set_pace(cli.pace);
