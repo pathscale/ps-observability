@@ -261,20 +261,37 @@ async fn wait_for_semantic_condition(
     mut matches: impl FnMut(&[SemanticNode]) -> bool,
 ) -> Result<AgentSnapshot> {
     let deadline = std::time::Instant::now() + within;
-    let event_driven = client.arm_paint_events().await.unwrap_or(false);
+    let event_driven = crate::outcome::read(client, deadline, Client::arm_paint_events)
+        .await
+        .unwrap_or(false);
+    let mut last_snapshot = None;
     loop {
-        let snapshot = inspect(client).await?.0;
-        if matches(&snapshot.nodes) || std::time::Instant::now() >= deadline {
+        let snapshot = match crate::outcome::read(client, deadline, inspect).await {
+            Ok((snapshot, _)) => snapshot,
+            Err(error) => {
+                if crate::outcome::is_timeout(client, &error)
+                    && let Some(snapshot) = last_snapshot
+                {
+                    return Ok(snapshot);
+                }
+                return Err(error);
+            }
+        };
+        if matches(&snapshot.nodes) || crate::outcome::budget(deadline).is_err() {
             return Ok(snapshot);
         }
         if event_driven {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if !remaining.is_zero() {
-                let _ = client.wait_for_paint(remaining).await?;
+            if let Err(error) = client.wait_for_paint(remaining).await {
+                if crate::outcome::is_timeout(client, &error) {
+                    return Ok(snapshot);
+                }
+                return Err(error);
             }
         } else {
             nagoya::sleep(Duration::from_millis(25)).await;
         }
+        last_snapshot = Some(snapshot);
     }
 }
 
@@ -843,6 +860,16 @@ async fn capture_node_region(
     // capture merely because shaping/rasterising its first frame is slower.
     let previous_timeout = client.request_timeout();
     client.set_request_timeout(cli::request_timeout());
+    let image = capture_node_sample(client, node_id, selector).await;
+    client.set_request_timeout(previous_timeout);
+    image.map_err(|error| format!("could not capture {selector:?}: {error}"))
+}
+
+async fn capture_node_sample(
+    client: &mut Client,
+    node_id: u64,
+    selector: &str,
+) -> Result<CapturedImage> {
     let started = std::time::Instant::now();
     let answer = client
         .diagnostics(&DiagnosticsRequest::Capture(CaptureRequest {
@@ -850,14 +877,12 @@ async fn capture_node_region(
             scale: 1.0,
         }))
         .await;
-    client.set_request_timeout(previous_timeout);
     if cli::trace_capture() {
         eprintln!("capture {selector:?}: request took {:?}", started.elapsed());
     }
-    let answer = answer.map_err(|error| format!("could not capture {selector:?}: {error}"))?;
-    match answer.response {
+    match answer?.response {
         DebugResponse::Captured(image) => Ok(image),
-        other => Err(format!("asked for a rendered frame, got {other:?}")),
+        other => bail!("asked for a rendered frame, got {other:?}"),
     }
 }
 
@@ -884,10 +909,26 @@ async fn capture_stable_region(
     // deadline made an unchanged frame fail before four samples existed.
     let mut deadline = std::time::Instant::now() + settle_timeout;
     let mut matching = 1;
+    let mut last_failure = format!(
+        "rendered region {selector:?} did not settle within {}ms",
+        settle_timeout.as_millis()
+    );
     loop {
         nagoya::sleep(Duration::from_millis(16)).await;
+        if crate::outcome::budget(deadline).is_err() {
+            return Err(last_failure);
+        }
         let capture_started = std::time::Instant::now();
-        let current = capture_node_region(client, node_id, selector).await?;
+        let current = match capture_node_region(client, node_id, selector).await {
+            Ok(current) => current,
+            Err(error) => {
+                return Err(crate::outcome::failure(
+                    client,
+                    Some(last_failure),
+                    eyre!(error),
+                ));
+            }
+        };
         deadline += std::time::Instant::now().duration_since(capture_started);
         let held =
             captured_pixels_hold(&previous, &current, CAPTURE_CHANNEL_TOLERANCE).unwrap_or(false);
@@ -908,23 +949,24 @@ async fn capture_stable_region(
         } else {
             matching = 1;
         }
-        if std::time::Instant::now() >= deadline {
-            let detail = if previous.width != current.width || previous.height != current.height {
-                format!(
-                    "; last frame changed size from {}x{} to {}x{}",
-                    previous.width, previous.height, current.width, current.height
-                )
-            } else {
-                captured_pixel_delta(&previous, &current)
-                    .map(|(pixels, max)| {
-                        format!("; last frame changed {pixels} pixel(s), max channel delta {max}")
-                    })
-                    .unwrap_or_else(|error| format!("; {error}"))
-            };
-            return Err(format!(
-                "rendered region {selector:?} did not settle within {}ms{detail}",
-                settle_timeout.as_millis()
-            ));
+        let detail = if previous.width != current.width || previous.height != current.height {
+            format!(
+                "; last frame changed size from {}x{} to {}x{}",
+                previous.width, previous.height, current.width, current.height
+            )
+        } else {
+            captured_pixel_delta(&previous, &current)
+                .map(|(pixels, max)| {
+                    format!("; last frame changed {pixels} pixel(s), max channel delta {max}")
+                })
+                .unwrap_or_else(|error| format!("; {error}"))
+        };
+        last_failure = format!(
+            "rendered region {selector:?} did not settle within {}ms{detail}",
+            settle_timeout.as_millis()
+        );
+        if crate::outcome::budget(deadline).is_err() {
+            return Err(last_failure);
         }
         previous = current;
     }
@@ -946,25 +988,64 @@ async fn wait_for_pixels_change(
     before: &CapturedImage,
     deadline: Instant,
     event_driven: bool,
+    artifact_id: &str,
 ) -> std::result::Result<(), String> {
-    loop {
-        let after = capture_node_region(client, node_id, selector).await?;
-        let now = Instant::now();
-        match assess_pixel_change(before, &after, now >= deadline)? {
-            Some(()) => return Ok(()),
-            None => {
-                let remaining = deadline.saturating_duration_since(now);
-                if event_driven {
-                    let _ = client
-                        .wait_for_paint(remaining)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                } else {
-                    nagoya::sleep(remaining.min(Duration::from_millis(25))).await;
+    let mut last_image = None;
+    let result = async {
+        loop {
+            let after = match crate::outcome::read(client, deadline, async |client| {
+                capture_node_sample(client, node_id, selector).await
+            })
+            .await
+            {
+                Ok(after) => after,
+                Err(error) => {
+                    let last_failure = last_image
+                        .as_ref()
+                        .and_then(|image| pixels_change(before, image).err());
+                    return Err(crate::outcome::failure(client, last_failure, error));
                 }
+            };
+            let now = Instant::now();
+            let assessment = assess_pixel_change(before, &after, now >= deadline);
+            last_image = Some(after);
+            match assessment {
+                Ok(Some(())) if now <= deadline => return Ok(()),
+                Ok(Some(())) => {
+                    return Err(format!(
+                        "rendered pixels of {selector:?} changed only after the outcome deadline"
+                    ));
+                }
+                Err(error) => return Err(error),
+                Ok(None) => {}
+            }
+            if crate::outcome::budget(deadline).is_err() {
+                let last_failure = last_image
+                    .as_ref()
+                    .and_then(|image| pixels_change(before, image).err());
+                return Err(crate::outcome::exhausted(last_failure));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            if event_driven {
+                if let Err(error) = client.wait_for_paint(remaining).await {
+                    let last_failure = last_image
+                        .as_ref()
+                        .and_then(|image| pixels_change(before, image).err());
+                    return Err(crate::outcome::failure(client, last_failure, error));
+                }
+            } else {
+                nagoya::sleep(remaining.min(Duration::from_millis(25))).await;
             }
         }
     }
+    .await;
+    if result.is_err()
+        && let Some(after) = last_image.as_ref()
+        && let Err(error) = save_pixel_artifacts(artifact_id, before, after)
+    {
+        eprintln!("could not save pixel artifacts for {artifact_id}: {error}");
+    }
+    result
 }
 
 /// Decide one capture in the bounded pixel-change wait.
@@ -2332,23 +2413,16 @@ async fn run_qa_inner(
                     // compatibility modes, wait for the declared subject's
                     // pixels to change instead of treating that first frame as
                     // the final verdict.
-                    let comparison = wait_for_pixels_change(
+                    wait_for_pixels_change(
                         client,
                         subject_id,
                         &check.subject,
                         &before,
                         Instant::now() + declared_outcome_timeout(check),
                         event_driven,
+                        &check.id,
                     )
-                    .await;
-                    if comparison.is_err()
-                        && let Ok(after) =
-                            capture_node_region(client, subject_id, &check.subject).await
-                        && let Err(error) = save_pixel_artifacts(&check.id, &before, &after)
-                    {
-                        eprintln!("could not save pixel artifacts for {}: {error}", check.id);
-                    }
-                    comparison
+                    .await
                 }
                 .await;
                 pixel_outcome = Some(measured);
@@ -2753,23 +2827,16 @@ async fn run_qa_inner(
                 Ok((node_id, before_pixels, event_driven)) => {
                     let deadline = check_started.unwrap_or_else(Instant::now)
                         + declared_outcome_timeout(check);
-                    let comparison = wait_for_pixels_change(
+                    wait_for_pixels_change(
                         client,
                         node_id,
                         &check.subject,
                         &before_pixels,
                         deadline,
                         event_driven,
+                        &check.id,
                     )
-                    .await;
-                    if comparison.is_err()
-                        && let Ok(after) =
-                            capture_node_region(client, node_id, &check.subject).await
-                        && let Err(error) = save_pixel_artifacts(&check.id, &before_pixels, &after)
-                    {
-                        eprintln!("could not save pixel artifacts for {}: {error}", check.id);
-                    }
-                    comparison
+                    .await
                 }
                 Err(error) => Err(error),
             });
@@ -2798,8 +2865,15 @@ async fn run_qa_inner(
             ..AgentSnapshot::default()
         };
         let (after, settle_error, settle_iterations) = if live_paint_expect {
-            match inspect(client).await {
+            let deadline = check_started.unwrap_or_else(Instant::now)
+                + declared_outcome_timeout(check);
+            match inspect_before_deadline(client, deadline).await {
                 Ok((snapshot, _)) => (snapshot, None, 0),
+                // The live-paint verdict already owns the completed sample.
+                // An ancillary semantic read must not replace that evidence.
+                Err(error) if crate::outcome::is_timeout(client, &error) => {
+                    (fallback_after(), None, 0)
+                }
                 Err(error) => (
                     fallback_after(),
                     Some(format!("could not inspect after the action: {error}")),
@@ -3258,31 +3332,36 @@ async fn wait_for_gpu(
     let deadline = started + declared_outcome_timeout(check);
     let stable_for = Duration::from_millis(check.stable_for_ms);
     let mut passing_since = None;
+    let mut last_failure = None;
     loop {
-        let report = gpu_report(client)
-            .await
-            .map_err(|error| error.to_string())?;
+        let report = match crate::outcome::read(client, deadline, gpu_report).await {
+            Ok(report) => report,
+            Err(error) => return Err(crate::outcome::failure(client, last_failure, error)),
+        };
         let verdict = gpu_verdict(check, &report);
         let now = Instant::now();
-        if verdict.is_ok() {
-            let since = passing_since.get_or_insert(now);
-            if now.duration_since(*since) >= stable_for {
-                return Ok(());
+        match verdict {
+            Ok(()) => {
+                let since = passing_since.get_or_insert(now);
+                if now <= deadline && now.duration_since(*since) >= stable_for {
+                    return Ok(());
+                }
+                last_failure = Some(format!(
+                    "GPU outcome did not remain complete for {}ms within the outcome window",
+                    stable_for.as_millis(),
+                ));
             }
-        } else {
-            passing_since = None;
-            // Cumulative errors cannot disappear without a new page load.
-            if check.expect == qa::Expect::GpuNoErrors {
-                return verdict;
+            Err(error) => {
+                passing_since = None;
+                // Cumulative errors cannot disappear without a new page load.
+                if check.expect == qa::Expect::GpuNoErrors {
+                    return Err(error);
+                }
+                last_failure = Some(error);
             }
         }
-        if now >= deadline {
-            return verdict.and_then(|()| {
-                Err(format!(
-                    "GPU outcome did not remain complete for {}ms",
-                    stable_for.as_millis(),
-                ))
-            });
+        if crate::outcome::budget(deadline).is_err() {
+            return Err(crate::outcome::exhausted(last_failure));
         }
         nagoya::sleep(
             deadline
@@ -3306,34 +3385,17 @@ async fn wait_for_gpu_buffer(
     let stable_for = Duration::from_millis(check.stable_for_ms);
     let mut passing_since = None;
     let mut baseline: Option<Arc<gpu_buffer::Sample>> = None;
-    let mut last_failure = format!("GPUBuffer {:?} has no completed sample", check.subject);
+    let mut last_failure = None;
     loop {
-        if let Err(error) = outcome_deadline_passed(deadline) {
-            return Err(format!("{last_failure}; {error}"));
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(format!(
-                "{last_failure}; OutcomeTimeout: GPUBuffer outcome deadline passed"
-            ));
-        }
-        let previous_timeout = client.request_timeout();
-        client.set_request_timeout(previous_timeout.min(remaining));
-        let sample = gpu_buffer::read(client, &check.subject, offset, Some(length)).await;
-        client.set_request_timeout(previous_timeout);
-        let sample = match sample {
-            Err(error)
-                if Instant::now() >= deadline
-                    && error
-                        .downcast_ref::<inspector::InspectorRequestTimeout>()
-                        .is_some() =>
-            {
-                return Err(format!(
-                    "{last_failure}; OutcomeTimeout: GPUBuffer outcome deadline passed; {error}"
-                ));
-            }
-            result => result.map_err(|error| error.to_string())?,
+        let sample = match crate::outcome::read(client, deadline, async |client| {
+            gpu_buffer::read(client, &check.subject, offset, Some(length)).await
+        })
+        .await
+        {
+            Ok(sample) => sample,
+            Err(error) => return Err(crate::outcome::failure(client, last_failure, error)),
         };
+        let completed = sample.is_some();
         let verdict = match sample {
             None => Err(format!(
                 "GPUBuffer {:?} is pending: no completed write yet",
@@ -3361,30 +3423,27 @@ async fn wait_for_gpu_buffer(
             },
         };
         let now = Instant::now();
-        if now > deadline {
-            return Err(format!(
-                "{}; OutcomeTimeout: GPUBuffer outcome deadline passed",
-                verdict
-                    .err()
-                    .unwrap_or_else(|| "GPUBuffer sample arrived after its deadline".to_owned())
-            ));
-        }
         match verdict {
             Ok(()) => {
                 let since = passing_since.get_or_insert(now);
-                if now.duration_since(*since) >= stable_for {
+                if now <= deadline && now.duration_since(*since) >= stable_for {
                     return Ok(());
                 }
-                last_failure = format!(
-                    "GPUBuffer {:?} outcome did not remain complete for {}ms",
+                last_failure = Some(format!(
+                    "GPUBuffer {:?} outcome did not remain complete for {}ms within the outcome window",
                     check.subject,
                     stable_for.as_millis()
-                );
+                ));
             }
             Err(error) => {
                 passing_since = None;
-                last_failure = error;
+                if completed {
+                    last_failure = Some(error);
+                }
             }
+        }
+        if crate::outcome::budget(deadline).is_err() {
+            return Err(crate::outcome::exhausted(last_failure));
         }
         nagoya::sleep(
             deadline
@@ -3581,25 +3640,11 @@ fn merge_outcome_snapshot(
 /// three-second check gets a dozen chances to see a change outside its pane.
 const FULL_DOCUMENT_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// An outcome deadline that has already passed is the check's failure, not
-/// the transport's. Issuing the read with the remaining time as its request
-/// timeout would ask for a zero deadline, and a request that times out leaves
-/// the client terminal, so every later check would be reported not run.
-fn outcome_deadline_passed(deadline: Instant) -> Result<()> {
-    if deadline.saturating_duration_since(Instant::now()).is_zero() {
-        return Err(eyre::eyre!(
-            "OutcomeTimeout: the declared outcome deadline passed before the next read"
-        ));
-    }
-    Ok(())
-}
-
 async fn inspect_before_deadline(
     client: &mut Client,
     deadline: Instant,
 ) -> Result<(AgentSnapshot, f64)> {
-    outcome_deadline_passed(deadline)?;
-    inspect(client).await
+    crate::outcome::read(client, deadline, inspect).await
 }
 
 async fn inspect_subtree_before_deadline(
@@ -3607,8 +3652,31 @@ async fn inspect_subtree_before_deadline(
     root: u64,
     deadline: Instant,
 ) -> Result<(AgentSnapshot, f64)> {
-    outcome_deadline_passed(deadline)?;
-    inspect_subtree(client, root).await
+    crate::outcome::read(client, deadline, async |client| {
+        inspect_subtree(client, root).await
+    })
+    .await
+}
+
+fn incomplete_semantic_outcome(
+    check: &qa::Check,
+    after: AgentSnapshot,
+    passing: bool,
+    iterations: u32,
+) -> (AgentSnapshot, Option<String>, u32) {
+    // A failing snapshot is judged by outcome_verdict at the call site.
+    let error = passing.then(|| {
+        if check.stable_for_ms == 0 {
+            "rendered outcome arrived only after the outcome deadline".to_owned()
+        } else {
+            format!(
+                "rendered outcome did not remain complete and unchanged for {}ms within {}ms",
+                check.stable_for_ms,
+                declared_outcome_timeout(check).as_millis()
+            )
+        }
+    });
+    (after, error, iterations)
 }
 
 /// Wait for the declared result, not merely for a tree that already contains
@@ -3628,26 +3696,31 @@ async fn wait_for_contrast(
     let deadline = started + declared_outcome_timeout(check);
     let stable_for = Duration::from_millis(check.stable_for_ms);
     let mut passing_since = None;
+    let mut last_failure = None;
     loop {
-        let verdict = paint_audit::contrast_verdict(client, &check.subject)
-            .await
-            .map_err(|error| error.to_string());
+        let verdict = paint_audit::contrast_verdict(client, &check.subject, deadline).await;
         let now = Instant::now();
-        if verdict.is_ok() {
-            let since = *passing_since.get_or_insert(now);
-            if now.duration_since(since) >= stable_for {
-                return Ok(());
-            }
-        } else {
-            passing_since = None;
-        }
-        if now >= deadline {
-            return verdict.and_then(|()| {
-                Err(format!(
+        match verdict {
+            Ok(()) => {
+                let since = *passing_since.get_or_insert(now);
+                if now <= deadline && now.duration_since(since) >= stable_for {
+                    return Ok(());
+                }
+                last_failure = Some(format!(
                     "contrast did not remain above its floor for {}ms within the outcome window",
                     stable_for.as_millis()
-                ))
-            });
+                ));
+            }
+            Err(error) if crate::outcome::is_timeout(client, &error) || client.is_terminal() => {
+                return Err(crate::outcome::failure(client, last_failure, error));
+            }
+            Err(error) => {
+                passing_since = None;
+                last_failure = Some(error.to_string());
+            }
+        }
+        if crate::outcome::budget(deadline).is_err() {
+            return Err(crate::outcome::exhausted(last_failure));
         }
         let remaining = deadline.saturating_duration_since(now);
         let wait = passing_since.map_or(remaining, |since| {
@@ -3656,10 +3729,9 @@ async fn wait_for_contrast(
                 .min(remaining)
         });
         if event_driven {
-            client
-                .wait_for_paint(wait)
-                .await
-                .map_err(|error| error.to_string())?;
+            if let Err(error) = client.wait_for_paint(wait).await {
+                return Err(crate::outcome::failure(client, last_failure, error));
+            }
         } else {
             nagoya::sleep(wait.min(Duration::from_millis(25))).await;
         }
@@ -3685,31 +3757,60 @@ async fn settle_for_outcome(
     // permanently blind to the rest of the page. See the interval below.
     let mut last_full_probe: Option<std::time::Instant> = None;
     let mut revealed_subject = false;
+    let mut last_snapshot = None;
     // Arming discards the frames already queued, which is right before an
     // action and wrong after one: the commit this loop is waiting for may
     // already have arrived. A caller that armed before driving says so.
     let event_driven = if already_armed {
         true
     } else {
-        client.arm_paint_events().await.unwrap_or(false)
+        crate::outcome::read(client, deadline, Client::arm_paint_events)
+            .await
+            .unwrap_or(false)
     };
     loop {
-        let mut after = if let Some(scoped) = scope.as_ref() {
+        let sample = if let Some(scoped) = scope.as_ref() {
             match inspect_subtree_before_deadline(client, scoped.root, deadline).await {
-                Ok((snapshot, _)) => merge_outcome_snapshot(before, snapshot, &scoped.baseline_ids),
+                Ok((snapshot, _)) => Ok(merge_outcome_snapshot(
+                    before,
+                    snapshot,
+                    &scoped.baseline_ids,
+                )),
+                Err(error)
+                    if crate::outcome::is_timeout(client, &error) || client.is_terminal() =>
+                {
+                    Err(error)
+                }
                 // Reconciliation can replace the pane root. Reacquire from one
                 // full snapshot instead of treating a stale id as failure.
-                Err(_) => {
-                    let full = inspect_before_deadline(client, deadline).await?.0;
-                    scope = outcome_poll_scope(&full.nodes);
-                    full
-                }
+                Err(_) => match inspect_before_deadline(client, deadline).await {
+                    Ok((full, _)) => {
+                        scope = outcome_poll_scope(&full.nodes);
+                        Ok(full)
+                    }
+                    Err(error) => Err(error),
+                },
             }
         } else {
-            inspect_before_deadline(client, deadline).await?.0
+            inspect_before_deadline(client, deadline)
+                .await
+                .map(|(snapshot, _)| snapshot)
+        };
+        let mut after = match sample {
+            Ok(after) => after,
+            Err(error) => {
+                if crate::outcome::is_timeout(client, &error)
+                    && let Some((after, passing)) = last_snapshot
+                {
+                    return Ok(incomplete_semantic_outcome(
+                        check, after, passing, iterations,
+                    ));
+                }
+                return Err(error);
+            }
         };
         iterations += 1;
-        let now = std::time::Instant::now();
+        let mut now = std::time::Instant::now();
         let mut passing = outcome_verdict(
             check,
             before,
@@ -3733,7 +3834,16 @@ async fn settle_for_outcome(
             // polling never saw a control a single fresh snapshot found at
             // once. Between probes the stability samples stay scoped, which is
             // what keeps this from serialising the document every turn.
-            after = inspect_before_deadline(client, deadline).await?.0;
+            after = match inspect_before_deadline(client, deadline).await {
+                Ok((full, _)) => full,
+                Err(error) if crate::outcome::is_timeout(client, &error) => {
+                    return Ok(incomplete_semantic_outcome(
+                        check, after, passing, iterations,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            now = std::time::Instant::now();
             last_full_probe = Some(now);
             passing = outcome_verdict(
                 check,
@@ -3776,26 +3886,37 @@ async fn settle_for_outcome(
                 .map(|node| node.id);
             if let Some(node_id) = offscreen {
                 revealed_subject = true;
-                let _ = client
-                    .agent(&AgentControlRequest::Act(AgentAction::ScrollIntoView {
-                        node_id,
-                    }))
-                    .await;
+                let reveal = crate::outcome::read(client, deadline, async |client| {
+                    client
+                        .agent(&AgentControlRequest::Act(AgentAction::ScrollIntoView {
+                            node_id,
+                        }))
+                        .await
+                })
+                .await;
+                if let Err(error) = reveal {
+                    if crate::outcome::is_timeout(client, &error) {
+                        return Ok(incomplete_semantic_outcome(
+                            check, after, passing, iterations,
+                        ));
+                    }
+                    if client.is_terminal() {
+                        return Err(error);
+                    }
+                }
+                last_snapshot = Some((after, passing));
                 continue;
             }
         }
-        if stability.observe(now, semantic_fingerprint(&after.nodes), passing, stable_for) {
+        if now <= deadline
+            && stability.observe(now, semantic_fingerprint(&after.nodes), passing, stable_for)
+        {
             return Ok((after, None, iterations));
         }
-        if now >= deadline {
-            let error = (passing && !stable_for.is_zero()).then(|| {
-                format!(
-                    "rendered outcome did not remain complete and unchanged for {}ms within {}ms",
-                    stable_for.as_millis(),
-                    outcome_timeout.as_millis()
-                )
-            });
-            return Ok((after, error, iterations));
+        if crate::outcome::budget(deadline).is_err() {
+            return Ok(incomplete_semantic_outcome(
+                check, after, passing, iterations,
+            ));
         }
         if event_driven {
             // A rendered outcome cannot change without a committed frame.
@@ -3810,12 +3931,20 @@ async fn settle_for_outcome(
             } else {
                 until_deadline
             };
-            if !wait.is_zero() {
-                let _ = client.wait_for_paint(wait).await?;
+            if !wait.is_zero()
+                && let Err(error) = client.wait_for_paint(wait).await
+            {
+                if crate::outcome::is_timeout(client, &error) {
+                    return Ok(incomplete_semantic_outcome(
+                        check, after, passing, iterations,
+                    ));
+                }
+                return Err(error);
             }
         } else {
             nagoya::sleep(Duration::from_millis(25)).await;
         }
+        last_snapshot = Some((after, passing));
     }
 }
 
@@ -4423,13 +4552,17 @@ fn report_captured(
 async fn read_gpu_capture(client: &mut Client, target: &str) -> Result<CapturedImage> {
     let previous_timeout = client.request_timeout();
     client.set_request_timeout(cli::request_timeout());
+    let image = read_gpu_capture_sample(client, target).await;
+    client.set_request_timeout(previous_timeout);
+    image
+}
+
+async fn read_gpu_capture_sample(client: &mut Client, target: &str) -> Result<CapturedImage> {
     let answer = client
         .diagnostics(&DiagnosticsRequest::WebGpuCapture {
             target: target.to_owned(),
         })
-        .await;
-    client.set_request_timeout(previous_timeout);
-    let answer = answer?;
+        .await?;
     match answer.response {
         DebugResponse::Captured(image) => Ok(image),
         DebugResponse::Error(error) => bail!("{}: {}", error.code, error.message),
@@ -4446,11 +4579,8 @@ async fn gpu_capture_command(
     report_captured(&image, 1.0, output)
 }
 
-async fn gpu_texture_ink(client: &mut Client, target: &str) -> std::result::Result<(), String> {
-    let image = read_gpu_capture(client, target)
-        .await
-        .map_err(|error| error.to_string())?;
-    let ink = measure_ink(&image).map_err(|error| error.to_string())?;
+fn gpu_texture_ink(image: &CapturedImage, target: &str) -> std::result::Result<(), String> {
+    let ink = measure_ink(image).map_err(|error| error.to_string())?;
     if ink.visible == 0 {
         Err(format!(
             "{target:?} occupies {}x{} but draws no pixels distinguishable from its background",
@@ -4467,14 +4597,30 @@ async fn wait_for_gpu_texture_ink(
     started: Instant,
 ) -> std::result::Result<(), String> {
     let deadline = started + declared_outcome_timeout(check);
+    let mut last_failure = None;
     loop {
-        let verdict = gpu_texture_ink(client, &check.subject).await;
-        if verdict.is_ok() {
-            return Ok(());
-        }
+        let image = match crate::outcome::read(client, deadline, async |client| {
+            read_gpu_capture_sample(client, &check.subject).await
+        })
+        .await
+        {
+            Ok(image) => image,
+            Err(error) => return Err(crate::outcome::failure(client, last_failure, error)),
+        };
+        let verdict = gpu_texture_ink(&image, &check.subject);
         let now = Instant::now();
-        if now >= deadline {
-            return verdict;
+        match verdict {
+            Ok(()) if now <= deadline => return Ok(()),
+            Ok(()) => {
+                last_failure = Some(format!(
+                    "{:?} did not contain visible ink within the outcome window",
+                    check.subject
+                ));
+            }
+            Err(error) => last_failure = Some(error),
+        }
+        if crate::outcome::budget(deadline).is_err() {
+            return Err(crate::outcome::exhausted(last_failure));
         }
         nagoya::sleep(
             deadline

@@ -125,13 +125,17 @@ pub(crate) async fn contrast(
     text_ratio: f64,
     control_ratio: f64,
 ) -> Result<()> {
-    measure_contrast(client, want, text_ratio, control_ratio, true).await
+    measure_contrast(client, want, text_ratio, control_ratio, true, None).await
 }
 
 /// A quiet sample for outcome settling; intermediate transition frames are not
 /// final failures and should not flood the CLI report.
-pub(crate) async fn contrast_verdict(client: &mut Client, want: &str) -> Result<()> {
-    measure_contrast(client, want, 4.5, 3.0, false).await
+pub(crate) async fn contrast_verdict(
+    client: &mut Client,
+    want: &str,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    measure_contrast(client, want, 4.5, 3.0, false, Some(deadline)).await
 }
 
 async fn measure_contrast(
@@ -140,22 +144,33 @@ async fn measure_contrast(
     text_ratio: f64,
     control_ratio: f64,
     report: bool,
+    deadline: Option<std::time::Instant>,
 ) -> Result<()> {
-    let (semantic, elapsed) = inspect(client).await?;
+    let (semantic, elapsed) = if let Some(deadline) = deadline {
+        crate::outcome::read(client, deadline, inspect).await?
+    } else {
+        inspect(client).await?
+    };
     // Reject a selector this tree cannot answer before measuring anything.
     // Silently auditing nothing and calling it a clean page is the worst of the
     // three available outcomes.
     if let Some(reason) = unmatched_selector_reason(&semantic.nodes, want) {
         bail!("{want:?} selects nothing in this document: {reason}");
     }
-    let answer = client
-        .diagnostics(&DiagnosticsRequest::Snapshot(SnapshotRequest {
-            include_dom: false,
-            include_layout: false,
-            include_computed_style: true,
-            node_ids: Vec::new(),
-        }))
-        .await?;
+    let request = DiagnosticsRequest::Snapshot(SnapshotRequest {
+        include_dom: false,
+        include_layout: false,
+        include_computed_style: true,
+        node_ids: Vec::new(),
+    });
+    let answer = if let Some(deadline) = deadline {
+        crate::outcome::read(client, deadline, async |client| {
+            client.diagnostics(&request).await
+        })
+        .await?
+    } else {
+        client.diagnostics(&request).await?
+    };
     let DebugResponse::Snapshot(snapshot) = answer.response else {
         bail!("asked for a contrast snapshot, got {:?}", answer.response);
     };

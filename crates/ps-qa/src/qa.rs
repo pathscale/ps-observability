@@ -744,6 +744,9 @@ pub struct Check {
     /// network round trip may opt into a larger explicit budget without
     /// weakening every button in the sweep.
     #[serde(default)]
+    // Retrying expectations stop before a new request would have less than
+    // the minimum outcome request budget. The last completed sample decides
+    // the assertion failure; a timeout is reported only without a sample.
     pub outcome_timeout_ms: u64,
     /// Require the successful rendered outcome to remain present while the
     /// complete live semantic snapshot stays unchanged for this long.

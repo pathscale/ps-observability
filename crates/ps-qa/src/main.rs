@@ -10,6 +10,7 @@ mod gpu_buffer;
 mod inspector;
 mod interaction;
 mod layout_report;
+mod outcome;
 mod paint_audit;
 mod paint_color;
 mod plan;

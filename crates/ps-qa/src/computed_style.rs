@@ -13,6 +13,17 @@ async fn value_for_node(
     selector: &str,
     property: &str,
 ) -> Result<String, String> {
+    value_for_node_sample(client, node_id, selector, property)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn value_for_node_sample(
+    client: &mut Client,
+    node_id: u64,
+    selector: &str,
+    property: &str,
+) -> eyre::Result<String> {
     let answer = client
         .diagnostics(&DiagnosticsRequest::Snapshot(SnapshotRequest {
             include_dom: false,
@@ -20,10 +31,9 @@ async fn value_for_node(
             include_computed_style: true,
             node_ids: vec![node_id],
         }))
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let DebugResponse::Snapshot(snapshot) = answer.response else {
-        return Err(format!(
+        return Err(eyre::eyre!(
             "asked for computed style of {selector:?}, got {:?}",
             answer.response
         ));
@@ -37,13 +47,13 @@ async fn value_for_node(
                 .find(|row| row.get("nodeId").and_then(serde_json::Value::as_u64) == Some(node_id))
         })
         .and_then(|row| row.get(property))
-        .ok_or_else(|| format!("diagnostics returned no {property} for {selector:?}"))?;
+        .ok_or_else(|| eyre::eyre!("diagnostics returned no {property} for {selector:?}"))?;
     if let Some(value) = resolved.as_str() {
         Ok(value.to_owned())
     } else if let Some(value) = resolved.as_f64() {
         Ok(value.to_string())
     } else {
-        Err(format!(
+        Err(eyre::eyre!(
             "diagnostics returned non-scalar {property} for {selector:?}"
         ))
     }
@@ -118,25 +128,38 @@ pub(crate) async fn wait_for_larger_font(
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + timeout;
-    let event_driven = client.arm_paint_events().await.unwrap_or(false);
+    let event_driven = crate::outcome::read(client, deadline, Client::arm_paint_events)
+        .await
+        .unwrap_or(false);
+    let mut last_failure = None;
     loop {
-        let latest =
-            parse_font_size(&value_for_node(client, node_id, selector, "fontSize").await?)?;
-        if latest > before + 0.1 {
+        let resolved = match crate::outcome::read(client, deadline, async |client| {
+            value_for_node_sample(client, node_id, selector, "fontSize").await
+        })
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => return Err(crate::outcome::failure(client, last_failure, error)),
+        };
+        let latest = parse_font_size(&resolved)?;
+        let now = std::time::Instant::now();
+        if latest > before + 0.1 && now <= deadline {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
+        last_failure = Some(if latest > before + 0.1 {
+            format!("{selector:?} font size grew only after the outcome deadline")
+        } else {
+            format!(
                 "{selector:?} font size stayed {latest:.2}px after the interface-size action; expected more than {before:.2}px"
-            ));
+            )
+        });
+        if crate::outcome::budget(deadline).is_err() {
+            return Err(crate::outcome::exhausted(last_failure));
         }
         if event_driven {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if !remaining.is_zero() {
-                let _ = client
-                    .wait_for_paint(remaining)
-                    .await
-                    .map_err(|error| error.to_string())?;
+            let remaining = deadline.saturating_duration_since(now);
+            if let Err(error) = client.wait_for_paint(remaining).await {
+                return Err(crate::outcome::failure(client, last_failure, error));
             }
         } else {
             nagoya::sleep(Duration::from_millis(25)).await;
