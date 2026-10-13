@@ -319,6 +319,120 @@ tabs, then activates the exact semantic node id.
 | `SelectionChanges` | the same semantic node changes selected/pressed state |
 | `NameChanges` | the same semantic node exposes a different accessible name after the action |
 
+### Page WebGPU checks
+
+`ps-qa gpu` prints page-owned devices, live resources, cumulative errors, and
+sampled frames. `ps-qa gpu-capture texture:preview` or
+`ps-qa gpu-capture canvas:#view` reads a texture or canvas and reports visible
+ink; `--output frame.ppm` saves that image.
+
+Buffer inspection reads completed GPU writes through the same diagnostics
+socket:
+
+```sh
+ps-qa gpu-buffer particles --as f32
+ps-qa gpu-buffer "particles*" --offset 16 --length 32 --as f32 --stride 4
+```
+
+The positional argument is the GPUBuffer label. `*` matches any run of
+characters, including an empty run, exactly as in `GpuHasResource`. Zero
+matches fail naming the label; multiple matches fail naming the matching
+labels. Offset and length are bytes and must be multiples of four. Offset
+defaults to zero, omitted length reads to the end, `--as` defaults to `u32`,
+and stride defaults to one. The available formats are little-endian `u32`,
+`i32`, `f32`, and `u8`. A zero stride fails.
+
+Output is TOON with the matched label, whole buffer size, original page usage
+bits, completed submit serial, byte offset, and decoded element count, then
+indexed values:
+
+```toon
+buffer[1]{label,size,usage,submit,offset,count}:
+  particles,16,136,7,0,4
+elements[4]{index,value}:
+  0,1
+  1,2
+  2,3
+  3,4
+```
+
+Element indices are relative to the whole buffer in the chosen type. Stride
+groups up to that many elements per row with columns `index,value0,value1,...`;
+the index names the first element in the row. A short final row is padded with
+`null`, while count still reports only returned elements. Non-finite f32
+values print as TOON strings `NaN`, `inf`, or `-inf`.
+
+The host returns the newest completed write while a newer submit is pending.
+If no completed write is available, it returns error code `pending`; the CLI
+reports that state, and suite checks retry it within `outcome_timeout_ms`, just
+as `GpuDraws` retries an incomplete frame. A submit serial of zero means no
+queue submit has written the buffer, for example mappedAtCreation-only data.
+
+| GPU expectation | Passes when |
+| --- | --- |
+| `GpuNoErrors` | cumulative validation and uncaptured error totals are zero |
+| `GpuHasResource` | a live `kind:label` resource matches the label pattern |
+| `GpuDraws(n)` | the newest completely sampled frame draws at least n times into the target |
+| `GpuTextureInk` | the named texture or canvas contains visible ink |
+| `GpuBufferRange` | every typed element in the byte range lies inside inclusive min/max bounds |
+| `GpuBufferEquals` | one typed element at the byte offset equals value |
+| `GpuBufferAtLeast` | one typed element at the byte offset is at least value |
+| `GpuBufferChanges` | two snapshots inside the outcome window have different bytes and different nonzero completed submit serials |
+
+Buffer expectations use subject `buffer:<label>` and the ordinary suite file
+format. Ranges must be nonempty, offsets and lengths must be multiples of four,
+and bounds must be finite. Equals and AtLeast fetch four bytes and judge one
+element; for `u8` that is the first byte at the requested offset.
+
+```ron
+[
+    (
+        id: "particles-stay-in-bounds",
+        group: "gpu",
+        what: "every particle coordinate stays in the simulation bounds",
+        subject: "buffer:particles",
+        expect: GpuBufferRange(offset: 0, length: 32, as: f32, min: -1.0, max: 1.0),
+        outcome_timeout_ms: 1000,
+    ),
+    (
+        id: "particle-count-is-four",
+        group: "gpu",
+        what: "the GPU reports four live particles",
+        subject: "buffer:particle-count",
+        expect: GpuBufferEquals(offset: 0, as: u32, value: 4.0),
+    ),
+    (
+        id: "compute-produced-results",
+        group: "gpu",
+        what: "the compute output counter is nonzero",
+        subject: "buffer:result-count",
+        expect: GpuBufferAtLeast(offset: 0, as: u32, value: 1.0),
+    ),
+    (
+        id: "particles-advance",
+        group: "gpu",
+        what: "completed simulation submissions update particle bytes",
+        subject: "buffer:particles",
+        expect: GpuBufferChanges(offset: 0, length: 32),
+        outcome_timeout_ms: 1000,
+    ),
+]
+```
+
+Typed f32 checks reject NaN and either infinity. Range alone accepts
+`allow_non_finite: true`, which skips non-finite elements when judging bounds;
+the default is false. Finite bounds and scalar values are rounded to f32 when
+comparing f32 data. Integer scalar values must be integral and fit the chosen
+type. Numeric failures name the matched label, absolute element index, value,
+bound, and submit serial. Changes compares raw bytes without a type
+interpretation; different bytes from the same submit, including writeBuffer
+updates without a new writing submit, cannot satisfy it.
+
+All buffer expectations retry failing samples against the declared outcome
+deadline and honor `stable_for_ms`. Changes keeps its first completed submit
+snapshot in that window as the baseline. Other host errors, malformed payloads,
+and transport failures fail immediately.
+
 `Paints`, `PaintsNamed`, `PaintsMore` and `Count` judge on boxes, because the
 tree's visibility flag and the renderer disagree and trusting the flag once
 reported a screen full of icons as painting nothing. That leaves a disclosure

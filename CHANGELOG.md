@@ -1,5 +1,17 @@
 # Changelog
 
+## blitz-control-protocol 0.7.1
+
+- Add DiagnosticsRequest::WebGpuBuffer and DebugResponse::WebGpuBuffer with labeled buffer bytes, original usage, completed submit serial, writeBuffer provenance, and base64 payload.
+- Advertise the additive request through the derived diagnostics schema while keeping DEBUG_PROTOCOL_VERSION at 2.
+- Expose a typed pending-response classifier for clients retrying incomplete buffer samples.
+
+## ps-qa 0.9.1
+
+- Require blitz-control-protocol ^0.7.1 and add ps-qa gpu-buffer with aligned byte ranges, little-endian typed values, stride grouping, and TOON output.
+- Add GpuBufferRange, GpuBufferEquals, GpuBufferAtLeast, and GpuBufferChanges suite expectations with finite-value policy and completed-submit change evidence.
+- Retry pending and failing buffer samples inside the outcome budget, honor stable_for_ms, and document the GPU inspection commands and checks.
+
 ## blitz-control-protocol 0.7.0
 
 - Advertise inspection protocol 2 and serialize command fields as camelCase; continue accepting the protocol 1 snake_case field names on input.
