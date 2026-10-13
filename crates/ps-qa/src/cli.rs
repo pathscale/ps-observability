@@ -432,7 +432,7 @@ pub enum Command {
     GpuCapture {
         /// `texture:<label>` or `canvas:#id`.
         target: String,
-        /// Save the readback as a binary PPM image.
+        /// Save the readback as PPM. Refused because captures may reveal secrets.
         #[arg(long)]
         output: Option<std::path::PathBuf>,
     },
@@ -451,7 +451,7 @@ pub enum Command {
         /// Render scale.
         #[arg(default_value_t = 1.0)]
         scale: f64,
-        /// Save the rendered pixels as a binary PPM image for visual diagnosis.
+        /// Save rendered pixels as PPM. Refused because captures may reveal secrets.
         #[arg(long)]
         output: Option<std::path::PathBuf>,
     },

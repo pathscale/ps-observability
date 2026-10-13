@@ -1,16 +1,15 @@
 //! Decode and compare renderer captures.
 //!
 //! The runner owns interaction ordering and transport. This module owns the
-//! pixel contract: buffer validation, tolerance, visible-ink measurement and
-//! diagnostic artifacts. Keeping those concerns separate makes a paint verdict
-//! testable without a live application or control socket.
+//! pixel contract: buffer validation, tolerance and visible-ink measurement.
+//! Keeping those concerns separate makes a paint verdict testable without a
+//! live application or control socket.
 
 use std::collections::HashMap;
-use std::io::Write as _;
 
 use base64::Engine as _;
 use blitz_control_protocol::CapturedImage;
-use eyre::{Context, Result};
+use eyre::Result;
 
 use crate::cli;
 
@@ -309,41 +308,23 @@ pub(crate) fn measure_interior_ink(image: &CapturedImage) -> Result<Ink> {
     measure_ink_bounds(image, inset_x, inset_y, right, bottom)
 }
 
-pub(crate) fn write_ppm(image: &CapturedImage, output: &std::path::Path) -> Result<()> {
-    let rgba = decode(image).map_err(eyre::Report::msg)?;
-    let mut file = std::fs::File::create(output)
-        .wrap_err_with(|| format!("could not create {}", output.display()))?;
-    write!(file, "P6\n{} {}\n255\n", image.width, image.height)?;
-    for pixel in rgba.as_chunks::<4>().0 {
-        file.write_all(&pixel[..3])?;
-    }
-    println!("saved {}", output.display());
-    Ok(())
+pub(crate) fn write_ppm(_image: &CapturedImage, _output: &std::path::Path) -> Result<()> {
+    Err(eyre::eyre!(
+        "refusing to write captured pixels to disk because they may contain secret values"
+    ))
 }
 
 pub(crate) fn save_artifacts(
-    check_id: &str,
-    before: &CapturedImage,
-    after: &CapturedImage,
+    _check_id: &str,
+    _before: &CapturedImage,
+    _after: &CapturedImage,
 ) -> Result<()> {
-    let Some(directory) = cli::pixel_artifact_dir() else {
+    let Some(_) = cli::pixel_artifact_dir() else {
         return Ok(());
     };
-    std::fs::create_dir_all(&directory)
-        .wrap_err_with(|| format!("could not create {}", directory.display()))?;
-    let safe_id: String = check_id
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    write_ppm(before, &directory.join(format!("{safe_id}-before.ppm")))?;
-    write_ppm(after, &directory.join(format!("{safe_id}-after.ppm")))?;
-    Ok(())
+    Err(eyre::eyre!(
+        "refusing to write captured pixels to disk because they may contain secret values"
+    ))
 }
 
 #[cfg(test)]

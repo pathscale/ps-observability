@@ -826,10 +826,10 @@ pub struct Check {
     /// `localStorage` entries installed before any page script runs.
     ///
     /// Values are arbitrary strings, often several kilobytes of JSON under one
-    /// key. A `qa-hosted` run writes the map as a JSON object and restarts the
-    /// host with `QA_INSPECT_STORAGE` set to that file, so the page boots with
-    /// the entries already present. The next check with an empty map restarts
-    /// without the variable. Empty leaves the standing host alone.
+    /// key. A `qa-hosted` run serializes the map in memory and passes the JSON
+    /// object to the restarted host through `QA_INSPECT_STORAGE`, so the page
+    /// boots with the entries already present. The next check with an empty map
+    /// restarts without the variable. Empty leaves the standing host alone.
     #[serde(default)]
     pub storage: std::collections::BTreeMap<String, String>,
     /// The node the assertion is about.

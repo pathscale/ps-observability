@@ -78,16 +78,14 @@ and the aborted run keeps a nonzero exit status.
 
 A hosted run starts the host binary with no arguments. `QA_INSPECT_PAGE` names
 the page or site to serve. `QA_INSPECT_STORAGE`, when a check sets `storage`,
-is the path of a JSON object whose keys and values are strings. The host
-installs those entries into `localStorage` for the page origin before any page
-script runs. A missing, unreadable, or invalid file is fatal: the host prints
-`chuzz-headless: QA_INSPECT_STORAGE: ...` on stderr and exits 2, so the check
-cannot pass against an empty store.
+contains a JSON object whose keys and values are strings. The host installs
+those entries into `localStorage` for the page origin before any page script
+runs. Invalid JSON is fatal, so the check cannot pass against an empty store.
 
-`qa-hosted` writes that object inside the plan tree and restarts the host with
-the variable set before the check. The next check with an empty `storage` map
-restarts once without the variable. The seed is not placed in the system
-temporary directory.
+`qa-hosted` serializes that object in memory and passes it in the child
+environment before restarting the host. The seed is never written to a file.
+Host output is suppressed while the seed is set. The next check with an empty
+`storage` map restarts once without the variable.
 
 ## Usage
 
@@ -127,7 +125,7 @@ may share credentials with another session only when both declare the same
 `identity_group`. `any_of` accepts one of a check's explicitly listed simple
 rendered outcomes; it does not add conditional actions. The runner removes inherited
 environment from every child host, then sets only `QA_INSPECT_PAGE`,
-`QA_INSPECT_STORAGE` when the check seeds storage, and a
+`QA_INSPECT_STORAGE` as a JSON value when the check seeds storage, and a
 unique `CHUZZ_CONTROL_DIR` under `target/ps-qa/run-plan-control`; it suppresses
 the host's console output during the run.
 
@@ -324,7 +322,11 @@ tabs, then activates the exact semantic node id.
 `ps-qa gpu` prints page-owned devices, live resources, cumulative errors, and
 sampled frames. `ps-qa gpu-capture texture:preview` or
 `ps-qa gpu-capture canvas:#view` reads a texture or canvas and reports visible
-ink; `--output frame.ppm` saves that image.
+ink. Capture pixels are not saved to disk because they can include secret
+values. An explicit `--output` request returns a safe error, and automatic
+pixel-artifact writes are skipped with a safe diagnostic.
+The optional `PS_QA_GPU_DUMP` file output is also refused because diagnostic
+labels and errors come from the inspected application.
 
 Buffer inspection reads completed GPU writes through the same diagnostics
 socket:

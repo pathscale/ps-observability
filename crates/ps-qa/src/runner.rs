@@ -357,10 +357,10 @@ struct HostedSession {
     startup_timeout: Duration,
     quiet_output: bool,
     clean_environment: bool,
-    /// `QA_INSPECT_STORAGE` path for the standing host. `None` launches without
-    /// the variable. The file lives outside the ephemeral control directory;
-    /// `restart` deletes that directory before the next spawn.
-    storage: Option<std::path::PathBuf>,
+    /// JSON `QA_INSPECT_STORAGE` value for the standing host. `None` launches
+    /// without the variable. The value stays in process memory and is passed
+    /// directly to the child environment on each restart.
+    storage: Option<String>,
     /// Whether checks may restart this host to install a `storage` seed.
     /// qa-hosted owns a throwaway host; run-plan keeps a signed-in one.
     seeds_storage: bool,
@@ -374,7 +374,7 @@ fn launch_host(
     startup_timeout: Duration,
     quiet_output: bool,
     clean_environment: bool,
-    storage: Option<&std::path::Path>,
+    storage: Option<&str>,
 ) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
     if !quiet_output && !clean_environment {
         start_host(host, page, startup_timeout, storage)
@@ -440,14 +440,6 @@ impl HostedSession {
         self.process = process;
         self.descriptor_path = descriptor_path;
         Ok(())
-    }
-}
-
-impl Drop for HostedSession {
-    fn drop(&mut self) {
-        if let Some(path) = self.storage.take() {
-            let _ = std::fs::remove_file(path);
-        }
     }
 }
 
@@ -1074,7 +1066,7 @@ fn start_host(
     host: &std::path::Path,
     page: &std::path::Path,
     startup_timeout: Duration,
-    storage: Option<&std::path::Path>,
+    storage: Option<&str>,
 ) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
     start_host_with_policy(host, page, startup_timeout, false, false, storage)
 }
@@ -1151,24 +1143,14 @@ fn control_directory_is_real(path: &std::path::Path) -> bool {
         .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
 }
 
-/// Write a check's `storage` map where the host can read it at launch.
+/// Encode a check's `storage` map for the child environment.
 ///
-/// The host reads the file once while starting, so it only has to outlive the
-/// spawn; the session removes it when the next check clears it or the session
-/// ends.
-fn write_storage_seed(
+/// The JSON stays in memory and is inherited only by the host that consumes it.
+fn encode_storage_seed(
     storage: &std::collections::BTreeMap<String, String>,
-) -> std::result::Result<std::path::PathBuf, String> {
-    let path = std::env::temp_dir().join(format!("qa-inspect-storage-{}.json", std::process::id()));
-    let encoded = serde_json::to_vec(storage)
-        .map_err(|error| format!("could not encode QA storage seed: {error}"))?;
-    std::fs::write(&path, encoded).map_err(|error| {
-        format!(
-            "could not write QA storage seed {}: {error}",
-            path.display()
-        )
-    })?;
-    Ok(path)
+) -> std::result::Result<String, String> {
+    serde_json::to_string(storage)
+        .map_err(|error| format!("could not encode QA storage seed: {error}"))
 }
 
 /// Install this check's `localStorage` seed, or clear one left by the check
@@ -1183,15 +1165,14 @@ async fn stage_check_storage(
     storage: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     if storage.is_empty() {
-        let Some(path) = session.storage.take() else {
+        if session.storage.take().is_none() {
             return Ok(());
-        };
-        let _ = std::fs::remove_file(path);
+        }
         reconnect_hosted(client, session).await?;
         return Ok(());
     }
-    let path = write_storage_seed(storage).map_err(eyre::Report::msg)?;
-    session.storage = Some(path);
+    let encoded = encode_storage_seed(storage).map_err(eyre::Report::msg)?;
+    session.storage = Some(encoded);
     reconnect_hosted(client, session).await?;
     Ok(())
 }
@@ -1217,15 +1198,15 @@ fn contained_control_file(
     Ok(path)
 }
 
-/// Launch a host, optionally with a clean environment. The quiet mode prevents
-/// application console output from echoing form values into the runner's logs.
+/// Launch a host, optionally with a clean environment. Quiet or seeded runs
+/// suppress application output so it cannot echo form or storage values.
 fn start_host_with_policy(
     host: &std::path::Path,
     page: &std::path::Path,
     startup_timeout: Duration,
     quiet_output: bool,
     clean_environment: bool,
-    storage: Option<&std::path::Path>,
+    storage: Option<&str>,
 ) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
     use std::io::BufRead;
 
@@ -1237,19 +1218,18 @@ fn start_host_with_policy(
     };
     if clean_environment {
         // Run plans must not forward unrelated secrets or application config
-        // to the browser process. Page, control and temporary directories are
-        // explicit host interfaces and point at plan-owned, in-repository paths.
+        // to the browser process. Page, storage and control are the explicit
+        // host interfaces supplied by this runner.
         command.env_clear();
     }
     // The page this host is to serve. The variable is the host interface, not
     // a particular host's: `chuzz-headless` reads it, and a host with a
     // different one can read its own environment and ignore this.
     command.env("QA_INSPECT_PAGE", page);
-    // localStorage installed before the page's scripts. Same host interface:
-    // a JSON object whose values are strings. `chuzz-headless` exits 2 when
-    // the file is missing or invalid, so a check cannot pass on an empty store.
-    if let Some(path) = storage {
-        command.env("QA_INSPECT_STORAGE", path);
+    // localStorage installed before the page's scripts. The value is a JSON
+    // object whose keys and values are strings, so no seed file is created.
+    if let Some(encoded) = storage {
+        command.env("QA_INSPECT_STORAGE", encoded);
     }
     if let Some(path) = &control_dir {
         command.env("CHUZZ_CONTROL_DIR", path);
@@ -1260,8 +1240,9 @@ fn start_host_with_policy(
             .env("TMP", path)
             .env("TEMP", path);
     }
+    let suppress_host_output = quiet_output || storage.is_some();
     command.stdout(std::process::Stdio::piped());
-    command.stderr(if quiet_output {
+    command.stderr(if suppress_host_output {
         std::process::Stdio::null()
     } else {
         // Host diagnostics belong to the sweep artifact. Discarding them
@@ -1319,7 +1300,7 @@ fn start_host_with_policy(
             if !announced && text.ends_with(".json") && std::path::Path::new(text).is_file() {
                 announced = true;
                 let _ = tx.send(text.to_owned());
-            } else if !quiet_output && !text.is_empty() {
+            } else if !suppress_host_output && !text.is_empty() {
                 eprintln!("host: {text}");
             }
             line.clear();
@@ -1754,8 +1735,8 @@ async fn run_qa_inner(
     let mut results: Vec<CheckResult<'_>> = Vec::new();
     for index in 0..selected.len() {
         // The host applies QA_INSPECT_STORAGE at launch, before page scripts,
-        // so a check that carries entries restarts onto that file. The next
-        // check with an empty map restarts once without it. Only a session
+        // so a check that carries entries restarts with that JSON value. The
+        // next check with an empty map restarts once without it. Only a session
         // that allows it (qa-hosted) is restarted.
         let check = &selected[index];
         let full_check_started = Instant::now();
@@ -3052,7 +3033,7 @@ async fn run_qa_inner(
                 .iter()
                 .all(|later| later.group != check.group);
         if group_done {
-            dump_qa_hosted_gpu(client, &check.group).await?;
+            dump_qa_hosted_gpu()?;
         }
         if gave_up && !client.is_terminal() && index + 1 < selected.len() {
             if let Some(session) = hosted.as_deref_mut() {
@@ -3208,30 +3189,12 @@ fn gpu_draw_target_matches(subject: &str, target: &str) -> bool {
     }
 }
 
-/// Write `<dir>/<group>.gpu.toon` for a `qa-hosted` run whose
-/// `PS_QA_GPU_DUMP` names a directory.
-///
-/// The bytes are what `ps-qa gpu` prints. A host that does not answer
-/// WebGPU inspection leaves no file and does not fail the group.
-async fn dump_qa_hosted_gpu(client: &mut Client, group: &str) -> Result<()> {
-    let Some(dir) = qa_hosted_gpu_dump_dir() else {
-        return Ok(());
-    };
-    if group.is_empty() || group.contains('/') || group.contains('\\') || group.contains('\0') {
-        return Err(eyre!(
-            "GPU dump group {group:?} is not a single path segment"
-        ));
+/// Refuse the optional `PS_QA_GPU_DUMP` file output. Diagnostic labels and
+/// errors come from the inspected application and may contain secret values.
+fn dump_qa_hosted_gpu() -> Result<()> {
+    if qa_hosted_gpu_dump_dir().is_some() {
+        bail!("refusing to write GPU diagnostics to disk because they may contain secret values");
     }
-    let report = match gpu_report(client).await {
-        Ok(report) => report,
-        Err(_) => return Ok(()),
-    };
-    let encoded = toon_format::encode_default(&report).map_err(|error| eyre!(error.to_string()))?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating GPU dump directory {}", dir.display()))?;
-    let path = dir.join(format!("{group}.gpu.toon"));
-    std::fs::write(&path, format!("{encoded}\n"))
-        .with_context(|| format!("writing GPU dump {}", path.display()))?;
     Ok(())
 }
 

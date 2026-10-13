@@ -694,6 +694,12 @@ fn descriptor_path(instance_id: &str) -> PathBuf {
 }
 
 fn write_descriptor(path: &Path, descriptor: &DebugDescriptor) -> io::Result<()> {
+    let content = serde_json::to_string_pretty(descriptor).map_err(io::Error::other)?;
+    if contains_secret_environment_value(&content) {
+        return Err(io::Error::other(
+            "refusing to write a descriptor that contains an environment secret",
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -703,9 +709,57 @@ fn write_descriptor(path: &Path, descriptor: &DebugDescriptor) -> io::Result<()>
         .write(true)
         .mode(0o600)
         .open(path)?;
-    serde_json::to_writer_pretty(&mut file, descriptor).map_err(io::Error::other)?;
+    file.write_all(content.as_bytes())?;
     file.write_all(b"\n")?;
     file.sync_all()
+}
+
+fn contains_secret_environment_value(content: &str) -> bool {
+    let variables: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            Some((
+                name.to_string_lossy().to_ascii_uppercase(),
+                value.into_string().ok()?,
+            ))
+        })
+        .collect();
+    let has_password = variables.iter().any(|(name, _)| {
+        name.contains("PASSWORD") || name.contains("PASSPHRASE") || name.ends_with("_PASS")
+    });
+
+    variables.iter().any(|(name, value)| {
+        if value.is_empty() {
+            return false;
+        }
+        let named_secret = name.contains("PASSWORD")
+            || name.contains("PASSPHRASE")
+            || name.ends_with("_PASS")
+            || name.contains("SEED")
+            || name.contains("PRIVATE_KEY")
+            || name.ends_with("_KEY")
+            || name == "KEY"
+            || name.contains("TOKEN")
+            || name.contains("SECRET")
+            || name.contains("COOKIE")
+            || name.contains("JWT")
+            || name.contains("SESSION")
+            || name.starts_with("AWS_")
+            || name.contains("DOPPLER")
+            || name.contains("HONEY")
+            || name.contains("HOOK");
+        let paired_username = has_password
+            && (name.contains("USERNAME") || name == "USER" || name.ends_with("_USER"));
+        if !named_secret && !paired_username {
+            return false;
+        }
+
+        if content.contains(value) {
+            return true;
+        }
+        serde_json::to_string(value).is_ok_and(|quoted| {
+            quoted.len() > 2 && content.contains(&quoted[1..quoted.len() - 1])
+        })
+    })
 }
 
 #[cfg(test)]
