@@ -523,10 +523,9 @@ pub(crate) fn validate_selector(selector: &str) -> Result<(), String> {
 
 fn looks_like_css_class_selector(selector: &str) -> bool {
     const HTML_TAGS: &[&str] = &[
-        "a", "article", "aside", "button", "div", "footer", "form", "h1", "h2", "h3",
-        "h4", "h5", "h6", "header", "img", "input", "label", "li", "main", "nav", "ol",
-        "option", "p", "section", "select", "span", "svg", "table", "tbody", "td",
-        "textarea", "th", "tr", "ul",
+        "a", "article", "aside", "button", "div", "footer", "form", "h1", "h2", "h3", "h4", "h5",
+        "h6", "header", "img", "input", "label", "li", "main", "nav", "ol", "option", "p",
+        "section", "select", "span", "svg", "table", "tbody", "td", "textarea", "th", "tr", "ul",
     ];
     let Some((tag, classes)) = selector.split_once('.') else {
         return false;
@@ -609,8 +608,7 @@ pub(crate) fn selector_matches_node(node: &SemanticNode, selector: &str) -> bool
     let Ok(parsed) = parse_selector(selector) else {
         return false;
     };
-    selector_matches_base(node, parsed.base)
-        && selector_attribute_matches(node, parsed.attribute)
+    selector_matches_base(node, parsed.base) && selector_attribute_matches(node, parsed.attribute)
 }
 
 /// The role half of a `role:name` selector, when the selector has one.
@@ -644,7 +642,10 @@ pub(crate) fn unmatched_selector_reason(nodes: &[SemanticNode], selector: &str) 
         Ok(parsed) => parsed,
         Err(error) => return Some(format!("invalid target selector: {error}")),
     };
-    if nodes.iter().any(|node| selector_matches_node(node, selector)) {
+    if nodes
+        .iter()
+        .any(|node| selector_matches_node(node, selector))
+    {
         return None;
     }
     if let Some(predicate) = parsed.attribute

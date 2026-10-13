@@ -1310,7 +1310,10 @@ fn validate_check(
         ("prepare_unless", check.prepare_unless.as_deref()),
         ("prepare_until", check.prepare_until.as_deref()),
         ("hover_unless", check.hover_unless.as_deref()),
-        ("reveal_before_capture", check.reveal_before_capture.as_deref()),
+        (
+            "reveal_before_capture",
+            check.reveal_before_capture.as_deref(),
+        ),
         ("setup_type_into", check.setup_type_into.as_deref()),
         ("click", check.click.as_deref()),
         ("type_into", check.type_into.as_deref()),
@@ -3383,12 +3386,8 @@ mod tests {
         ] {
             let mut check = parse("");
             check.subject = selector.into();
-            let error = validate_check(
-                &check,
-                Path::new("sorting.ron"),
-                &mut HashMap::new(),
-            )
-            .expect_err("malformed target syntax is a plan load error");
+            let error = validate_check(&check, Path::new("sorting.ron"), &mut HashMap::new())
+                .expect_err("malformed target syntax is a plan load error");
 
             assert!(error.contains("sorting.ron"), "{error}");
             assert!(error.contains("invalid subject target"), "{error}");
