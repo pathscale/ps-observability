@@ -100,6 +100,8 @@ pub use webgpu::*;
 /// token, because the file mode already says who may connect.
 #[cfg(all(feature = "server", unix))]
 pub mod server;
+#[cfg(all(feature = "server", unix))]
+mod server_stream;
 
 use std::collections::BTreeMap;
 

@@ -365,7 +365,9 @@ async fn handle_connection(
     host: Host,
     events: Option<EventSource>,
 ) {
-    let mut stream = TransportStream::new(framed_json_neutral(NagoyaStream::new(stream)));
+    let mut stream = crate::server_stream::ServerStream(TransportStream::new(
+        framed_json_neutral(NagoyaStream::new(stream)),
+    ));
     let mut observed = Vec::<DebugStream>::new();
     // This reader's position in the event stream. Held here rather than in the
     // slot, because two connections read the same `Latest` from different
