@@ -11,8 +11,8 @@ mod gpu_buffer;
 mod inspector;
 mod interaction;
 mod layout_report;
-mod outcome;
 mod native_page;
+mod outcome;
 mod page_targets;
 mod paint_audit;
 mod paint_color;
@@ -35,7 +35,15 @@ mod app_caps;
 fn main() -> eyre::Result<()> {
     if std::env::args_os().any(|argument| argument == "native-page") {
         let command = <cli::Cli as clap::Parser>::parse().command;
-        if let cli::Command::NativePage { host, page, checks, engine, plant, report } = command {
+        if let cli::Command::NativePage {
+            host,
+            page,
+            checks,
+            engine,
+            plant,
+            report,
+        } = command
+        {
             return native_page::run(&host, &page, &checks, &engine, plant.as_deref(), &report);
         }
     }

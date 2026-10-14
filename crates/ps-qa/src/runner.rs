@@ -7087,7 +7087,14 @@ pub async fn run() -> Result<()> {
     }
 
     match cli.command {
-        cli::Command::NativePage { host, page, checks, engine, plant, report } => {
+        cli::Command::NativePage {
+            host,
+            page,
+            checks,
+            engine,
+            plant,
+            report,
+        } => {
             crate::native_page::run(&host, &page, &checks, &engine, plant.as_deref(), &report)?;
         }
         cli::Command::Targets => {
