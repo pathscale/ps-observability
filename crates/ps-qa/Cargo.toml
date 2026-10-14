@@ -23,7 +23,7 @@ publish = true
 # a wheel event. `cargo tree -p ps-qa` is the check.
 [dependencies]
 rustix = { version = "^1.1", features = ["process", "time", "std", "fs"] }
-nagoya = { version = "^0.1.16", features = ["reactor"] }
+nagoya = { path = "../../../nagoya", features = ["reactor", "process"] }
 futures = "^0.3"
 blitz-control-protocol = { workspace = true, features = ["client"] }
 # The same framing the server uses, from the same crate, for the same reason as

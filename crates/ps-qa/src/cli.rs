@@ -171,6 +171,21 @@ pub struct Cli {
 /// and the behaviour are the same edit.
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Run declared outcomes on a native hello page through a real linked host.
+    NativePage {
+        #[arg(long)]
+        host: PathBuf,
+        #[arg(long)]
+        page: PathBuf,
+        #[arg(long)]
+        checks: PathBuf,
+        #[arg(long, default_value = "ekojit")]
+        engine: String,
+        #[arg(long)]
+        plant: Option<String>,
+        #[arg(long)]
+        report: PathBuf,
+    },
     /// List every inspection target and its mounted identity and capabilities.
     Targets,
     /// Drive the page-target fixture through two GUI tabs, navigation and closure.
