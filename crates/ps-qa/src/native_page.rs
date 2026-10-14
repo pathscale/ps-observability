@@ -165,7 +165,10 @@ pub fn run(
     }
     let report_value = json!({ "backend": observation.backend, "checks": rows,
         "failures": failures, "native_entries": observation.native.iter().map(|entry| entry.native_entries).sum::<u64>() });
-    std::fs::write(report, serde_json::to_vec_pretty(&report_value)?)?;
+    blitz_control_protocol::guarded_writer::write_file(
+        std::path::Path::new(&report),
+        &serde_json::to_vec_pretty(&report_value)?,
+    )?;
     println!(
         "{}",
         toon_format::encode_default(&report_value).map_err(|error| eyre!(error.to_string()))?
