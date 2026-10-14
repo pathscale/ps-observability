@@ -7087,6 +7087,9 @@ pub async fn run() -> Result<()> {
     }
 
     match cli.command {
+        cli::Command::NativePage { host, page, checks, engine, plant, report } => {
+            crate::native_page::run(&host, &page, &checks, &engine, plant.as_deref(), &report)?;
+        }
         cli::Command::Targets => {
             let answer = client.agent(&AgentControlRequest::ListTargets).await?;
             println!("{}", serde_json::to_string_pretty(&answer.response)?);
