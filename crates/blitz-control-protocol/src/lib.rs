@@ -67,11 +67,14 @@
 /// The socket transport, connecting half.
 #[cfg(feature = "client")]
 pub mod client;
+
 /// Condensing a settled page into levels a caller can widen from.
 ///
 /// Types and ranking only, no transport: a caller with a snapshot already has
 /// everything this needs, and the cache is keyed on settle rather than fetch.
 pub mod condense;
+#[cfg(all(unix, any(feature = "server", feature = "client")))]
+mod control_directory;
 /// The core: reading, capturing and driving a document.
 #[cfg(feature = "engine")]
 pub mod document;

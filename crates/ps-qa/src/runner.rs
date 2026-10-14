@@ -1126,8 +1126,14 @@ fn ensure_plan_directory(
 }
 
 fn control_directory_is_real(path: &std::path::Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.is_dir()
+            && !meta.file_type().is_symlink()
+            && meta.uid() == rustix::process::geteuid().as_raw()
+            && meta.mode() & 0o077 == 0
+    })
 }
 
 /// Encode a check's `storage` map for the child environment.
@@ -1174,14 +1180,28 @@ async fn stage_check_storage(
     Ok(())
 }
 
-fn contained_control_file(
+pub(crate) fn contained_control_file(
     path: &std::path::Path,
     root: &std::path::Path,
 ) -> std::result::Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !control_directory_is_real(root) {
+        return Err(
+            "QA host control directory must be private and owned by the effective uid".into(),
+        );
+    }
     let meta = std::fs::symlink_metadata(path)
         .map_err(|error| format!("could not inspect host descriptor: {error}"))?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err("host descriptor must be a regular file under the QA control directory".into());
+    if meta.file_type().is_symlink()
+        || !meta.is_file()
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.mode() & 0o077 != 0
+    {
+        return Err(
+            "host descriptor must be a private regular file owned by the effective uid under the QA control directory"
+                .into(),
+        );
     }
     let path = path
         .canonicalize()
@@ -1206,11 +1226,7 @@ fn start_host_with_policy(
     storage: Option<&str>,
 ) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
     let mut command = std::process::Command::new(host);
-    let control_dir = if clean_environment {
-        Some(plan_control_directory()?)
-    } else {
-        None
-    };
+    let control_dir = Some(plan_control_directory()?);
     if clean_environment {
         // Run plans must not forward unrelated secrets or application config
         // to the browser process. Page, storage and control are the explicit
@@ -1268,8 +1284,13 @@ fn start_host_with_policy(
 
     // Readiness drives stdout, and the host owns the task until it is killed.
     let stdout = child.child.stdout.take().expect("stdout was piped");
+    let output_root = child
+        .control_dir
+        .as_ref()
+        .expect("host control directory was allocated")
+        .clone();
     child.output = Some(
-        crate::child_output::HostOutput::start(stdout, suppress_host_output)
+        crate::child_output::HostOutput::start(stdout, suppress_host_output, output_root)
             .map_err(|error| format!("reading host stdout: {error}"))?,
     );
     let output = child.output.as_ref().expect("stdout task was installed");
@@ -1278,11 +1299,11 @@ fn start_host_with_policy(
             // Once::recv transferred the sole descriptor Arc to this caller.
             let announced = Arc::try_unwrap(path)
                 .map_err(|_| "host descriptor ownership was not transferred".to_owned())?;
-            let announced = if let Some(root) = &child.control_dir {
-                contained_control_file(&announced, root)?
-            } else {
-                announced
-            };
+            let root = child
+                .control_dir
+                .as_ref()
+                .ok_or_else(|| "host control directory was not allocated".to_owned())?;
+            let announced = contained_control_file(&announced, root)?;
             Ok((child, announced))
         }
         _ => Err("the host never announced a descriptor".to_owned()),

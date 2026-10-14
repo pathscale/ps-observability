@@ -314,6 +314,7 @@ impl Secret {
         let mut forms = vec![self.value.clone()];
         forms.extend(url_encoded_forms(&self.value));
         forms.extend(base64_forms(&self.value));
+        forms.extend(hex_forms(&self.value));
         if let Ok(value) = std::str::from_utf8(&self.value) {
             if let Ok(quoted) = serde_json::to_string(value) {
                 forms.push(quoted.as_bytes().to_vec());
@@ -382,15 +383,48 @@ fn percent_encode(value: &[u8], flavor: UrlFlavor, lowercase: bool) -> Vec<u8> {
     encoded
 }
 
+fn hex_forms(value: &[u8]) -> Vec<Vec<u8>> {
+    let mut forms = Vec::with_capacity(2);
+    for digits in [b"0123456789abcdef", b"0123456789ABCDEF"] {
+        let mut encoded = Vec::with_capacity(value.len().saturating_mul(2));
+        for &byte in value {
+            encoded.push(digits[(byte >> 4) as usize]);
+            encoded.push(digits[(byte & 0x0f) as usize]);
+        }
+        forms.push(encoded);
+    }
+    forms
+}
+
 fn base64_forms(value: &[u8]) -> Vec<Vec<u8>> {
     const STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const URL_SAFE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    vec![
+    let mut forms = vec![
         base64_encode(value, STANDARD, true),
         base64_encode(value, STANDARD, false),
         base64_encode(value, URL_SAFE, true),
         base64_encode(value, URL_SAFE, false),
-    ]
+    ];
+    if value.len() >= 6 {
+        for alphabet in [STANDARD, URL_SAFE] {
+            for offset in 0_usize..3 {
+                let mut aligned = vec![0_u8; offset];
+                aligned.extend_from_slice(value);
+                let encoded = base64_encode(&aligned, alphabet, false);
+
+                // Keep only sextets composed entirely of secret bits.
+                let start = (offset * 8).div_ceil(6);
+                let end = (aligned.len() / 3) * 4
+                    + match aligned.len() % 3 {
+                        0 => 0,
+                        1 => 1,
+                        _ => 2,
+                    };
+                forms.push(encoded[start..end].to_vec());
+            }
+        }
+    }
+    forms
 }
 
 fn base64_encode(value: &[u8], alphabet: &[u8; 64], padding: bool) -> Vec<u8> {
