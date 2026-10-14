@@ -109,7 +109,7 @@ pub fn monitor(caps: Arc<Caps>) -> Option<Monitor> {
     if caps.hard[..6].iter().all(|value| *value == u64::MAX - 1) {
         return None;
     }
-    let stopping = Arc::new(blitz_control_protocol::latest::Flag::new());
+    let stopping = blitz_control_protocol::latest::Flag::new();
     let task = enqueue(Arc::clone(&caps), Arc::clone(&stopping));
     Some(Monitor {
         stopping,
