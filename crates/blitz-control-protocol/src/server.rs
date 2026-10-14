@@ -4,7 +4,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use endpoint_libs::libs::ws::mcp_wire::{INVALID_REQUEST, JsonRpcError};
@@ -15,7 +15,7 @@ use endpoint_libs::libs::ws::transport::framed::framed_json_neutral;
 use endpoint_libs::libs::ws::transport::nagoya::NagoyaStream;
 use endpoint_libs::libs::ws::{MessageStream, StreamError, WireMessage};
 use nagoya::reactor::socket::TcpListener as BoundListener;
-use nagoya::reactor::{Addr, Reactor, TcpListener, TcpStream, block_on_with};
+use nagoya::reactor::{Addr, Reactor, TcpListener, TcpStream};
 
 use crate::{
     AgentControlRequest, DebugDescriptor, DebugEvent, DebugResponse, DebugStream,
@@ -98,7 +98,7 @@ pub struct AgentControlServer {
     descriptor_path: PathBuf,
     socket_path: PathBuf,
     shutdown: Option<Arc<Flag>>,
-    thread: Option<JoinHandle<()>>,
+    task: Option<nagoya::JoinHandle<Arc<ServerWork>>>,
     /// Holds deep-profiling collection open while a tool can attach.
     ///
     /// The consumer is out of process, so it cannot hold a session itself and
@@ -121,7 +121,7 @@ impl AgentControlServer {
     /// Bind the inspection socket and announce the descriptor.
     ///
     /// Nothing here needs a window: it creates a Unix listener, writes a
-    /// descriptor file and serves frames from a thread. A headless host that
+    /// descriptor file and serves frames through nagoya. A headless host that
     /// owns a document can call this and be inspected exactly like the real
     /// application, which is what lets a QA sweep run with no display server
     /// and still answer questions that require clicking.
@@ -180,13 +180,15 @@ impl AgentControlServer {
 
         // Bound here, before `start` returns, so a caller that connects the
         // moment it has the path finds a socket listening. Registering it on a
-        // reactor is the server thread's job; binding is not, and doing it
+        // reactor is done here as well; binding is not deferred, since doing it
         // there was a race the tests caught immediately.
         let addr = Addr::path(socket_path.as_os_str().as_bytes())
             .map_err(|_| io::Error::other("socket path is not a valid unix address"))?;
         let listener = BoundListener::bind(addr, 128)
             .map_err(|error| io::Error::other(format!("bind: {error:?}")))?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+        let listener = TcpListener::from_listener(listener, &server_reactor()?)
+            .map_err(|error| io::Error::other(format!("register listener: {error:?}")))?;
 
         let descriptor = DebugDescriptor {
             protocol_version: crate::DEBUG_PROTOCOL_VERSION,
@@ -200,16 +202,19 @@ impl AgentControlServer {
         reap_dead_descriptors(&descriptor_path);
 
         let shutdown_flag = Flag::new();
-        let shutdown_for_thread = Arc::clone(&shutdown_flag);
-        let thread = thread::Builder::new()
-            .name("blitz-agent-control".into())
-            .spawn(move || run(listener, bridge, host, events, shutdown_for_thread))?;
+        let task = enqueue(Arc::new(ServerWork {
+            listener,
+            bridge,
+            host,
+            events,
+            shutdown: Arc::clone(&shutdown_flag),
+        }));
 
         Ok(Self {
             descriptor_path,
             socket_path,
             shutdown: Some(shutdown_flag),
-            thread: Some(thread),
+            task: Some(task),
             // Taken after the socket is listening, so a permitted profile
             // begins collecting for the tool that is now able to attach, and
             // stops again when this server is dropped.
@@ -260,64 +265,51 @@ impl Drop for AgentControlServer {
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.raise();
         }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(task) = self.task.take() {
+            drop(nagoya::block_on(task));
         }
         let _ = remove_file(&self.socket_path);
         let _ = remove_file(&self.descriptor_path);
     }
 }
-fn run(
-    listener: BoundListener,
+struct ServerWork {
+    listener: TcpListener,
     bridge: ControlBridge,
     host: Host,
     events: Option<EventSource>,
     shutdown: Arc<Flag>,
-) {
-    // One reactor, owned by this thread, driving the listener and every
-    // connection on it. A nagoya socket makes progress only while its own
-    // reactor is polled, so the listener and the connections accepted from it
-    // have to share one.
-    let reactor = match Reactor::local() {
-        Ok(reactor) => reactor,
-        Err(error) => {
-            eprintln!("control socket reactor could not start: {error:?}");
-            return;
-        }
-    };
-    let handle = reactor.handle();
-    // Registered, not bound: the socket was bound in `start_inner` so that it
-    // is listening before `start` returns. Registration is what has to happen
-    // here, because it ties the listener to the reactor this thread polls.
-    let listener = match TcpListener::from_listener(listener, &handle) {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("control socket could not register on the reactor: {error:?}");
-            return;
-        }
-    };
+}
 
-    block_on_with(&reactor, async move {
-        use futures::StreamExt;
-        use futures::future::{Either, select};
-        use futures::stream::FuturesUnordered;
+fn server_reactor() -> io::Result<nagoya::reactor::Handle> {
+    static REACTOR: std::sync::OnceLock<io::Result<Reactor>> = std::sync::OnceLock::new();
+    REACTOR
+        .get_or_init(|| {
+            Reactor::start().map_err(|error| io::Error::other(format!("control reactor: {error:?}")))
+        })
+        .as_ref()
+        .map(Reactor::handle)
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+}
 
-        // Connections are held here and polled in place rather than spawned.
-        // nagoya's `TaskSet` is the purpose-built runner for non-Send tasks on
-        // one thread, but it never removes a finished task's entry: the slot
-        // stays so a late wake still has a link to follow. A set fed by
-        // unbounded connection churn therefore grows one entry per connection
-        // ever accepted. A debug socket that a QA harness reconnects to in a
-        // loop is exactly that churn. `FuturesUnordered` drops what finishes.
+fn enqueue(work: Arc<ServerWork>) -> nagoya::JoinHandle<Arc<ServerWork>> {
+    nagoya::spawn(run(work))
+}
+
+async fn run(work: Arc<ServerWork>) -> Arc<ServerWork> {
+    use futures::StreamExt;
+    use futures::future::{Either, select};
+    use futures::stream::FuturesUnordered;
+
+    // Completed connections leave the set, so reconnecting does not retain
+    // one task slot for every connection the server has ever accepted.
+    {
         let mut connections = FuturesUnordered::new();
-
         loop {
-            let stopping = shutdown.raised();
-            let accepted = listener.accept();
+            let stopping = work.shutdown.raised();
+            let accepted = work.listener.accept();
             futures::pin_mut!(stopping, accepted);
 
-            // Shutdown is the outer left arm so a raised flag is not stuck
-            // behind an accept, or behind a live connection that is also ready.
+            // The shutdown flag wins over readiness from any connection.
             let accepted = if connections.is_empty() {
                 match select(stopping, accepted).await {
                     Either::Left(_) => break,
@@ -329,7 +321,6 @@ fn run(
                 match select(stopping, progress).await {
                     Either::Left(_) => break,
                     Either::Right((Either::Left((accepted, _)), _)) => accepted,
-                    // A connection finished and the set has already dropped it.
                     Either::Right((Either::Right(_), _)) => continue,
                 }
             };
@@ -339,12 +330,14 @@ fn run(
             };
             connections.push(handle_connection(
                 stream,
-                Arc::clone(&bridge),
-                host.clone(),
-                events.clone(),
+                Arc::clone(&work.bridge),
+                work.host.clone(),
+                work.events.clone(),
             ));
         }
-    });
+    }
+    // Every connection is dropped before the finished work changes owner.
+    work
 }
 
 enum ConnectionInput {
