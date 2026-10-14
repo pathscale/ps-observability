@@ -7,6 +7,9 @@
 //! exits naming the cap when the hard value is passed. No `unsafe` here: rustix and
 //! libproc provide the system calls.
 
+// Each binary uses a different subset of these helpers.
+#![allow(dead_code)]
+
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
