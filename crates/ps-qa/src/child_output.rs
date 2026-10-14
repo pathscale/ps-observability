@@ -26,7 +26,10 @@ impl Pipe {
         let registration = handle
             .register(stdout.as_raw_fd(), Interest::READABLE)
             .map_err(|error| io::Error::other(format!("host stdout registration: {error:?}")))?;
-        Ok(Self { registration, stdout })
+        Ok(Self {
+            registration,
+            stdout,
+        })
     }
 }
 
@@ -80,7 +83,8 @@ fn reactor() -> io::Result<Handle> {
     static REACTOR: OnceLock<io::Result<Reactor>> = OnceLock::new();
     REACTOR
         .get_or_init(|| {
-            Reactor::start().map_err(|error| io::Error::other(format!("host stdout reactor: {error:?}")))
+            Reactor::start()
+                .map_err(|error| io::Error::other(format!("host stdout reactor: {error:?}")))
         })
         .as_ref()
         .map(Reactor::handle)
@@ -96,7 +100,10 @@ impl HostOutput {
             suppress,
         });
         let task = enqueue(Arc::clone(&work));
-        Ok(Self { work, task: Some(task) })
+        Ok(Self {
+            work,
+            task: Some(task),
+        })
     }
 
     pub(crate) async fn descriptor(&self) -> Option<Arc<PathBuf>> {
@@ -118,7 +125,11 @@ fn enqueue(work: Arc<OutputWork>) -> nagoya::JoinHandle<Arc<OutputWork>> {
 }
 
 async fn drain(work: Arc<OutputWork>) -> Arc<OutputWork> {
-    let pipe = work.pipe.lock().unwrap_or_else(|error| error.into_inner()).take();
+    let pipe = work
+        .pipe
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
     if let Some(pipe) = pipe {
         let mut reader = BufReader::new(pipe);
         let mut line = String::new();

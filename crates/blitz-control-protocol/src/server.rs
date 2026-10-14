@@ -11,9 +11,9 @@ use endpoint_libs::libs::ws::mcp_wire::{INVALID_REQUEST, JsonRpcError};
 use endpoint_libs::libs::ws::transport::TransportStream;
 
 use crate::latest::{Flag, Latest, Once};
+pub(crate) use endpoint_libs::libs::ws::MessageStream;
 use endpoint_libs::libs::ws::transport::framed::framed_json_neutral;
 use endpoint_libs::libs::ws::transport::nagoya::NagoyaStream;
-pub(crate) use endpoint_libs::libs::ws::MessageStream;
 use endpoint_libs::libs::ws::{StreamError, WireMessage};
 use nagoya::reactor::socket::TcpListener as BoundListener;
 use nagoya::reactor::{Addr, Reactor, TcpListener, TcpStream};
@@ -285,7 +285,8 @@ fn server_reactor() -> io::Result<nagoya::reactor::Handle> {
     static REACTOR: std::sync::OnceLock<io::Result<Reactor>> = std::sync::OnceLock::new();
     REACTOR
         .get_or_init(|| {
-            Reactor::start().map_err(|error| io::Error::other(format!("control reactor: {error:?}")))
+            Reactor::start()
+                .map_err(|error| io::Error::other(format!("control reactor: {error:?}")))
         })
         .as_ref()
         .map(Reactor::handle)
@@ -366,9 +367,9 @@ async fn handle_connection(
     host: Host,
     events: Option<EventSource>,
 ) {
-    let mut stream = crate::server_stream::ServerStream(TransportStream::new(
-        framed_json_neutral(NagoyaStream::new(stream)),
-    ));
+    let mut stream = crate::server_stream::ServerStream(TransportStream::new(framed_json_neutral(
+        NagoyaStream::new(stream),
+    )));
     let mut observed = Vec::<DebugStream>::new();
     // This reader's position in the event stream. Held here rather than in the
     // slot, because two connections read the same `Latest` from different

@@ -3,11 +3,11 @@
 #![allow(dead_code)]
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use std::future::Future;
 
 const NAMES: [&str; 9] = [
     "rss",
@@ -75,7 +75,9 @@ pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
             fail(format!("CAP_BAD_PARAMETER warn-{name} needs max-{name}"));
         }
         if hard[i] != u64::MAX - 1 {
-            warn[i] = warning.map(|value| number(&value)).unwrap_or((hard[i] / 2).max(1));
+            warn[i] = warning
+                .map(|value| number(&value))
+                .unwrap_or((hard[i] / 2).max(1));
             if warn[i] > hard[i] {
                 fail(format!("CAP_BAD_PARAMETER warn-{name} exceeds max-{name}"));
             }
@@ -89,7 +91,9 @@ pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
         stage: Mutex::new(Arc::from("startup")),
         started: Instant::now(),
     });
-    STATE.set(Arc::clone(&caps)).unwrap_or_else(|_| fail("CAP_ALREADY_STARTED"));
+    STATE
+        .set(Arc::clone(&caps))
+        .unwrap_or_else(|_| fail("CAP_ALREADY_STARTED"));
     #[cfg(unix)]
     install_kernel_limits(&hard);
     caps.tick();
@@ -107,7 +111,10 @@ pub fn monitor(caps: Arc<Caps>) -> Option<Monitor> {
     }
     let stopping = Arc::new(blitz_control_protocol::latest::Flag::new());
     let task = enqueue(Arc::clone(&caps), Arc::clone(&stopping));
-    Some(Monitor { stopping, task: Some(task) })
+    Some(Monitor {
+        stopping,
+        task: Some(task),
+    })
 }
 
 fn enqueue(
@@ -148,10 +155,10 @@ impl Drop for Monitor {
 #[cfg(unix)]
 fn install_kernel_limits(hard: &[u64; 9]) {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
-    for (resource, requested, margin) in
-        [(Resource::Nofile, hard[3], 0)]
-    {
-        if requested == u64::MAX - 1 { continue; }
+    for (resource, requested, margin) in [(Resource::Nofile, hard[3], 0)] {
+        if requested == u64::MAX - 1 {
+            continue;
+        }
         let inherited = getrlimit(resource);
         let soft = requested.saturating_add(margin);
         if inherited.maximum.is_some_and(|max| soft > max) {
@@ -218,7 +225,9 @@ fn index(name: &str) -> usize {
 
 impl Caps {
     fn check(&self, index: usize, value: u64) {
-        if self.hard[index] == u64::MAX - 1 { return; }
+        if self.hard[index] == u64::MAX - 1 {
+            return;
+        }
         if value >= self.warn[index] && !self.warned[index].swap(true, Ordering::Relaxed) {
             let stage = self.stage.lock().unwrap_or_else(|_| fail("CAP_STAGE_LOCK"));
             eprintln!(
@@ -240,7 +249,9 @@ impl Caps {
         }
     }
     fn tick(&self) {
-        if self.hard[..6].iter().all(|value| *value == u64::MAX - 1) { return; }
+        if self.hard[..6].iter().all(|value| *value == u64::MAX - 1) {
+            return;
+        }
         let sample = sample(self.hard[3].min(65_536), self.hard[4].min(65_536))
             .unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}")));
         self.check(0, sample.rss);
@@ -271,10 +282,14 @@ fn sample(_max_files: u64, _max_procs: u64) -> std::io::Result<Sample> {
     use libproc::task_info::TaskInfo;
     let pid = std::process::id();
     let info = pidinfo::<TaskInfo>(pid as i32, 0).map_err(std::io::Error::other)?;
-    let descriptor_limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current.unwrap_or(65_536);
+    let descriptor_limit = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .current
+        .unwrap_or(65_536);
     let slots = descriptor_limit.min(current().hard[3]).saturating_add(1);
     let bytes = slots.saturating_mul(std::mem::size_of::<libproc::file_info::ProcFDInfo>() as u64);
-    if bytes > i32::MAX as u64 { return Err(std::io::Error::other("descriptor census out of range")); }
+    if bytes > i32::MAX as u64 {
+        return Err(std::io::Error::other("descriptor census out of range"));
+    }
     current().check(0, info.pti_resident_size.saturating_add(bytes));
     let files = listpidinfo::<ListFDs>(pid as i32, slots as usize)
         .map_err(std::io::Error::other)?
@@ -377,14 +392,21 @@ pub fn read_limited(mut reader: impl std::io::Read, maximum: u64) -> std::io::Re
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             result => result?,
         };
-        if count == 0 { return Ok(bytes); }
+        if count == 0 {
+            return Ok(bytes);
+        }
         let next = (bytes.len() as u64).saturating_add(count as u64);
         check("input-bytes", next);
         if next > maximum {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "input byte budget exceeded"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "input byte budget exceeded",
+            ));
         }
         reserve_bytes(count as u64);
-        bytes.try_reserve_exact(count).map_err(std::io::Error::other)?;
+        bytes
+            .try_reserve_exact(count)
+            .map_err(std::io::Error::other)?;
         bytes.extend_from_slice(&block[..count]);
     }
 }
@@ -393,12 +415,18 @@ pub fn read_stdin() -> std::io::Result<String> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 pub fn reserve_bytes(additional: u64) {
-    if hard("rss") == u64::MAX - 1 { return; }
+    if hard("rss") == u64::MAX - 1 {
+        return;
+    }
     let rss = sample(current().hard[3].min(65_536), current().hard[4].min(65_536))
-        .unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}"))).rss;
+        .unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}")))
+        .rss;
     check("rss", rss.saturating_add(additional));
 }
 
 pub fn args() -> impl Iterator<Item = String> {
-    args_os().map(|s| s.into_string().unwrap_or_else(|_| fail("CAP_NON_UTF8_ARGUMENT")))
+    args_os().map(|s| {
+        s.into_string()
+            .unwrap_or_else(|_| fail("CAP_NON_UTF8_ARGUMENT"))
+    })
 }
