@@ -279,7 +279,7 @@ fn find_text_field<'a>(
         // Keep exact-match priority even when the matching field is disabled.
         // An unusable match in a higher-priority scope must not select the background.
         scoped.retain(|node| node.enabled);
-        return unique_text_field(scoped.into_iter());
+        return unique_text_field(scoped);
     }
     let mut global: Vec<&SemanticNode> = fields.into_iter().filter(matches_name).collect();
     if !want.is_empty()
@@ -290,7 +290,7 @@ fn find_text_field<'a>(
         global.retain(|node| exact_selector_matches_node(node, want));
     }
     global.retain(|node| node.enabled);
-    unique_text_field(global.into_iter())
+    unique_text_field(global)
 }
 
 /// Drive real key events into a focused text field and price them.
