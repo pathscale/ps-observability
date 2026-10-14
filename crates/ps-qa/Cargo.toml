@@ -22,8 +22,9 @@ publish = true
 # `izumo` for the same types would build a browser engine to send
 # a wheel event. `cargo tree -p ps-qa` is the check.
 [dependencies]
-rustix = { version = "^1.1", features = ["process", "time", "std"] }
-nagoya = { version = "^0.1.12", features = ["reactor"] }
+rustix = { version = "^1.1", features = ["process", "time", "std", "fs"] }
+nagoya = { version = "^0.1.16", features = ["reactor"] }
+futures = "^0.3"
 blitz-control-protocol = { workspace = true, features = ["client"] }
 # The same framing the server uses, from the same crate, for the same reason as
 # the protocol types: a hand-rolled length-prefix reader is how the Python

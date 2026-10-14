@@ -1,4 +1,7 @@
 disallowed-methods = [
+  { path = "std::thread::spawn", reason = "owner ruling: typed Arc<T> hand-off, concurrency only via nagoya/ps-st3" },
+  { path = "std::thread::Builder::spawn", reason = "owner ruling: typed Arc<T> hand-off, concurrency only via nagoya/ps-st3" },
+  { path = "std::thread::scope", reason = "owner ruling: typed Arc<T> hand-off, concurrency only via nagoya/ps-st3" },
   { path = "std::fs::write", reason = "Route file writes through the guarded writer, which refuses secret values." },
   { path = "std::fs::File::create", reason = "Route file writes through the guarded writer, which refuses secret values." },
   { path = "std::fs::OpenOptions::open", reason = "Route file writes through the guarded writer, which refuses secret values." },
@@ -11,4 +14,9 @@ disallowed-methods = [
   { path = "std::io::Write::write", reason = "Route file writes through the guarded writer, which refuses secret values." },
   { path = "std::io::Write::write_all", reason = "Route file writes through the guarded writer, which refuses secret values." },
   { path = "std::io::Write::write_fmt", reason = "Route file writes through the guarded writer, which refuses secret values." },
+]
+disallowed-types = [
+  { path = "std::sync::Barrier", reason = "owner ruling: typed Arc<T> hand-off, concurrency only via nagoya/ps-st3" },
+  { path = "std::sync::mpsc::Sender", reason = "owner ruling: typed Arc<T> hand-off, concurrency only via nagoya/ps-st3" },
+  { path = "std::sync::Condvar", reason = "owner ruling: typed Arc<T> hand-off, concurrency only via nagoya/ps-st3" },
 ]

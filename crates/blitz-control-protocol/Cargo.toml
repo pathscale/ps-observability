@@ -68,7 +68,7 @@ client = ["dep:eyre", "dep:nagoya", "dep:futures"]
 
 [dependencies]
 endpoint-libs.workspace = true
-nagoya = { version = "^0.1", features = ["reactor"], optional = true }
+nagoya = { version = "^0.1.16", features = ["reactor"], optional = true }
 futures = { version = "^0.3", optional = true }
 serde.workspace = true
 serde_json.workspace = true
