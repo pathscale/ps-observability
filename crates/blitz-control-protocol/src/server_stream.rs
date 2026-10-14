@@ -1,7 +1,8 @@
 //! Concrete futures for the server task, preserving MessageStream semantics.
 
 use endpoint_libs::libs::ws::transport::{Transport, TransportStream};
-use endpoint_libs::libs::ws::{MessageStream, StreamError, WireMessage};
+use crate::server::MessageStream;
+use endpoint_libs::libs::ws::{StreamError, WireMessage};
 use futures::{SinkExt, StreamExt};
 
 // MessageStream uses async_trait(?Send) for UI callers. The shared nagoya pool

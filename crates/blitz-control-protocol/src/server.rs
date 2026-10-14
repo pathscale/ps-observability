@@ -13,7 +13,8 @@ use endpoint_libs::libs::ws::transport::TransportStream;
 use crate::latest::{Flag, Latest, Once};
 use endpoint_libs::libs::ws::transport::framed::framed_json_neutral;
 use endpoint_libs::libs::ws::transport::nagoya::NagoyaStream;
-use endpoint_libs::libs::ws::{MessageStream, StreamError, WireMessage};
+pub(crate) use endpoint_libs::libs::ws::MessageStream;
+use endpoint_libs::libs::ws::{StreamError, WireMessage};
 use nagoya::reactor::socket::TcpListener as BoundListener;
 use nagoya::reactor::{Addr, Reactor, TcpListener, TcpStream};
 

@@ -17,4 +17,3 @@ endpoint-libs = { version = "^3.3.3", default-features = false, features = ["age
 serde = { version = "^1", features = ["derive"] }
 serde_json = "^1"
 schemars = "^1"
-tokio = { version = "^1" }
