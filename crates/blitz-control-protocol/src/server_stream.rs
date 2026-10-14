@@ -17,12 +17,12 @@ where
     pub(crate) async fn send(&mut self, message: WireMessage) -> Result<(), StreamError> {
         self.0.0.send(message)
             .await
-            .map_err(|error| StreamError::Other(eyre::eyre!(error)))
+            .map_err(|error| StreamError::Other(error.into()))
     }
 
     pub(crate) async fn recv(&mut self) -> Option<Result<WireMessage, StreamError>> {
         self.0.0.next()
             .await
-            .map(|result| result.map_err(|error| StreamError::Other(eyre::eyre!(error))))
+            .map(|result| result.map_err(|error| StreamError::Other(error.into())))
     }
 }
