@@ -1,21 +1,13 @@
-//! Application resource caps, compiled into each binary (never a library).
-//!
-//! Every cap is a parameter: `--max-<name>` / `--warn-<name>` on the command line,
-//! stripped before the application parses its own arguments. Defaults come from the
-//! binary's `start` call. Resident size is measured, never virtual. Each cap warns
-//! once at its warn threshold (default 50%) naming the current stage, and the process
-//! exits naming the cap when the hard value is passed. No `unsafe` here: rustix and
-//! libproc provide the system calls.
+//! Application-only caps. Environment config preserves the original CLI.
 
-// Each binary uses a different subset of these helpers.
 #![allow(dead_code)]
 
 use std::ffi::OsString;
-use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use std::future::Future;
 
 const NAMES: [&str; 9] = [
     "rss",
@@ -57,116 +49,90 @@ fn number(value: &str) -> u64 {
         .parse::<u64>()
         .ok()
         .and_then(|n| n.checked_mul(scale))
-        .filter(|n| *n > 0 && *n < u64::MAX)
+        .filter(|n| *n > 0 && *n < u64::MAX - 1)
         .unwrap_or_else(|| fail(format!("CAP_BAD_PARAMETER value={value:?}")))
 }
 
+/// Configure this binary with APP_CAP_MAX_<NAME> and APP_CAP_WARN_<NAME>.
+/// Hyphens become underscores. No config means the legacy invocation is uncapped.
+/// APP_CAP_PROFILE=default explicitly selects the defaults supplied by main.
 pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
-    let mut hard = defaults;
-    let mut supplied = [None; 9];
-    let mut args = Vec::new();
-    let mut raw = std::env::args_os();
-    args.push(raw.next().unwrap_or_default());
-    let mut positional = false;
-    let mut help = false;
-    while let Some(arg) = raw.next() {
-        if positional {
-            args.push(arg);
-            continue;
+    let profile = std::env::var_os("APP_CAP_PROFILE");
+    if profile.as_deref().is_some_and(|s| s != "default") {
+        fail("CAP_BAD_PARAMETER APP_CAP_PROFILE requires default");
+    }
+    let mut hard = [u64::MAX - 1; 9];
+    let mut warn = [u64::MAX - 1; 9];
+    for (i, name) in NAMES.iter().enumerate() {
+        let key = name.replace('-', "_").to_uppercase();
+        let maximum = std::env::var(format!("APP_CAP_MAX_{key}"));
+        let warning = std::env::var(format!("APP_CAP_WARN_{key}"));
+        if let Ok(value) = maximum {
+            hard[i] = number(&value);
+        } else if profile.is_some() {
+            hard[i] = defaults[i];
+        } else if warning.is_ok() {
+            fail(format!("CAP_BAD_PARAMETER warn-{name} needs max-{name}"));
         }
-        if arg == "--" {
-            positional = true;
-            args.push(arg);
-            continue;
-        }
-        let text = arg.to_string_lossy();
-        if text == "--caps-help" {
-            help = true;
-            continue;
-        }
-        let (flag, inline) = text
-            .split_once('=')
-            .map_or((text.as_ref(), None), |(k, v)| (k, Some(v)));
-        let cap = flag
-            .strip_prefix("--max-")
-            .map(|s| (s, false))
-            .or_else(|| flag.strip_prefix("--warn-").map(|s| (s, true)));
-        let matched = cap.and_then(|(name, warning)| {
-            NAMES
-                .iter()
-                .position(|n| *n == name)
-                .map(|index| (index, warning))
-        });
-        if let Some((index, warning)) = matched {
-            let value = inline.map(str::to_owned).unwrap_or_else(|| {
-                raw.next()
-                    .and_then(|s| s.into_string().ok())
-                    .unwrap_or_else(|| fail(format!("CAP_BAD_PARAMETER flag={flag}")))
-            });
-            if warning {
-                supplied[index] = Some(number(&value));
-            } else {
-                hard[index] = number(&value);
+        if hard[i] != u64::MAX - 1 {
+            warn[i] = warning.map(|value| number(&value)).unwrap_or((hard[i] / 2).max(1));
+            if warn[i] > hard[i] {
+                fail(format!("CAP_BAD_PARAMETER warn-{name} exceeds max-{name}"));
             }
-            continue;
         }
-        args.push(arg);
-    }
-    let warn = std::array::from_fn(|i| supplied[i].unwrap_or((hard[i] / 2).max(1)));
-    for i in 0..9 {
-        if warn[i] > hard[i] {
-            fail(format!(
-                "CAP_BAD_PARAMETER warn-{}={} max={}",
-                NAMES[i], warn[i], hard[i]
-            ));
-        }
-        if help {
-            println!(
-                "--max-{} {} --warn-{} {}",
-                NAMES[i], hard[i], NAMES[i], warn[i]
-            );
-        }
-    }
-    if help {
-        std::process::exit(0);
     }
     let caps = Arc::new(Caps {
         hard,
         warn,
         warned: std::array::from_fn(|_| AtomicBool::new(false)),
-        args: args.into(),
+        args: std::env::args_os().collect::<Vec<_>>().into(),
         stage: Mutex::new(Arc::from("startup")),
         started: Instant::now(),
     });
-    STATE
-        .set(Arc::clone(&caps))
-        .unwrap_or_else(|_| fail("CAP_ALREADY_STARTED"));
-    caps.tick();
+    STATE.set(Arc::clone(&caps)).unwrap_or_else(|_| fail("CAP_ALREADY_STARTED"));
     #[cfg(unix)]
     install_kernel_limits(&hard);
-    let monitor = Arc::clone(&caps);
-    let runtime = nagoya::runtime::Runtime::new(1);
-    drop(runtime.spawn(async move {
-        loop {
-            nagoya::sleep(Duration::from_millis(250)).await;
-            monitor.tick();
-        }
-    }));
+    caps.tick();
+    if hard[..6].iter().any(|value| *value != u64::MAX - 1) {
+        let runtime = nagoya::runtime::Runtime::new(1);
+        drop(runtime.spawn(CensusTimer {
+            caps: Arc::clone(&caps),
+            deadline: nagoya::time::sleep(Duration::from_secs(1)),
+        }));
+    }
     caps
 }
 
-/// Kernel backstops. The 250 ms sampler names the CPU cap first; the kernel
-/// limit sits two seconds above it and kills the process if the sampler cannot.
+// A registered nagoya timer wakes the census; there is no sleep-loop thread.
+struct CensusTimer {
+    caps: Arc<Caps>,
+    deadline: nagoya::time::Sleep,
+}
+impl std::future::Future for CensusTimer {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let timer = self.get_mut();
+        if std::pin::Pin::new(&mut timer.deadline).poll(cx).is_ready() {
+            timer.caps.tick();
+            timer.deadline = nagoya::time::sleep(Duration::from_secs(1));
+            let _ = std::pin::Pin::new(&mut timer.deadline).poll(cx);
+        }
+        std::task::Poll::Pending
+    }
+}
+
+/// Kernel backstops leave time for the timer to report CPU exhaustion by name.
 #[cfg(unix)]
 fn install_kernel_limits(hard: &[u64; 9]) {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
     for (resource, requested, margin) in
-        [(Resource::Cpu, hard[1], 2), (Resource::Nofile, hard[3], 0)]
+        [(Resource::Nofile, hard[3], 0)]
     {
+        if requested == u64::MAX - 1 { continue; }
         let inherited = getrlimit(resource);
         let soft = requested.saturating_add(margin);
         if inherited.maximum.is_some_and(|max| soft > max) {
-            fail("CAP_INHERITED_HARD_LIMIT");
+            continue;
         }
         let maximum = if margin > 0 {
             Some(soft.saturating_add(1))
@@ -211,11 +177,13 @@ pub fn stage(value: impl Into<Arc<str>>) {
         .stage
         .lock()
         .unwrap_or_else(|_| fail("CAP_STAGE_LOCK")) = value.into();
+    current().tick();
 }
 pub fn hard(name: &str) -> u64 {
     current().hard[index(name)]
 }
 pub fn check(name: &str, value: u64) {
+    current().tick();
     current().check(index(name), value);
 }
 fn index(name: &str) -> usize {
@@ -227,6 +195,7 @@ fn index(name: &str) -> usize {
 
 impl Caps {
     fn check(&self, index: usize, value: u64) {
+        if self.hard[index] == u64::MAX - 1 { return; }
         if value >= self.warn[index] && !self.warned[index].swap(true, Ordering::Relaxed) {
             let stage = self.stage.lock().unwrap_or_else(|_| fail("CAP_STAGE_LOCK"));
             eprintln!(
@@ -248,7 +217,8 @@ impl Caps {
         }
     }
     fn tick(&self) {
-        let sample = sample(self.hard[3], self.hard[4])
+        if self.hard[..6].iter().all(|value| *value == u64::MAX - 1) { return; }
+        let sample = sample(self.hard[3].min(65_536), self.hard[4].min(65_536))
             .unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}")));
         self.check(0, sample.rss);
         self.check(2, self.started.elapsed().as_secs());
@@ -271,21 +241,24 @@ struct Sample {
 }
 
 #[cfg(target_os = "macos")]
-fn sample(max_files: u64, max_procs: u64) -> std::io::Result<Sample> {
+fn sample(_max_files: u64, _max_procs: u64) -> std::io::Result<Sample> {
     use libproc::file_info::ListFDs;
     use libproc::proc_pid::{listpidinfo, pidinfo};
     use libproc::processes::{ProcFilter, pids_by_type};
     use libproc::task_info::TaskInfo;
     let pid = std::process::id();
     let info = pidinfo::<TaskInfo>(pid as i32, 0).map_err(std::io::Error::other)?;
-    // One slot past the cap so an overflow is still observed.
-    let files = listpidinfo::<ListFDs>(pid as i32, max_files.saturating_add(1) as usize)
+    let descriptor_limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current.unwrap_or(65_536);
+    let slots = descriptor_limit.min(current().hard[3]).saturating_add(1);
+    let bytes = slots.saturating_mul(std::mem::size_of::<libproc::file_info::ProcFDInfo>() as u64);
+    if bytes > i32::MAX as u64 { return Err(std::io::Error::other("descriptor census out of range")); }
+    current().check(0, info.pti_resident_size.saturating_add(bytes));
+    let files = listpidinfo::<ListFDs>(pid as i32, slots as usize)
         .map_err(std::io::Error::other)?
         .len() as u64;
     let procs = pids_by_type(ProcFilter::ByParentProcess { ppid: pid })?
         .into_iter()
         .filter(|p| *p > 0)
-        .take(max_procs.saturating_add(1) as usize)
         .count() as u64;
     Ok(Sample {
         rss: info.pti_resident_size,
@@ -335,10 +308,7 @@ pub fn read_bytes(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     stage(Arc::<str>::from(format!("read {}", path.display())));
     let file = std::fs::File::open(path)?;
     check("input-bytes", file.metadata()?.len());
-    let mut bytes = Vec::new();
-    file.take(hard("input-bytes") + 1).read_to_end(&mut bytes)?;
-    check("input-bytes", bytes.len() as u64);
-    Ok(bytes)
+    read_limited(file, hard("input-bytes"))
 }
 pub fn read_string(path: impl AsRef<Path>) -> std::io::Result<String> {
     String::from_utf8(read_bytes(path)?)
@@ -369,4 +339,43 @@ fn stop_owned() {
             let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
     }
+}
+
+/// Read into a fixed stack block, validate growth, then reserve exactly the accepted bytes.
+/// The extra overflow byte stays on the stack and never enters the output allocation.
+pub fn read_limited(mut reader: impl std::io::Read, maximum: u64) -> std::io::Result<Vec<u8>> {
+    let maximum = maximum.min(hard("input-bytes"));
+    let mut bytes = Vec::new();
+    let mut block = [0u8; 8192];
+    loop {
+        let remaining = maximum.saturating_sub(bytes.len() as u64);
+        let size = remaining.saturating_add(1).min(block.len() as u64) as usize;
+        let count = match reader.read(&mut block[..size]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 { return Ok(bytes); }
+        let next = (bytes.len() as u64).saturating_add(count as u64);
+        check("input-bytes", next);
+        if next > maximum {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "input byte budget exceeded"));
+        }
+        reserve_bytes(count as u64);
+        bytes.try_reserve_exact(count).map_err(std::io::Error::other)?;
+        bytes.extend_from_slice(&block[..count]);
+    }
+}
+pub fn read_stdin() -> std::io::Result<String> {
+    String::from_utf8(read_limited(std::io::stdin().lock(), hard("input-bytes"))?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+pub fn reserve_bytes(additional: u64) {
+    if hard("rss") == u64::MAX - 1 { return; }
+    let rss = sample(current().hard[3].min(65_536), current().hard[4].min(65_536))
+        .unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}"))).rss;
+    check("rss", rss.saturating_add(additional));
+}
+
+pub fn args() -> impl Iterator<Item = String> {
+    args_os().map(|s| s.into_string().unwrap_or_else(|_| fail("CAP_NON_UTF8_ARGUMENT")))
 }

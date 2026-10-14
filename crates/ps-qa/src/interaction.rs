@@ -179,6 +179,9 @@ pub(crate) async fn scroll_events(
     ticks: usize,
     delta: f64,
 ) -> Result<Vec<f64>> {
+    crate::app_caps::check("iterations", ticks as u64);
+    crate::app_caps::check("cache-entries", ticks as u64);
+    crate::app_caps::reserve_bytes((ticks as u64).saturating_mul(8));
     let mut latencies = Vec::with_capacity(ticks);
     for _ in 0..ticks {
         let started = Instant::now();
@@ -510,6 +513,9 @@ pub(crate) async fn type_keys(client: &mut Client, count: usize, want: &str) -> 
         .await?;
 
     let before = metrics_if_supported(client).await?;
+    crate::app_caps::check("iterations", count as u64);
+    crate::app_caps::check("cache-entries", count as u64);
+    crate::app_caps::reserve_bytes((count as u64).saturating_mul(8));
     let mut latencies = Vec::with_capacity(count);
     for index in 0..count {
         let letter = (b'a' + (index % 26) as u8) as char;
