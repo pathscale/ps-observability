@@ -1,5 +1,5 @@
 use std::fs::remove_file;
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -180,6 +180,7 @@ impl AgentControlServer {
         let directory = crate::control_directory::validate_directory(&directory)?;
         let descriptor_path = directory.join(format!("{instance_id}.json"));
         let socket_path = descriptor_path.with_extension("sock");
+        reap_dead_descriptors(&descriptor_path);
 
         // Bound here, before `start` returns, so a caller that connects the
         // moment it has the path finds a socket listening. Registering it on a
@@ -203,7 +204,6 @@ impl AgentControlServer {
         };
         crate::control_directory::validate_socket(&directory, &descriptor.address)?;
         write_descriptor(&descriptor_path, &descriptor)?;
-        reap_dead_descriptors(&descriptor_path);
 
         let shutdown_flag = Flag::new();
         let task = enqueue(Arc::new(ServerWork {
@@ -629,68 +629,114 @@ fn instance_id() -> String {
     format!("{}-{nanos:x}", std::process::id())
 }
 
-/// Whether a pid still names a live process.
-///
-/// `kill(pid, 0)` without a libc dependency, and `/proc` does not exist on
-/// macOS. A `ps` that cannot be run at all reports "live", because deleting
-/// another instance's descriptor on a bad guess is far worse than keeping a
-/// stale file.
+/// Treat every result except ESRCH as live or unknown.
 fn pid_is_live(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string()])
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(true)
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    // SAFETY: A positive PID and signal zero probe without sending a signal.
+    let result = unsafe { libc::kill(pid, 0) };
+    !(result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
 }
 
-/// Delete descriptors whose process is gone.
-///
-/// The name carries a pid and a nanosecond stamp, so every launch leaves a new
-/// pair behind and nothing ever removed them: a developer machine accumulates
-/// them indefinitely, and one here had **99**. `Drop` cleans up an orderly
-/// exit, but a crash, a `kill -9`, or a rebuild that unlinks the socket under a
-/// running instance all skip it.
-///
-/// That is not merely untidy. A tool discovering the current descriptor has to
-/// distinguish them, and a directory full of dead entries
-/// is what makes "attached to a stale socket and reported numbers for a process
-/// nobody is looking at" a routine failure rather than a rare one.
-///
-/// Only entries whose pid is dead are removed, so concurrent instances are left
-/// strictly alone — and this one's own descriptor is skipped by path, since it
-/// has just been written and its pid is obviously live.
+/// Sweep dead instances before binding, including orphaned sockets.
+/// Each entry must independently pass ownership and file-type checks.
 fn reap_dead_descriptors(own: &Path) {
     reap_dead_descriptors_with(own, pid_is_live);
 }
 
 fn reap_dead_descriptors_with(own: &Path, is_live: impl Fn(u32) -> bool) {
+    use std::os::unix::fs::MetadataExt;
+
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+
     let Some(dir) = own.parent() else { return };
-    if crate::control_directory::validate_directory(dir).is_err() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(dir) = crate::control_directory::validate_directory(dir) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path == own || path.extension().is_none_or(|ext| ext != "json") {
-            continue;
-        }
-        let Ok(mut file) = crate::control_directory::open_descriptor(&path) else {
+    let Ok(before) = std::fs::symlink_metadata(&dir) else {
+        return;
+    };
+    let Ok(fd) = rustix::fs::open(
+        &dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) else {
+        return;
+    };
+    let directory = std::fs::File::from(fd);
+    let Ok(after) = directory.metadata() else {
+        return;
+    };
+    let uid = rustix::process::geteuid().as_raw();
+    if !after.is_dir()
+        || after.uid() != uid
+        || after.mode() & 0o077 != 0
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+    {
+        return;
+    }
+    let Ok(entries) = rustix::fs::Dir::read_from(&directory) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
             continue;
         };
-        let mut text = String::new();
-        if file.read_to_string(&mut text).is_err() {
+        let name = entry.file_name();
+        let bytes = name.to_bytes();
+        if own.file_name().is_some_and(|own| own.as_bytes() == bytes) {
             continue;
         }
-        let Ok(descriptor) = serde_json::from_str::<DebugDescriptor>(&text) else {
+        let (stem, expected_type) = if let Some(stem) = bytes.strip_suffix(b".json") {
+            (stem, FileType::RegularFile)
+        } else if let Some(stem) = bytes.strip_suffix(b".sock") {
+            (stem, FileType::Socket)
+        } else {
             continue;
         };
-        if is_live(descriptor.pid) {
+        let Some(separator) = stem.iter().position(|byte| *byte == b'-') else {
+            continue;
+        };
+        let pid_bytes = &stem[..separator];
+        if pid_bytes.is_empty()
+            || !pid_bytes.iter().all(u8::is_ascii_digit)
+            || separator + 1 == stem.len()
+        {
             continue;
         }
-        let _ = remove_file(path.with_extension("sock"));
-        let _ = remove_file(&path);
+        let Some(pid) = std::str::from_utf8(pid_bytes)
+            .ok()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .filter(|pid| *pid > 0 && libc::pid_t::try_from(*pid).is_ok())
+        else {
+            continue;
+        };
+        let Ok(before) = rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        if before.st_uid != uid
+            || FileType::from_raw_mode(before.st_mode) != expected_type
+            || is_live(pid)
+        {
+            continue;
+        }
+        let Ok(after) = rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        if after.st_uid != uid
+            || FileType::from_raw_mode(after.st_mode) != expected_type
+            || before.st_dev != after.st_dev
+            || before.st_ino != after.st_ino
+        {
+            continue;
+        }
+        // The pinned directory confines deletion; unlinkat never follows the leaf.
+        let _ = rustix::fs::unlinkat(&directory, name, AtFlags::empty());
     }
 }
 
@@ -1068,16 +1114,15 @@ mod tests {
                 },
             )
             .expect("descriptor is written");
-            crate::guarded_writer::write_file(&dir.join(format!("{name}.sock")), b"")
-                .expect("socket stub is written");
+            let _socket = std::os::unix::net::UnixListener::bind(dir.join(format!("{name}.sock")))
+                .expect("socket is bound");
             path
         };
 
-        // Liveness is injected here because process inspection may be denied by
-        // the test sandbox. This test owns descriptor cleanup, not `ps` itself.
-        let own = write("own", std::process::id());
-        let live = write("live", 1);
-        let dead = write("dead", 2);
+        // Inject liveness so the test does not depend on process permissions.
+        let own = write(&format!("{}-own", std::process::id()), std::process::id());
+        let live = write("1-live", 1);
+        let dead = write("2-dead", 2);
 
         reap_dead_descriptors_with(&own, |pid| pid == std::process::id() || pid == 1);
 
@@ -1085,7 +1130,7 @@ mod tests {
         assert!(live.exists(), "a live instance must keep its descriptor");
         assert!(!dead.exists(), "a dead instance's descriptor is removed");
         assert!(
-            !dir.join("dead.sock").exists(),
+            !dir.join("2-dead.sock").exists(),
             "the orphaned socket goes with it"
         );
 
