@@ -50,9 +50,30 @@ async fn targets(client: &mut Client) -> Result<Vec<TargetInfo>> {
 }
 
 async fn tree(client: &mut Client, id: Option<u64>) -> Result<Tree> {
+    let discovered = targets(client).await?;
     let mut request = json!({"command": "inspect", "params": {"root": null, "max_depth": 40}});
-    if let Some(id) = id {
-        request["target"] = json!({"tabId": id});
+    match id {
+        Some(id) => {
+            let target = discovered
+                .iter()
+                .find(|target| target.id == TargetId::Tab(id))
+                .ok_or_else(|| eyre!("tab {id} is not discoverable"))?;
+            let document_id = target
+                .document_id
+                .ok_or_else(|| eyre!("tab {id} is not mounted"))?;
+            request["target"] = json!({"tabId": id});
+            request["expectedGeneration"] = json!(target.generation);
+            request["expectedDocumentId"] = json!(document_id);
+        }
+        None => {
+            ensure!(
+                discovered
+                    .iter()
+                    .any(|target| target.id == TargetId::chrome()),
+                "chrome target is not discoverable"
+            );
+            request["target"] = json!("chrome");
+        }
     }
     let response = checked(client, AGENT_CONTROL_TOOL, request).await?;
     Ok(Tree {
@@ -333,32 +354,27 @@ fn one_socket(descriptor_path: &Path, descriptor: &DebugDescriptor) -> Result<()
 pub async fn gui(socket: &Path, descriptor_path: &Path, fixture_url: &str) -> Result<()> {
     let descriptor: DebugDescriptor = serde_json::from_slice(&std::fs::read(descriptor_path)?)?;
     let mut client = Client::connect(socket).await?;
-    let legacy = tree(&mut client, None).await?;
+    let chrome = tree(&mut client, None).await?;
     ensure!(
-        legacy.context.target_id == TargetId::chrome(),
-        "omitted GUI target changed its default"
+        chrome.context.target_id == TargetId::chrome(),
+        "targeted GUI inspect did not return chrome context"
     );
-    let explicit = checked(
+    let legacy = checked(
         &mut client,
         AGENT_CONTROL_TOOL,
-        json!({"command": "inspect", "target": "chrome",
-        "params": {"root": null, "max_depth": 40}}),
+        json!({"command": "inspect", "params": {"root": null, "max_depth": 40}}),
     )
     .await?;
-    let explicit: AgentSnapshot = serde_json::from_value(explicit["value"].clone())?;
+    let legacy: AgentSnapshot = serde_json::from_value(legacy["value"].clone())?;
     ensure!(
-        explicit
-            .nodes
-            .iter()
-            .map(|node| node.id)
-            .collect::<Vec<_>>()
-            == legacy
+        legacy.nodes.iter().map(|node| node.id).collect::<Vec<_>>()
+            == chrome
                 .snapshot
                 .nodes
                 .iter()
                 .map(|node| node.id)
                 .collect::<Vec<_>>(),
-        "explicit and legacy chrome target differ"
+        "targeted and legacy chrome inspect differ"
     );
 
     let a = open_tab(&mut client).await?;
@@ -518,7 +534,7 @@ pub async fn gui(socket: &Path, descriptor_path: &Path, fixture_url: &str) -> Re
     validate_records(&events_a, Some(&tree_a.context))?;
     validate_records(&events_a2, Some(&tree_a.context))?;
     validate_records(&events_all, None)?;
-    validate_records(&events_chrome, Some(&legacy.context))?;
+    validate_records(&events_chrome, Some(&chrome.context))?;
     ensure!(
         event_sequence(&events_a, "startup A")? == event_sequence(&events_a2, "startup A")?,
         "observers do not replay independently"
