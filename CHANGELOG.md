@@ -1,5 +1,9 @@
 # Changelog
 
+## ps-qa 0.9.6
+
+- Make resource caps explicit application parameters, bound reads and latency allocations, and drain child output through the shared nagoya executor.
+
 ## blitz-control-protocol 0.7.5
 
 - Route server work through nagoya with typed Arc ownership and concrete Send transport futures, removing per-server OS threads.
