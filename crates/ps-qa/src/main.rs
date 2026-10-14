@@ -32,7 +32,8 @@ mod timing;
 mod app_caps;
 
 fn main() -> eyre::Result<()> {
-    let _caps = app_caps::start([2147483648, 600, 1800, 512, 8, 32, 16777216, 100000, 100000]);
+    let caps = app_caps::start([2147483648, 600, 1800, 512, 8, 32, 16777216, 100000, 100000]);
+    let _monitor = app_caps::monitor(caps);
     app_caps::stage("crates/ps-qa/src/main.rs: running");
     nagoya::block_on(runner::run())
 }

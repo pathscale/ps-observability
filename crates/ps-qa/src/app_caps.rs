@@ -93,31 +93,54 @@ pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
     #[cfg(unix)]
     install_kernel_limits(&hard);
     caps.tick();
-    if hard[..6].iter().any(|value| *value != u64::MAX - 1) {
-        let runtime = nagoya::runtime::Runtime::new(1);
-        drop(runtime.spawn(CensusTimer {
-            caps: Arc::clone(&caps),
-            deadline: nagoya::time::sleep(Duration::from_secs(1)),
-        }));
-    }
     caps
 }
 
-// A registered nagoya timer wakes the census; there is no sleep-loop thread.
-struct CensusTimer {
-    caps: Arc<Caps>,
-    deadline: nagoya::time::Sleep,
+pub struct Monitor {
+    stopping: Arc<blitz_control_protocol::latest::Flag>,
+    task: Option<nagoya::JoinHandle<Arc<Caps>>>,
 }
-impl std::future::Future for CensusTimer {
-    type Output = ();
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        let timer = self.get_mut();
-        if std::pin::Pin::new(&mut timer.deadline).poll(cx).is_ready() {
-            timer.caps.tick();
-            timer.deadline = nagoya::time::sleep(Duration::from_secs(1));
-            let _ = std::pin::Pin::new(&mut timer.deadline).poll(cx);
+
+pub fn monitor(caps: Arc<Caps>) -> Option<Monitor> {
+    if caps.hard[..6].iter().all(|value| *value == u64::MAX - 1) {
+        return None;
+    }
+    let stopping = Arc::new(blitz_control_protocol::latest::Flag::new());
+    let task = enqueue(Arc::clone(&caps), Arc::clone(&stopping));
+    Some(Monitor { stopping, task: Some(task) })
+}
+
+fn enqueue(
+    caps: Arc<Caps>,
+    stopping: Arc<blitz_control_protocol::latest::Flag>,
+) -> nagoya::JoinHandle<Arc<Caps>> {
+    nagoya::spawn(async move {
+        use std::task::Poll;
+
+        let mut signal = std::pin::pin!(stopping.raised());
+        let mut deadline = std::pin::pin!(nagoya::time::sleep(Duration::from_secs(1)));
+        std::future::poll_fn(|cx| {
+            if signal.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+            if deadline.as_mut().poll(cx).is_ready() {
+                caps.tick();
+                deadline.set(nagoya::time::sleep(Duration::from_secs(1)));
+                let _ = deadline.as_mut().poll(cx);
+            }
+            Poll::Pending
+        })
+        .await;
+        caps
+    })
+}
+
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        self.stopping.raise();
+        if let Some(task) = self.task.take() {
+            drop(nagoya::block_on(task));
         }
-        std::task::Poll::Pending
     }
 }
 
