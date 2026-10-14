@@ -1,8 +1,8 @@
 use std::fs::remove_file;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -156,28 +156,30 @@ impl AgentControlServer {
         events: Option<EventSource>,
     ) -> io::Result<Self> {
         let instance_id = instance_id();
-        let descriptor_path = descriptor_path(&instance_id);
-        let socket_path = descriptor_path.with_extension("sock");
+        let directory = crate::control_directory::default_directory();
 
         // The directory carries the access control, and it is set before
         // anything inside it exists.
         //
         // A mode on the socket cannot be: a Unix socket is created by `bind`
         // already listening, so any mode applied afterwards leaves a window in
-        // which the path is connectable. That window was real here. The
-        // directory had whatever `create_dir_all` gives, which is world
-        // readable under `/tmp`, and the socket's `0600` landed after `bind`.
+        // which the path is connectable. The old directory setup used
+        // `create_dir_all`, which is world readable under `/tmp`, and
+        // the socket's `0600` landed after `bind`.
         //
         // `0700` on the directory closes it without depending on ordering at
         // all: a process that cannot traverse the directory cannot reach the
         // socket whatever the socket's own mode says. The socket keeps `0600`
         // as well, because defence that rests on one check is defence that
         // rests on nobody ever relaxing the directory.
-        if let Some(parent) = socket_path.parent() {
-            guarded_writer::create_dir_all(parent)?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        match guarded_writer::create_private_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
         }
-        let _ = remove_file(&socket_path);
+        let directory = crate::control_directory::validate_directory(&directory)?;
+        let descriptor_path = directory.join(format!("{instance_id}.json"));
+        let socket_path = descriptor_path.with_extension("sock");
 
         // Bound here, before `start` returns, so a caller that connects the
         // moment it has the path finds a socket listening. Registering it on a
@@ -199,6 +201,7 @@ impl AgentControlServer {
             renderer: "blitz".into(),
             renderer_revision: host.version.clone(),
         };
+        crate::control_directory::validate_socket(&directory, &descriptor.address)?;
         write_descriptor(&descriptor_path, &descriptor)?;
         reap_dead_descriptors(&descriptor_path);
 
@@ -662,6 +665,9 @@ fn reap_dead_descriptors(own: &Path) {
 
 fn reap_dead_descriptors_with(own: &Path, is_live: impl Fn(u32) -> bool) {
     let Some(dir) = own.parent() else { return };
+    if crate::control_directory::validate_directory(dir).is_err() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -670,9 +676,13 @@ fn reap_dead_descriptors_with(own: &Path, is_live: impl Fn(u32) -> bool) {
         if path == own || path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(mut file) = crate::control_directory::open_descriptor(&path) else {
             continue;
         };
+        let mut text = String::new();
+        if file.read_to_string(&mut text).is_err() {
+            continue;
+        }
         let Ok(descriptor) = serde_json::from_str::<DebugDescriptor>(&text) else {
             continue;
         };
@@ -684,16 +694,26 @@ fn reap_dead_descriptors_with(own: &Path, is_live: impl Fn(u32) -> bool) {
     }
 }
 
-fn descriptor_path(instance_id: &str) -> PathBuf {
-    std::env::temp_dir()
-        .join("tauri-blitz-agent")
-        .join(format!("{instance_id}.json"))
-}
-
 fn write_descriptor(path: &Path, descriptor: &DebugDescriptor) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "descriptor needs a parent"))?;
+    crate::control_directory::validate_directory(parent)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to replace an existing control descriptor",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     let mut content = serde_json::to_string_pretty(descriptor).map_err(io::Error::other)?;
     content.push('\n');
-    guarded_writer::write_file(path, content.as_bytes())
+    guarded_writer::write_file(path, content.as_bytes())?;
+    crate::control_directory::open_descriptor(path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1032,7 +1052,7 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        crate::guarded_writer::create_dir_all(&dir).expect("scratch directory is created");
+        crate::guarded_writer::create_private_dir(&dir).expect("scratch directory is created");
 
         let write = |name: &str, pid: u32| {
             let path = dir.join(format!("{name}.json"));
