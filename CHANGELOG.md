@@ -1,5 +1,9 @@
 # Changelog
 
+## blitz-control-protocol 0.7.5
+
+- Route server work through nagoya with typed Arc ownership and concrete Send transport futures, removing per-server OS threads.
+
 ## blitz-control-protocol 0.7.4
 
 - Route file writes through a secret-aware guard that refuses raw and encoded secret values before opening a destination.
