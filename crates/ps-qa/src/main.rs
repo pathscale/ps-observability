@@ -3,6 +3,7 @@
 mod app;
 mod audit;
 mod capture_analysis;
+mod child_output;
 mod cli;
 mod computed_style;
 mod diagnostics;
