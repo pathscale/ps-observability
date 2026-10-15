@@ -84,6 +84,45 @@ pub mod guarded_writer;
 /// The in-process transport.
 #[cfg(feature = "engine")]
 pub mod in_process;
+
+/// A script-capable backend for the control protocol.
+///
+/// Implementations provide a [`blitz_dom::Document`] for protocol observation and
+/// implement the event delivery that the document alone cannot perform. Event
+/// methods must preserve target-directed delivery, bubbling, cancellation and
+/// native default actions. Pointer movement must preserve hover event ordering.
+///
+/// Observation calls [`blitz_dom::Document::poll_for_settle`] with timers
+/// disabled and a bounded budget. Action settlement uses bounded calls to
+/// [`blitz_dom::Document::poll`], preserving the backend's normal timer policy.
+/// Backends must report whether each poll leaves immediate work runnable.
+///
+/// Hosts implement this contract on their document owner or an adapter that
+/// delegates `Document` and event delivery to the selected script backend.
+#[cfg(feature = "engine")]
+pub trait ControlScriptBackend: blitz_dom::Document {
+    /// Dispatch a DOM event through the backend's scripted event handling.
+    fn dispatch_dom_event(&mut self, event: blitz_traits::events::DomEvent);
+
+    /// Deliver pointer movement to a target node, preserving hover event order.
+    fn handle_pointer_move_to_node(
+        &mut self,
+        event: blitz_traits::events::BlitzPointerEvent,
+        node: blitz_dom::NodeId,
+    );
+
+    /// Deliver a UI event to its target node with native defaults and bubbling.
+    fn handle_ui_event_to_node(
+        &mut self,
+        event: blitz_traits::events::UiEvent,
+        node: blitz_dom::NodeId,
+    );
+
+    /// Return script runtime metrics when the backend can provide them.
+    fn script_metrics(&self) -> Option<ScriptMetrics> {
+        None
+    }
+}
 /// Latest-value and one-shot handoffs built on nagoya, replacing tokio channels.
 #[cfg(any(feature = "server", feature = "client"))]
 pub mod latest;
@@ -833,7 +872,7 @@ pub struct RendererMetrics {
     /// not the application, and is reported separately so the two are never
     /// confused again.
     pub snapshot: Option<SnapshotCost>,
-    /// What JavaScript cost, per `ScriptDocument::poll`.
+    /// What script execution cost, per backend poll.
     ///
     /// The frame numbers above cover resolve, paint and present, which is the
     /// engine. Reactivity, event handlers, timers and microtasks are none of
@@ -1539,6 +1578,51 @@ pub fn decode_rpc(message: WireMessage) -> Result<JsonRpcMessage, DebugProtocolE
 /// end to end.
 #[cfg(any(feature = "server", feature = "client"))]
 pub use endpoint_libs::libs::ws::transport::nagoya::NagoyaStream;
+
+#[cfg(all(test, feature = "engine"))]
+impl ControlScriptBackend for blitz_script::ScriptDocument {
+    fn dispatch_dom_event(&mut self, event: blitz_traits::events::DomEvent) {
+        blitz_script::ScriptDocument::dispatch_dom_event(self, event);
+    }
+
+    fn handle_pointer_move_to_node(
+        &mut self,
+        event: blitz_traits::events::BlitzPointerEvent,
+        node: blitz_dom::NodeId,
+    ) {
+        blitz_script::ScriptDocument::handle_pointer_move_to_node(self, event, node);
+    }
+
+    fn handle_ui_event_to_node(
+        &mut self,
+        event: blitz_traits::events::UiEvent,
+        node: blitz_dom::NodeId,
+    ) {
+        blitz_script::ScriptDocument::handle_ui_event_to_node(self, event, node);
+    }
+
+    fn script_metrics(&self) -> Option<ScriptMetrics> {
+        blitz_script::script_stats::latest_script_stats().map(|stats| ScriptMetrics {
+            mean_ms: stats.mean_ms,
+            p95_ms: stats.p95_ms,
+            max_ms: stats.max_ms,
+            window_polls: stats.window_polls,
+            total_polls: stats.total_polls,
+            productive_polls: stats.productive_polls,
+            spent_ms: stats.spent_ms,
+            breakdown: blitz_script::script_stats::work_breakdown()
+                .into_iter()
+                .take(12)
+                .map(|(label, calls, total_ms, worst_ms)| ScriptSource {
+                    label,
+                    calls,
+                    total_ms,
+                    worst_ms,
+                })
+                .collect(),
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {

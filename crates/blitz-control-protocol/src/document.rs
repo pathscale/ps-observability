@@ -21,11 +21,9 @@ use crate::{
 #[cfg(feature = "capture")]
 use crate::{
     DebugSnapshot, FrameMetrics, FrameWindowMetrics, LayoutBounds, LayoutDiagnosticRow,
-    LayoutEdges, LayoutOffset, LayoutSize, RendererMetrics, RevisionSet, ScriptMetrics,
-    ScriptSource, SnapshotCost, SnapshotRequest, TimingStats,
+    LayoutEdges, LayoutOffset, LayoutSize, RendererMetrics, RevisionSet, SnapshotCost,
+    SnapshotRequest, TimingStats,
 };
-use blitz_dom::Document;
-use blitz_script::ScriptDocument;
 use blitz_traits::events::{
     BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, KeyState, MouseEventButton,
     MouseEventButtons, Point, PointerCoords, PointerDetails, UiEvent,
@@ -68,7 +66,7 @@ impl DocumentCapture {
 
     pub fn capture(
         &mut self,
-        document: &mut ScriptDocument,
+        document: &mut (impl crate::ControlScriptBackend + ?Sized),
         request: crate::CaptureRequest,
     ) -> Result<crate::CapturedImage, DebugError> {
         capture_document_with_surface(document, request, &mut self.surface)
@@ -107,7 +105,7 @@ impl CaptureSurface {
     }
 }
 
-/// Draw a standalone script document through the same CPU paint path used by
+/// Draw a standalone control document through the same CPU paint path used by
 /// runtime diagnostics.
 ///
 /// Headless QA hosts intentionally have no `RuntimeApplication`, but they must
@@ -116,7 +114,7 @@ impl CaptureSurface {
 /// byte-for-byte comparable.
 #[cfg(feature = "capture")]
 pub fn capture_document(
-    script_document: &mut ScriptDocument,
+    script_document: &mut (impl crate::ControlScriptBackend + ?Sized),
     request: crate::CaptureRequest,
 ) -> Result<crate::CapturedImage, DebugError> {
     DocumentCapture::new().capture(script_document, request)
@@ -124,7 +122,7 @@ pub fn capture_document(
 
 #[cfg(feature = "capture")]
 pub(crate) fn capture_document_with_surface(
-    script_document: &mut ScriptDocument,
+    script_document: &mut (impl crate::ControlScriptBackend + ?Sized),
     request: crate::CaptureRequest,
     surface: &mut Option<CaptureSurface>,
 ) -> Result<crate::CapturedImage, DebugError> {
@@ -267,7 +265,7 @@ pub(crate) fn capture_document_with_surface(
 /// `setTimeout(0)` slices of a page that yields that way, so a page doing
 /// time-sliced work answered each request seconds late. Returns how many
 /// passes made progress and how many ran.
-fn drain_for_observer(document: &mut ScriptDocument) -> (u64, u64) {
+fn drain_for_observer(document: &mut (impl crate::ControlScriptBackend + ?Sized)) -> (u64, u64) {
     const BUDGET: std::time::Duration = std::time::Duration::from_millis(16);
     let started = std::time::Instant::now();
     let (mut progressed, mut passes) = (0u64, 0u64);
@@ -284,12 +282,12 @@ fn drain_for_observer(document: &mut ScriptDocument) -> (u64, u64) {
 /// Collect the same typed diagnostic snapshot from a standalone Blitz document
 /// that the windowed runtime exposes over its control socket.
 ///
-/// Headless component hosts own a `ScriptDocument` without a Tauri event loop.
-/// Keeping snapshot collection here gives those hosts the renderer's real DOM,
-/// layout and computed paint data instead of a partial or reimplemented view.
+/// Headless component hosts can provide a document backend without a Tauri event
+/// loop. Keeping snapshot collection here gives those hosts the renderer's real
+/// DOM, layout and computed paint data instead of a partial or reimplemented view.
 #[cfg(feature = "capture")]
 pub fn snapshot_document(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     request: SnapshotRequest,
     revision: u64,
 ) -> Result<DebugSnapshot, DebugError> {
@@ -416,28 +414,8 @@ pub fn snapshot_document(
             resolve_ms: snapshot_resolve_ms,
             total_ms,
         }),
-        // The other half of a frame. Everything above this line is the
-        // engine; this is the language runtime the application actually
-        // spends its time in.
-        script: blitz_script::script_stats::latest_script_stats().map(|stats| ScriptMetrics {
-            mean_ms: stats.mean_ms,
-            p95_ms: stats.p95_ms,
-            max_ms: stats.max_ms,
-            window_polls: stats.window_polls,
-            total_polls: stats.total_polls,
-            productive_polls: stats.productive_polls,
-            spent_ms: stats.spent_ms,
-            breakdown: blitz_script::script_stats::work_breakdown()
-                .into_iter()
-                .take(12)
-                .map(|(label, calls, total_ms, worst_ms)| ScriptSource {
-                    label,
-                    calls,
-                    total_ms,
-                    worst_ms,
-                })
-                .collect(),
-        }),
+        // Script metrics are supplied by the active document backend.
+        script: document.script_metrics(),
         resident_bytes: resident_bytes(),
     };
     let dom = request
@@ -1303,7 +1281,7 @@ pub(crate) fn viewport_fixed_descendant(
 /// control revealed on hover cannot be reached any other way, and a defect that
 /// only appears on the second entry cannot be reached at all without it.
 pub fn hover_agent_node(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     node_id: u64,
 ) -> Result<(f32, f32), DebugError> {
     let (node_id, position) = resolve_agent_node(document, node_id)?;
@@ -1321,7 +1299,7 @@ pub fn hover_agent_node(
 }
 
 pub fn press_agent_key(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     key: &str,
     code: &str,
 ) -> Result<(), DebugError> {
@@ -1345,7 +1323,7 @@ pub fn press_agent_key(
 }
 
 pub fn click_agent_node(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     node_id: u64,
     count: u8,
 ) -> Result<(f32, f32), DebugError> {
@@ -1353,7 +1331,7 @@ pub fn click_agent_node(
 }
 
 pub fn focus_agent_node(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     node_id: blitz_dom::NodeId,
 ) -> Result<(), DebugError> {
     let focusable = document
@@ -1383,7 +1361,7 @@ pub fn focus_agent_node(
 /// inspector for every element on the page, because that builder names only
 /// text nodes and carries no geometry at all.
 pub fn inspect_document(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     root: Option<u64>,
     max_depth: u32,
     revision: u64,
@@ -1613,7 +1591,7 @@ pub(crate) fn node_is_individually_visible(node: &blitz_dom::Node) -> bool {
 }
 
 pub(crate) fn resolve_agent_node(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     raw_node_id: u64,
 ) -> Result<(blitz_dom::NodeId, (f32, f32)), DebugError> {
     resolve_agent_node_inner(document, raw_node_id, Area::Required)
@@ -1651,7 +1629,7 @@ pub(crate) enum Area {
 /// `visibility: hidden`, `hidden` or `aria-hidden`, and not be disabled. Those
 /// are the reasons a press should not land, and none of them is a box size.
 pub(crate) fn resolve_agent_node_inner(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     raw_node_id: u64,
     area: Area,
 ) -> Result<(blitz_dom::NodeId, (f32, f32)), DebugError> {
@@ -1729,7 +1707,7 @@ pub(crate) fn pointer_event(
 /// document's current viewport scroll. Treating both as the client position
 /// makes hit testing and component pointer math miss after `ScrollIntoView`.
 pub(crate) fn pointer_event_for_document(
-    document: &ScriptDocument,
+    document: &(impl crate::ControlScriptBackend + ?Sized),
     position: (f32, f32),
     button: MouseEventButton,
     buttons: MouseEventButtons,
@@ -1743,7 +1721,7 @@ pub(crate) fn pointer_event_for_document(
 }
 
 pub(crate) fn pointer_coords_for_document(
-    document: &ScriptDocument,
+    document: &(impl crate::ControlScriptBackend + ?Sized),
     position: (f32, f32),
 ) -> PointerCoords {
     let mut coords = pointer_coords(position);
@@ -2141,7 +2119,7 @@ pub(crate) fn diagnostic_layout_row(
 }
 
 pub(crate) fn activate_agent_node(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     raw_node_id: u64,
     count: u8,
 ) -> Result<(f32, f32), DebugError> {
@@ -2203,6 +2181,7 @@ pub(crate) fn activate_agent_node(
 mod tests {
     use super::*;
     use blitz_dom::{Document, DocumentConfig};
+    use blitz_script::ScriptDocument;
 
     #[test]
     fn meta_also_sets_the_super_modifier() {
@@ -2320,7 +2299,8 @@ mod tests {
 #[cfg(test)]
 mod semantic_tests {
     use super::*;
-    use blitz_dom::DocumentConfig;
+    use blitz_dom::{Document, DocumentConfig};
+    use blitz_script::ScriptDocument;
 
     /// One document, reproducing every naming and role defect this module
     /// covers. Kept whole rather than split per test so a fix that repairs one
@@ -2722,7 +2702,8 @@ mod semantic_tests {
 #[cfg(test)]
 mod role_projection_tests {
     use super::*;
-    use blitz_dom::DocumentConfig;
+    use blitz_dom::{Document, DocumentConfig};
+    use blitz_script::ScriptDocument;
 
     fn role(html: &str) -> String {
         let mut document = ScriptDocument::from_html(html, DocumentConfig::default());
@@ -2876,7 +2857,8 @@ mod runtime_tests {
         element_attr, layout_chain_is_valid, layout_chain_validities, node_is_visible,
         semantic_name, semantic_role, semantic_selected,
     };
-    use blitz_dom::DocumentConfig;
+    use blitz_dom::{Document, DocumentConfig};
+    use blitz_script::ScriptDocument;
 
     #[test]
     fn semantic_visibility_includes_display_none_ancestors() {
