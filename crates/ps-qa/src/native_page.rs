@@ -88,39 +88,56 @@ pub fn run(
     }
     let reactor = Reactor::local().map_err(|error| eyre!(error.to_string()))?;
     let handle = reactor.handle();
-    let result = block_on_with(&reactor, async {
-        let mut command = Command::new(host);
-        command
-            .arg("--page")
-            .arg(page)
-            .arg("--engine")
-            .arg(engine)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        if let Some(plant) = plant {
-            command.arg("--plant").arg(plant);
-        }
-        let mut child = command.spawn(&handle)?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| eyre!("native host has no stdout pipe"))?;
-        let mut bytes = Vec::new();
-        stdout.take(65_537).read_to_end(&mut bytes).await?;
-        if bytes.len() > 65_536 {
-            bail!("native host observation exceeds 64 KiB");
-        }
-        let status = child.wait().await?;
-        if !status.success() {
-            bail!("native host failed before producing an outcome: {status}");
-        }
-        let observation: Observation = serde_json::from_slice(&bytes)?;
-        Ok::<_, eyre::Report>(Arc::new(observation))
-    });
+    let result = block_on_with(
+        &reactor,
+        nagoya::timeout(std::time::Duration::from_secs(60), async {
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .arg("--supervise-native-host")
+                .arg(host)
+                .arg("--page")
+                .arg(page)
+                .arg("--engine")
+                .arg(engine)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true);
+            if let Some(plant) = plant {
+                command.arg("--plant").arg(plant);
+            }
+            {
+                use std::os::unix::process::CommandExt;
+                command.as_std_mut().process_group(0);
+            }
+            let mut child = command.spawn(&handle)?;
+            struct Group(u32);
+            impl Drop for Group {
+                fn drop(&mut self) {
+                    crate::supervisor::kill_group(self.0);
+                }
+            }
+            let _group = Group(child.id().ok_or_else(|| eyre!("native host has no pid"))?);
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| eyre!("native host has no stdout pipe"))?;
+            let mut bytes = Vec::new();
+            stdout.take(65_537).read_to_end(&mut bytes).await?;
+            if bytes.len() > 65_536 {
+                bail!("native host observation exceeds 64 KiB");
+            }
+            let status = child.wait().await?;
+            if !status.success() {
+                bail!("native host failed before producing an outcome: {status}");
+            }
+            let observation: Observation = serde_json::from_slice(&bytes)?;
+            Ok::<_, eyre::Report>(Arc::new(observation))
+        }),
+    );
     reactor.shutdown();
-    let observation = result?;
+    let observation =
+        result.map_err(|_| eyre!("native host exceeded its 60 second deadline"))??;
     if observation.schema != "eko-page-observation-v1" || observation.viewport.contains(&0) {
         bail!("invalid native page observation schema or viewport");
     }
