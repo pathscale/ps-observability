@@ -2,7 +2,7 @@ use std::fs::remove_file;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use std::time::{SystemTime, UNIX_EPOCH};

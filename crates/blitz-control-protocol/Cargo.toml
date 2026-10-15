@@ -38,7 +38,6 @@ publish = true
 default = []
 engine = [
     "dep:blitz-dom",
-    "dep:blitz-script",
     "dep:blitz-traits",
     "dep:keyboard-types",
     "dep:style",
@@ -87,7 +86,6 @@ style = { version = "0.20.0", package = "stylo", optional = true }
 # `yeslogic-fontconfig-sys` system library, so enabling it here would decide
 # that every consumer needs one installed, including a headless one that reads
 # no font catalogue. An application that wants the machine's fonts asks itself.
-blitz-script = { package = "ps-blitz-script", version = "^0.6.2", optional = true }
 blitz-traits = { package = "ps-blitz-traits", version = "^0.6.2", optional = true }
 keyboard-types = { version = "0.7", optional = true }
 
@@ -104,6 +102,10 @@ base64 = { version = "0.22", optional = true }
 
 eyre = { version = "0.6", optional = true }
 
+
+[dev-dependencies]
+# Concrete script fixtures are development-only; hosts supply the production backend.
+blitz-script = { package = "ps-blitz-script", version = "^0.6.2", default-features = false }
 
 [package.metadata.docs.rs]
 all-features = true
