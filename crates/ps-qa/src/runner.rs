@@ -333,15 +333,27 @@ async fn settle_sweep_case(
 /// hand.
 struct HostProcess {
     child: std::process::Child,
+    stopped: bool,
     control_dir: Option<std::path::PathBuf>,
     output: Option<crate::child_output::HostOutput>,
 }
 
-impl Drop for HostProcess {
-    fn drop(&mut self) {
+impl HostProcess {
+    fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        crate::supervisor::kill_group(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();
         crate::app_caps::reaped(self.child.id());
+        self.stopped = true;
+    }
+}
+
+impl Drop for HostProcess {
+    fn drop(&mut self) {
+        self.stop();
         if let Some(path) = &self.control_dir
             && control_directory_is_real(path)
         {
@@ -423,8 +435,7 @@ impl HostedSession {
     /// Stop the current process before the replacement is spawned, so a wedged
     /// page cannot keep the control socket the next check has to attach to.
     fn restart(&mut self) -> std::result::Result<(), String> {
-        let _ = self.process.child.kill();
-        let _ = self.process.child.wait();
+        self.process.stop();
         if let Some(path) = self.process.control_dir.take()
             && control_directory_is_real(&path)
         {
@@ -1225,7 +1236,13 @@ fn start_host_with_policy(
     clean_environment: bool,
     storage: Option<&str>,
 ) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
-    let mut command = std::process::Command::new(host);
+    let mut command = std::process::Command::new(
+        std::env::current_exe().map_err(|error| format!("locating host supervisor: {error}"))?,
+    );
+    command.arg("--supervise-host").arg(host);
+    // The supervisor owns the read end. EOF also arrives when this process
+    // is killed without unwinding, so cleanup does not depend on Drop.
+    command.stdin(std::process::Stdio::piped());
     let control_dir = Some(plan_control_directory()?);
     if clean_environment {
         // Run plans must not forward unrelated secrets or application config
@@ -1243,7 +1260,12 @@ fn start_host_with_policy(
         command.env("QA_INSPECT_STORAGE", encoded);
     }
     if let Some(path) = &control_dir {
-        command.env("CHUZZ_CONTROL_DIR", path);
+        command
+            .env("CHUZZ_CONTROL_DIR", path)
+            .env("CHUZZ_CACHE_DIR", path)
+            .env("CHUZZ_PROFILE_DIR", path.join("profile"));
+        // Sandboxed hosts place control sockets under their cache root. Keep
+        // that root private and contained alongside the legacy descriptor.
         // The current Blitz protocol uses std::env::temp_dir(), while legacy
         // Chuzz control uses CHUZZ_CONTROL_DIR. Confine both implementations.
         command
@@ -1278,6 +1300,7 @@ fn start_host_with_policy(
     crate::app_caps::child(spawned.id());
     let mut child = HostProcess {
         child: spawned,
+        stopped: false,
         control_dir,
         output: None,
     };
