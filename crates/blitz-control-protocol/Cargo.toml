@@ -57,6 +57,7 @@ capture = [
     # in the graph, so a build that reads the semantic tree and drives input
     # gets no window stack at all.
     "dep:blitz-shell",
+    "dep:blitz-debug-control",
     # Where the frame timings and the sampling guard are: `blitz-shell` keeps
     # both behind this feature, and it forwards to `blitz-script/debug-control`
     # for the script half of the same capture.
@@ -98,14 +99,17 @@ anyrender = { package = "ps-anyrender", version = "^0.13", optional = true }
 anyrender_vello_cpu = { package = "ps-anyrender-vello-cpu", version = "^0.17", optional = true }
 blitz-paint = { package = "ps-blitz-paint", version = "^0.6.2", optional = true }
 blitz-shell = { package = "ps-blitz-shell", version = "^0.6.2", default-features = false, optional = true }
+# The shell's typed diagnostic queue needs this API floor, including when
+# dependency resolution prefers releases matching a lower Rust version.
+blitz-debug-control = { package = "ps-blitz-debug-control", version = "^0.3.9", optional = true }
 base64 = { version = "0.22", optional = true }
 
 eyre = { version = "0.6", optional = true }
 
 
 [dev-dependencies]
-# Concrete script fixtures are development-only; hosts supply the production backend.
-blitz-script = { package = "ps-blitz-script", version = "^0.6.2", default-features = false }
+# The test fixture uses the native HTML document and DOM event driver.
+blitz-html = { package = "ps-blitz-html", version = "^0.6.5", default-features = false }
 
 [package.metadata.docs.rs]
 all-features = true
