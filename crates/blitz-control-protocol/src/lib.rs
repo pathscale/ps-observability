@@ -1580,49 +1580,7 @@ pub fn decode_rpc(message: WireMessage) -> Result<JsonRpcMessage, DebugProtocolE
 pub use endpoint_libs::libs::ws::transport::nagoya::NagoyaStream;
 
 #[cfg(all(test, feature = "engine"))]
-impl ControlScriptBackend for blitz_script::ScriptDocument {
-    fn dispatch_dom_event(&mut self, event: blitz_traits::events::DomEvent) {
-        blitz_script::ScriptDocument::dispatch_dom_event(self, event);
-    }
-
-    fn handle_pointer_move_to_node(
-        &mut self,
-        event: blitz_traits::events::BlitzPointerEvent,
-        node: blitz_dom::NodeId,
-    ) {
-        blitz_script::ScriptDocument::handle_pointer_move_to_node(self, event, node);
-    }
-
-    fn handle_ui_event_to_node(
-        &mut self,
-        event: blitz_traits::events::UiEvent,
-        node: blitz_dom::NodeId,
-    ) {
-        blitz_script::ScriptDocument::handle_ui_event_to_node(self, event, node);
-    }
-
-    fn script_metrics(&self) -> Option<ScriptMetrics> {
-        blitz_script::script_stats::latest_script_stats().map(|stats| ScriptMetrics {
-            mean_ms: stats.mean_ms,
-            p95_ms: stats.p95_ms,
-            max_ms: stats.max_ms,
-            window_polls: stats.window_polls,
-            total_polls: stats.total_polls,
-            productive_polls: stats.productive_polls,
-            spent_ms: stats.spent_ms,
-            breakdown: blitz_script::script_stats::work_breakdown()
-                .into_iter()
-                .take(12)
-                .map(|(label, calls, total_ms, worst_ms)| ScriptSource {
-                    label,
-                    calls,
-                    total_ms,
-                    worst_ms,
-                })
-                .collect(),
-        })
-    }
-}
+mod test_document;
 
 #[cfg(test)]
 mod tests {
