@@ -10,8 +10,10 @@ use std::task::{Context, Poll};
 
 use blitz_control_protocol::latest::{Flag, Once};
 use futures::future::{Either, select};
-use futures::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use futures::io::{AsyncRead, AsyncReadExt};
 use nagoya::reactor::{Handle, Interest, Reactor, Registration};
+
+const MAX_STDOUT_LINE_BYTES: usize = 64 * 1024;
 
 // Deregister before closing stdout, so fd reuse cannot inherit this interest.
 struct Pipe {
@@ -72,6 +74,7 @@ struct OutputWork {
     descriptor: Arc<Once<Arc<PathBuf>>>,
     stopping: Arc<Flag>,
     suppress: bool,
+    control_root: PathBuf,
 }
 
 pub(crate) struct HostOutput {
@@ -92,12 +95,17 @@ fn reactor() -> io::Result<Handle> {
 }
 
 impl HostOutput {
-    pub(crate) fn start(stdout: ChildStdout, suppress: bool) -> io::Result<Self> {
+    pub(crate) fn start(
+        stdout: ChildStdout,
+        suppress: bool,
+        control_root: PathBuf,
+    ) -> io::Result<Self> {
         let work = Arc::new(OutputWork {
             pipe: Mutex::new(Some(Pipe::new(stdout, &reactor()?)?)),
             descriptor: Once::new(),
             stopping: Flag::new(),
             suppress,
+            control_root,
         });
         let task = enqueue(Arc::clone(&work));
         Ok(Self {
@@ -124,15 +132,35 @@ fn enqueue(work: Arc<OutputWork>) -> nagoya::JoinHandle<Arc<OutputWork>> {
     nagoya::spawn(drain(work))
 }
 
+async fn accept_line(work: &OutputWork, line: &[u8], announced: &mut bool) {
+    let Ok(line) = std::str::from_utf8(line) else {
+        return;
+    };
+    let text = line.trim();
+    if !*announced
+        && text.ends_with(".json")
+        && let Ok(path) =
+            crate::runner::contained_control_file(std::path::Path::new(text), &work.control_root)
+    {
+        *announced = true;
+        work.descriptor.send(Arc::new(path)).await;
+        return;
+    }
+    if !work.suppress && !text.is_empty() {
+        eprintln!("host: {text}");
+    }
+}
+
 async fn drain(work: Arc<OutputWork>) -> Arc<OutputWork> {
     let pipe = work
         .pipe
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .take();
-    if let Some(pipe) = pipe {
-        let mut reader = BufReader::new(pipe);
-        let mut line = String::new();
+    if let Some(mut pipe) = pipe {
+        let mut chunk = [0_u8; 4096];
+        let mut line = Vec::new();
+        let mut discarding = false;
         let mut announced = false;
 
         /*
@@ -152,14 +180,14 @@ async fn drain(work: Arc<OutputWork>) -> Arc<OutputWork> {
          * that will not start. Every component that logs anything at startup
          * was one line away from the same thing.
          *
-         * A descriptor is a `.json` path the host has already created by the
-         * time it prints it, so both halves are checkable. Everything else is
-         * forwarded as the diagnostic it is.
+         * A descriptor is a private `.json` file contained under this host's
+         * control root. Other bounded UTF-8 lines are forwarded as diagnostics;
+         * oversized lines are discarded through their terminating newline.
          */
         loop {
             let count = {
                 let stopping = work.stopping.raised();
-                let reading = reader.read_line(&mut line);
+                let reading = pipe.read(&mut chunk);
                 futures::pin_mut!(stopping, reading);
                 match select(stopping, reading).await {
                     Either::Left(_) => break,
@@ -168,16 +196,27 @@ async fn drain(work: Arc<OutputWork>) -> Arc<OutputWork> {
                 }
             };
             if count == 0 {
+                if !discarding && !line.is_empty() {
+                    accept_line(&work, &line, &mut announced).await;
+                }
                 break;
             }
-            let text = line.trim();
-            if !announced && text.ends_with(".json") && std::path::Path::new(text).is_file() {
-                announced = true;
-                work.descriptor.send(Arc::new(PathBuf::from(text))).await;
-            } else if !work.suppress && !text.is_empty() {
-                eprintln!("host: {text}");
+            for &byte in &chunk[..count] {
+                if byte == b'\n' {
+                    if !discarding {
+                        accept_line(&work, &line, &mut announced).await;
+                    }
+                    line.clear();
+                    discarding = false;
+                } else if !discarding {
+                    if line.len() == MAX_STDOUT_LINE_BYTES {
+                        line.clear();
+                        discarding = true;
+                    } else {
+                        line.push(byte);
+                    }
+                }
             }
-            line.clear();
             nagoya::yield_now().await;
         }
         // Keep consuming stdout for the lifetime of the host. Closing the

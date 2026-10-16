@@ -333,15 +333,27 @@ async fn settle_sweep_case(
 /// hand.
 struct HostProcess {
     child: std::process::Child,
+    stopped: bool,
     control_dir: Option<std::path::PathBuf>,
     output: Option<crate::child_output::HostOutput>,
 }
 
-impl Drop for HostProcess {
-    fn drop(&mut self) {
+impl HostProcess {
+    fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        crate::supervisor::kill_group(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();
         crate::app_caps::reaped(self.child.id());
+        self.stopped = true;
+    }
+}
+
+impl Drop for HostProcess {
+    fn drop(&mut self) {
+        self.stop();
         if let Some(path) = &self.control_dir
             && control_directory_is_real(path)
         {
@@ -423,8 +435,7 @@ impl HostedSession {
     /// Stop the current process before the replacement is spawned, so a wedged
     /// page cannot keep the control socket the next check has to attach to.
     fn restart(&mut self) -> std::result::Result<(), String> {
-        let _ = self.process.child.kill();
-        let _ = self.process.child.wait();
+        self.process.stop();
         if let Some(path) = self.process.control_dir.take()
             && control_directory_is_real(&path)
         {
@@ -1126,8 +1137,14 @@ fn ensure_plan_directory(
 }
 
 fn control_directory_is_real(path: &std::path::Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.is_dir()
+            && !meta.file_type().is_symlink()
+            && meta.uid() == rustix::process::geteuid().as_raw()
+            && meta.mode() & 0o077 == 0
+    })
 }
 
 /// Encode a check's `storage` map for the child environment.
@@ -1174,14 +1191,28 @@ async fn stage_check_storage(
     Ok(())
 }
 
-fn contained_control_file(
+pub(crate) fn contained_control_file(
     path: &std::path::Path,
     root: &std::path::Path,
 ) -> std::result::Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !control_directory_is_real(root) {
+        return Err(
+            "QA host control directory must be private and owned by the effective uid".into(),
+        );
+    }
     let meta = std::fs::symlink_metadata(path)
         .map_err(|error| format!("could not inspect host descriptor: {error}"))?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err("host descriptor must be a regular file under the QA control directory".into());
+    if meta.file_type().is_symlink()
+        || !meta.is_file()
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.mode() & 0o077 != 0
+    {
+        return Err(
+            "host descriptor must be a private regular file owned by the effective uid under the QA control directory"
+                .into(),
+        );
     }
     let path = path
         .canonicalize()
@@ -1205,12 +1236,14 @@ fn start_host_with_policy(
     clean_environment: bool,
     storage: Option<&str>,
 ) -> std::result::Result<(HostProcess, std::path::PathBuf), String> {
-    let mut command = std::process::Command::new(host);
-    let control_dir = if clean_environment {
-        Some(plan_control_directory()?)
-    } else {
-        None
-    };
+    let mut command = std::process::Command::new(
+        std::env::current_exe().map_err(|error| format!("locating host supervisor: {error}"))?,
+    );
+    command.arg("--supervise-host").arg(host);
+    // The supervisor owns the read end. EOF also arrives when this process
+    // is killed without unwinding, so cleanup does not depend on Drop.
+    command.stdin(std::process::Stdio::piped());
+    let control_dir = Some(plan_control_directory()?);
     if clean_environment {
         // Run plans must not forward unrelated secrets or application config
         // to the browser process. Page, storage and control are the explicit
@@ -1227,7 +1260,12 @@ fn start_host_with_policy(
         command.env("QA_INSPECT_STORAGE", encoded);
     }
     if let Some(path) = &control_dir {
-        command.env("CHUZZ_CONTROL_DIR", path);
+        command
+            .env("CHUZZ_CONTROL_DIR", path)
+            .env("CHUZZ_CACHE_DIR", path)
+            .env("CHUZZ_PROFILE_DIR", path.join("profile"));
+        // Sandboxed hosts place control sockets under their cache root. Keep
+        // that root private and contained alongside the legacy descriptor.
         // The current Blitz protocol uses std::env::temp_dir(), while legacy
         // Chuzz control uses CHUZZ_CONTROL_DIR. Confine both implementations.
         command
@@ -1262,14 +1300,20 @@ fn start_host_with_policy(
     crate::app_caps::child(spawned.id());
     let mut child = HostProcess {
         child: spawned,
+        stopped: false,
         control_dir,
         output: None,
     };
 
     // Readiness drives stdout, and the host owns the task until it is killed.
     let stdout = child.child.stdout.take().expect("stdout was piped");
+    let output_root = child
+        .control_dir
+        .as_ref()
+        .expect("host control directory was allocated")
+        .clone();
     child.output = Some(
-        crate::child_output::HostOutput::start(stdout, suppress_host_output)
+        crate::child_output::HostOutput::start(stdout, suppress_host_output, output_root)
             .map_err(|error| format!("reading host stdout: {error}"))?,
     );
     let output = child.output.as_ref().expect("stdout task was installed");
@@ -1278,11 +1322,11 @@ fn start_host_with_policy(
             // Once::recv transferred the sole descriptor Arc to this caller.
             let announced = Arc::try_unwrap(path)
                 .map_err(|_| "host descriptor ownership was not transferred".to_owned())?;
-            let announced = if let Some(root) = &child.control_dir {
-                contained_control_file(&announced, root)?
-            } else {
-                announced
-            };
+            let root = child
+                .control_dir
+                .as_ref()
+                .ok_or_else(|| "host control directory was not allocated".to_owned())?;
+            let announced = contained_control_file(&announced, root)?;
             Ok((child, announced))
         }
         _ => Err("the host never announced a descriptor".to_owned()),

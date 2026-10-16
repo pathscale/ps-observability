@@ -21,6 +21,7 @@ mod qa;
 mod reach;
 mod report;
 mod runner;
+mod supervisor;
 mod sweep;
 mod target;
 mod timing;
@@ -33,6 +34,12 @@ mod timing;
 mod app_caps;
 
 fn main() -> eyre::Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--supervise-host" || arg == "--supervise-native-host")
+    {
+        return supervisor::run();
+    }
     if std::env::args_os().any(|argument| argument == "native-page") {
         let command = <cli::Cli as clap::Parser>::parse().command;
         if let cli::Command::NativePage {
