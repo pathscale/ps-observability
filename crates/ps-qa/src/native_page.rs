@@ -22,6 +22,17 @@ struct Observation {
     native: Vec<NativeEntry>,
     texts: Vec<Text>,
     viewport: [u32; 2],
+    initial_ns: Option<u64>,
+    counts: Option<NativeCounts>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeCounts {
+    compilations_before: u64,
+    compilations_after: u64,
+    native_entries_before: u64,
+    native_entries_after: u64,
 }
 
 #[derive(Deserialize)]
@@ -35,10 +46,11 @@ struct NativeEntry {
     code_bytes: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct Text {
     node_id: u64,
+    parent_id: Option<String>,
     text: String,
     bounds: Option<[f64; 4]>,
     ink_pixels: u64,
@@ -67,8 +79,8 @@ pub fn run(
     plant: Option<&str>,
     report: &Path,
 ) -> Result<()> {
-    if !matches!(engine, "boa" | "ekojit") {
-        bail!("engine must be boa or ekojit");
+    if engine != "ekojit" {
+        bail!("native-page requires the ekojit engine");
     }
     if plant.is_some_and(|name| name != "host-text-append-noop") {
         bail!("unknown native-page plant");
@@ -97,8 +109,6 @@ pub fn run(
                 .arg(host)
                 .arg("--page")
                 .arg(page)
-                .arg("--engine")
-                .arg(engine)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -141,6 +151,9 @@ pub fn run(
     if observation.schema != "eko-page-observation-v1" || observation.viewport.contains(&0) {
         bail!("invalid native page observation schema or viewport");
     }
+    if observation.backend != engine {
+        bail!("native page observation does not match the requested engine");
+    }
     if !observation.errors.is_empty() {
         bail!("native page startup errors: {:?}", observation.errors);
     }
@@ -180,8 +193,38 @@ pub fn run(
         failures += usize::from(!passed);
         rows.push(json!({ "id": check.id, "verdict": if passed { "pass" } else { "fail" } }));
     }
+    let (native_entries, native_host_calls, native_code_bytes) = observation
+        .native
+        .iter()
+        .try_fold((0_u64, 0_u64, 0_usize), |(entries, calls, bytes), entry| {
+            Ok::<_, eyre::Report>((
+                entries
+                    .checked_add(entry.native_entries)
+                    .ok_or_else(|| eyre!("native entry count overflow"))?,
+                calls
+                    .checked_add(entry.host_calls)
+                    .ok_or_else(|| eyre!("native host call count overflow"))?,
+                bytes
+                    .checked_add(entry.code_bytes)
+                    .ok_or_else(|| eyre!("native code byte count overflow"))?,
+            ))
+        })?;
     let report_value = json!({ "backend": observation.backend, "checks": rows,
-        "failures": failures, "native_entries": observation.native.iter().map(|entry| entry.native_entries).sum::<u64>() });
+        "failures": failures,
+        "native_entries": native_entries,
+        "native_host_calls": native_host_calls,
+        "native_code_bytes": native_code_bytes,
+        "initial_ns": observation.initial_ns,
+        "counts": observation.counts,
+        "texts": observation.texts,
+        "native": observation.native.iter().map(|entry| json!({
+            "source_url": &entry.source_url,
+            "backend": &entry.backend,
+            "entry_abi": &entry.entry_abi,
+            "native_entries": entry.native_entries,
+            "host_calls": entry.host_calls,
+            "code_bytes": entry.code_bytes,
+        })).collect::<Vec<_>>() });
     blitz_control_protocol::guarded_writer::write_file(
         std::path::Path::new(&report),
         &serde_json::to_vec_pretty(&report_value)?,
