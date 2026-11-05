@@ -5,4 +5,3 @@
     (id: "ekojit-console-log", expect: Console("ekojit hello")),
     (id: "ekojit-text-append", expect: VisibleText("Hello from ekojit")),
 ]
-
