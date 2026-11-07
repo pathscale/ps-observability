@@ -115,9 +115,10 @@ impl Descriptor {
 
 /// Locate a running inspector, preferring an explicitly pinned descriptor.
 ///
-/// `--descriptor <path>` wins. Otherwise the build's own pinned path is tried,
-/// then the temporary directory is scanned, which is the fallback for a
-/// hand-launched build and the one that can find a stale instance.
+/// `--descriptor <path>` wins. Otherwise the build's own pinned path is
+/// authoritative when it exists: an invalid or stale pin is an error rather
+/// than a reason to attach to another host. The temporary directory is scanned
+/// only when no implicit pin exists.
 ///
 /// A named descriptor that is not there is an error, not an invitation to
 /// scan. Falling through to discovery attached to the newest *other* host on
@@ -126,6 +127,18 @@ impl Descriptor {
 /// page nobody had asked about. A typo in a path is not consent to inspect
 /// somebody else's application.
 pub fn discover(explicit: Option<&str>) -> Result<Descriptor> {
+    discover_with_paths(
+        explicit,
+        Path::new("target/blitz-control.json"),
+        &crate::control_directory::default_directory(),
+    )
+}
+
+fn discover_with_paths(
+    explicit: Option<&str>,
+    pinned: &Path,
+    root: &Path,
+) -> Result<Descriptor> {
     if let Some(path) = explicit {
         let path = PathBuf::from(path);
         if !path.exists() {
@@ -143,19 +156,33 @@ pub fn discover(explicit: Option<&str>) -> Result<Descriptor> {
     // $TMPDIR meant the one instance that was definitely running was the one
     // instance discovery could not see, and it picked a dead descriptor from a
     // previous run instead, which is how preferring a live pid still failed.
-    let pinned = PathBuf::from("target/blitz-control.json");
-    if pinned.exists()
-        && let Ok(mut descriptor) = read_descriptor(&pinned)
-        && descriptor.is_reachable()
-    {
-        descriptor.verified_reachable = true;
-        return Ok(descriptor);
+    match std::fs::symlink_metadata(pinned) {
+        Ok(_) => {
+            let result = read_descriptor(pinned).and_then(|mut descriptor| {
+                if !descriptor.is_reachable() {
+                    bail!("control socket is unreachable");
+                }
+                descriptor.verified_reachable = true;
+                Ok(descriptor)
+            });
+            return result.wrap_err_with(|| {
+                format!(
+                    "implicit pinned descriptor {} exists but is invalid or unreachable; fix or remove this pin before discovery",
+                    pinned.display()
+                )
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).wrap_err_with(|| {
+                format!("checking implicit pinned descriptor {}", pinned.display())
+            });
+        }
     }
 
-    let root = crate::control_directory::default_directory();
     let mut found: Vec<(std::time::SystemTime, PathBuf)> =
-        if crate::control_directory::validate_directory(&root).is_ok() {
-            std::fs::read_dir(&root)
+        if crate::control_directory::validate_directory(root).is_ok() {
+            std::fs::read_dir(root)
                 .into_iter()
                 .flatten()
                 .flatten()
@@ -912,6 +939,377 @@ mod tests {
     use super::*;
     use crate::{JsonRpcResponse, encode_diagnostics_event};
     use nagoya::reactor::TcpListener;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::net::UnixListener as StdUnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PIN_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
+    const PIN_FIXTURE_ROOT_ENV: &str = "PS_OBSERVABILITY_PIN_FIXTURE_ROOT";
+    const MACOS_SUN_PATH_CAPACITY: usize = 104;
+
+    fn fixture_root() -> PathBuf {
+        let configured = std::env::var_os(PIN_FIXTURE_ROOT_ENV).unwrap_or_else(|| {
+            panic!(
+                "{PIN_FIXTURE_ROOT_ENV} is required; set it to an existing absolute directory owned by the current user and writable by that user"
+            )
+        });
+        let configured = PathBuf::from(configured);
+        assert!(configured.is_absolute(), "{PIN_FIXTURE_ROOT_ENV} must be an absolute path: {}", configured.display());
+        let before = std::fs::symlink_metadata(&configured).unwrap_or_else(|error| {
+            panic!("{PIN_FIXTURE_ROOT_ENV} must name an existing directory ({}): {error}", configured.display())
+        });
+        validate_fixture_root_metadata(&configured, &before);
+        let canonical = configured.canonicalize().unwrap_or_else(|error| {
+            panic!("cannot resolve {PIN_FIXTURE_ROOT_ENV} directory {}: {error}", configured.display())
+        });
+        let after = std::fs::symlink_metadata(&canonical).unwrap_or_else(|error| {
+            panic!("cannot recheck {PIN_FIXTURE_ROOT_ENV} directory {}: {error}", canonical.display())
+        });
+        validate_fixture_root_metadata(&canonical, &after);
+        assert!(before.dev() == after.dev() && before.ino() == after.ino(), "{PIN_FIXTURE_ROOT_ENV} changed while being validated: {}", configured.display());
+        canonical
+    }
+
+    fn validate_fixture_root_metadata(path: &Path, metadata: &std::fs::Metadata) {
+        assert!(!metadata.file_type().is_symlink() && metadata.is_dir(), "{PIN_FIXTURE_ROOT_ENV} must be a real directory, not a symlink: {}", path.display());
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw(), "{PIN_FIXTURE_ROOT_ENV} must be owned by the current user: {}", path.display());
+        assert!(metadata.mode() & 0o300 == 0o300, "{PIN_FIXTURE_ROOT_ENV} must be writable and searchable by its owner: {}", path.display());
+    }
+
+    struct PinDiscoveryFixture {
+        root: PathBuf,
+        pinned: PathBuf,
+        pin_directory: PathBuf,
+        runtime: PathBuf,
+        listeners: Vec<StdUnixListener>,
+    }
+
+    impl PinDiscoveryFixture {
+        fn new() -> Self {
+            let base = fixture_root();
+            let root = loop {
+                let sequence = PIN_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock is after the epoch")
+                    .as_nanos();
+                let candidate = base.join(format!("pin-{:x}-{nonce:x}-{sequence:x}", std::process::id()));
+                match crate::guarded_writer::create_private_dir(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create unique private fixture child {} under {}: {error}", candidate.display(), base.display()),
+                }
+            };
+            let pin_directory = root.join("pin");
+            let runtime = root.join("run");
+            let setup = (|| -> Result<()> {
+                crate::guarded_writer::create_private_dir(&pin_directory)?;
+                crate::guarded_writer::create_private_dir(&runtime)?;
+                Ok(())
+            })();
+            if let Err(error) = setup {
+                let _ = std::fs::remove_dir_all(&root);
+                panic!("create fixture directories under {}: {error}", root.display());
+            }
+            let pinned = pin_directory.join("blitz-control.json");
+            Self {
+                root,
+                pinned,
+                pin_directory,
+                runtime,
+                listeners: Vec::new(),
+            }
+        }
+
+        fn descriptor(&mut self, directory: &Path, file: &str, socket_name: &str) -> PathBuf {
+            let socket = directory.join(socket_name);
+            assert_socket_path_length(&socket);
+            let listener = StdUnixListener::bind(&socket).expect("bind private fixture socket");
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict fixture socket mode");
+            self.listeners.push(listener);
+            let descriptor = directory.join(file);
+            crate::guarded_writer::write_file(
+                &descriptor,
+                serde_json::json!({
+                    "protocolVersion": DEBUG_PROTOCOL_VERSION,
+                    "pid": 1,
+                    "instanceId": file,
+                    "address": format!("unix://{}", socket.display()),
+                    "renderer": "fixture",
+                    "rendererRevision": "test"
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .expect("write valid fixture descriptor");
+            descriptor
+        }
+
+        fn fallback(&mut self) -> PathBuf {
+            self.descriptor(&self.runtime.clone(), "fallback.json", "f.sock")
+        }
+
+        fn prove_fallback_is_discoverable(&self, fallback: &Path) {
+            let selected = discover_fixture(self).expect("fallback is discoverable before pin");
+            assert_eq!(selected.path, fallback);
+            self.drain_listener("f.sock");
+        }
+
+        fn set_modified(path: &Path, seconds: u64) -> std::time::SystemTime {
+            let modified = std::time::UNIX_EPOCH + Duration::from_secs(seconds);
+            let file = std::fs::File::open(path).expect("open fixture descriptor for timestamps");
+            file.set_times(
+                std::fs::FileTimes::new().set_modified(modified),
+            )
+            .expect("set fixture descriptor timestamp");
+            std::fs::metadata(path)
+                .expect("stat timestamped fixture descriptor")
+                .modified()
+                .expect("read fixture descriptor timestamp")
+        }
+
+        fn drain_listener(&self, socket_name: &str) {
+            let path = self.runtime.join(socket_name);
+            if let Some(listener) = self
+                .listeners
+                .iter()
+                .find(|listener| {
+                    listener
+                        .local_addr()
+                        .ok()
+                        .and_then(|addr| addr.as_pathname().map(Path::to_path_buf))
+                        .as_deref()
+                        == Some(path.as_path())
+                })
+            {
+                listener.set_nonblocking(true).expect("nonblocking fixture listener");
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => drop(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("drain fallback listener: {error}"),
+                    }
+                }
+            }
+        }
+
+        fn assert_no_fallback_connection(&self) {
+            let path = self.runtime.join("f.sock");
+            let listener = self
+                .listeners
+                .iter()
+                .find(|listener| {
+                    listener
+                        .local_addr()
+                        .ok()
+                        .and_then(|addr| addr.as_pathname().map(Path::to_path_buf))
+                        .as_deref()
+                        == Some(path.as_path())
+                })
+                .expect("fallback listener");
+            listener.set_nonblocking(true).expect("nonblocking fallback listener");
+            match listener.accept() {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok((stream, _)) => {
+                    drop(stream);
+                    panic!("rejected pin connected to fallback host");
+                }
+                Err(error) => panic!("check fallback listener: {error}"),
+            }
+        }
+    }
+
+    impl Drop for PinDiscoveryFixture {
+        fn drop(&mut self) {
+            self.listeners.clear();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn discover_fixture(fixture: &PinDiscoveryFixture) -> Result<Descriptor> {
+        discover_with_paths(None, &fixture.pinned, &fixture.runtime)
+    }
+
+    #[test]
+    fn pinned_discovery_absent_pin_uses_reachable_fallback() {
+        let mut fixture = PinDiscoveryFixture::new();
+        let fallback = fixture.fallback();
+        let selected = discover_fixture(&fixture).expect("fallback is discoverable");
+        assert_eq!(selected.path, fallback);
+        fixture.drain_listener("f.sock");
+    }
+
+    #[test]
+    fn pinned_discovery_absent_pin_keeps_newest_reachable_selection() {
+        let mut fixture = PinDiscoveryFixture::new();
+        let oldest = fixture.descriptor(&fixture.runtime.clone(), "older.json", "o.sock");
+        let newest = fixture.descriptor(&fixture.runtime.clone(), "newest.json", "n.sock");
+        let unreachable = fixture.descriptor(&fixture.runtime.clone(), "latest.json", "x.sock");
+        let latest_socket = fixture.runtime.join("x.sock");
+        drop(fixture.listeners.pop().expect("latest listener"));
+        assert!(latest_socket.exists(), "closed socket path remains for validation");
+        let oldest_time = PinDiscoveryFixture::set_modified(&oldest, 1_700_000_000);
+        let newest_time = PinDiscoveryFixture::set_modified(&newest, 1_700_000_010);
+        let unreachable_time = PinDiscoveryFixture::set_modified(&unreachable, 1_700_000_020);
+        assert!(oldest_time < newest_time);
+        assert!(newest_time < unreachable_time);
+        let selected = discover_fixture(&fixture).expect("newest reachable descriptor selected");
+        assert_eq!(selected.path, newest);
+        fixture.drain_listener("n.sock");
+    }
+
+    #[test]
+    fn pinned_discovery_rejects_malformed_pin_without_connecting_fallback() {
+        let mut fixture = PinDiscoveryFixture::new();
+        let fallback = fixture.fallback();
+        fixture.prove_fallback_is_discoverable(&fallback);
+        crate::guarded_writer::write_file(&fixture.pinned, b"{").expect("write malformed pin");
+        let error = discover_fixture(&fixture).expect_err("invalid existing pin must fail");
+        assert!(error.to_string().contains(fixture.pinned.to_str().unwrap()));
+        fixture.assert_no_fallback_connection();
+    }
+
+    #[test]
+    fn pinned_discovery_rejects_insecure_parent_without_connecting_fallback() {
+        let mut fixture = PinDiscoveryFixture::new();
+        let fallback = fixture.fallback();
+        fixture.prove_fallback_is_discoverable(&fallback);
+        fixture.descriptor(
+            &fixture.pin_directory.clone(),
+            "blitz-control.json",
+            "p.sock",
+        );
+        std::fs::set_permissions(&fixture.pin_directory, std::fs::Permissions::from_mode(0o755))
+            .expect("make pin parent insecure");
+        let error = discover_fixture(&fixture).expect_err("insecure pin parent must fail");
+        let cause = format!("{error:#}");
+        assert!(cause.contains(fixture.pinned.to_str().unwrap()));
+        assert!(
+            cause.contains("validating descriptor directory"),
+            "insecure-parent case failed for an unexpected reason: {cause}"
+        );
+        fixture.assert_no_fallback_connection();
+    }
+
+    #[test]
+    fn pinned_discovery_rejects_socket_outside_pin_parent_without_fallback() {
+        let mut fixture = PinDiscoveryFixture::new();
+        let fallback = fixture.fallback();
+        fixture.prove_fallback_is_discoverable(&fallback);
+        let outside = fixture.runtime.join("f.sock");
+        crate::guarded_writer::write_file(
+            &fixture.pinned,
+            serde_json::json!({
+                "protocolVersion": DEBUG_PROTOCOL_VERSION,
+                "pid": 1,
+                "instanceId": "outside",
+                "address": format!("unix://{}", outside.display()),
+                "renderer": "fixture",
+                "rendererRevision": "test"
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("write outside-socket pin");
+        let error = discover_fixture(&fixture).expect_err("socket outside pin parent must fail");
+        assert!(error.to_string().contains(fixture.pinned.to_str().unwrap()));
+        fixture.assert_no_fallback_connection();
+    }
+
+    #[test]
+    fn pinned_discovery_rejects_unreachable_and_dangling_pins_without_fallback() {
+        let mut fixture = PinDiscoveryFixture::new();
+        let fallback = fixture.fallback();
+        fixture.prove_fallback_is_discoverable(&fallback);
+        let stale_socket = fixture.pin_directory.join("s.sock");
+        assert_socket_path_length(&stale_socket);
+        let stale_listener = StdUnixListener::bind(&stale_socket).expect("bind stale pin socket");
+        std::fs::set_permissions(&stale_socket, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict stale socket mode");
+        drop(stale_listener);
+        crate::guarded_writer::write_file(
+            &fixture.pinned,
+            serde_json::json!({
+                "protocolVersion": DEBUG_PROTOCOL_VERSION,
+                "pid": 1,
+                "instanceId": "stale",
+                "address": format!("unix://{}", stale_socket.display()),
+                "renderer": "fixture",
+                "rendererRevision": "test"
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("write stale pin");
+        let error = discover_fixture(&fixture).expect_err("unreachable pin must fail");
+        assert!(error.to_string().contains(fixture.pinned.to_str().unwrap()));
+        fixture.assert_no_fallback_connection();
+
+        std::fs::remove_file(&fixture.pinned).expect("remove stale pin");
+        symlink(fixture.pin_directory.join("missing.json"), &fixture.pinned)
+            .expect("create dangling pin symlink");
+        let error = discover_fixture(&fixture).expect_err("dangling pin must fail");
+        assert!(error.to_string().contains(fixture.pinned.to_str().unwrap()));
+        fixture.assert_no_fallback_connection();
+    }
+
+    #[test]
+    fn pinned_discovery_valid_pin_wins_and_explicit_path_precedes_invalid_pin() {
+        let mut fixture = PinDiscoveryFixture::new();
+        let fallback = fixture.fallback();
+        let pinned = fixture.descriptor(&fixture.pin_directory.clone(), "blitz-control.json", "p.sock");
+        let selected = discover_fixture(&fixture).expect("reachable pin is authoritative");
+        assert_eq!(selected.path, pinned);
+        assert!(selected.verified_reachable);
+        fixture.assert_no_fallback_connection();
+
+        std::fs::remove_file(&fixture.pinned).expect("remove pin file");
+        crate::guarded_writer::write_file(&fixture.pinned, b"invalid").expect("write bad pin");
+        let explicit = discover_with_paths(
+            Some(fallback.to_str().unwrap()),
+            &fixture.pinned,
+            &fixture.runtime,
+        )
+        .expect("explicit descriptor retains precedence");
+        assert_eq!(explicit.path, fallback);
+        assert!(!explicit.verified_reachable);
+        fixture.assert_no_fallback_connection();
+    }
+
+    #[test]
+    fn pinned_discovery_explicit_closed_socket_remains_uncached() {
+        let mut fixture = PinDiscoveryFixture::new();
+        let explicit = fixture.descriptor(&fixture.pin_directory.clone(), "explicit.json", "e.sock");
+        drop(fixture.listeners.pop().expect("explicit listener"));
+        assert!(fixture.pin_directory.join("e.sock").exists());
+        let selected = discover_with_paths(
+            Some(explicit.to_str().unwrap()),
+            &fixture.pinned,
+            &fixture.runtime,
+        )
+        .expect("explicit descriptor read does not add a reachability probe");
+        assert_eq!(selected.path, explicit);
+        assert!(!selected.verified_reachable);
+        assert!(!selected.is_reachable());
+    }
+
+    fn assert_socket_path_length(path: &Path) {
+        let length = path.as_os_str().as_bytes().len();
+        assert!(
+            length < MACOS_SUN_PATH_CAPACITY,
+            "Unix socket path is {length} bytes; expected fewer than {MACOS_SUN_PATH_CAPACITY}: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn pinned_discovery_empty_runtime_reports_no_host() {
+        let fixture = PinDiscoveryFixture::new();
+        let error = discover_fixture(&fixture).expect_err("empty runtime has no host");
+        assert!(error.to_string().contains("no reachable inspector descriptor found"));
+    }
 
     #[test]
     fn connect_retries_startup_and_exchange_preserves_events() {
