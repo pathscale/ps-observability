@@ -13,9 +13,9 @@ Can a native Rust web-rendering application combine semantic control identity wi
 3. **Paint evidence:** `blitz-control-protocol` defines committed-paint events and a client baseline operation. Trace the event from renderer to QA verdict and show that no synthetic paint is counted.
 4. **In-band inspection:** the handover proposed serialized inspection between render frames. This remains a claim to verify against the renderer and host implementation; do not claim atomicity or freedom from torn snapshots until that path is demonstrated in current source.
 
-## Known limitation to resolve before a broad event-driven claim
+## Scope of event-driven waiting
 
-The current `crates/ps-qa/src/runner.rs::wait_for_gpu` loop rechecks an outcome and sleeps for up to 25 ms before checking again. This is a periodic sleep-and-recheck path. Either replace it with a real completion event or clearly limit the study claim to the paths that are event driven. Do not describe the whole system as event synchronized while this path remains.
+Limit any event-driven claim to paths that subscribe to and await committed paint on supporting hosts. Count compatibility retries without paint events and all WebGPU outcome checks as sampled paths. The control protocol exposes WebGPU diagnostics reads, and page GPU resources, error totals, and offscreen work can change independently of committed window paint.
 
 ## Claim boundaries
 
@@ -28,7 +28,7 @@ The current `crates/ps-qa/src/runner.rs::wait_for_gpu` loop rechecks an outcome 
 ## Evidence required before a paper is written
 
 - Re-review each candidate contribution against the current source revision and name the exact source path and interface that implements it.
-- Trace the renderer event lifecycle and the QA wait path, including the GPU polling limitation above.
+- Trace the renderer event lifecycle and distinguish paint-event waits from sampled paths in the QA results.
 - Prepare focused, reproducible local witnesses that distinguish committed paint from layout-only or unsupported observations and that fail when coverage accounting is corrupted.
 - Compare the design with current browser DevTools/WebDriver interfaces, Flutter's widget testing and settling APIs, accessibility-tree testing, and GUI test-flakiness research. Record the precise difference; transport resemblance is not novelty.
 - Establish a current artifact and deployment boundary, including whether the headless host runs on the target platform. Report unsupported platform behavior explicitly.

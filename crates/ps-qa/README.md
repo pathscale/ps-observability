@@ -337,6 +337,13 @@ tabs, then activates the exact semantic node id.
 
 ### Page WebGPU checks
 
+Suite WebGPU checks sample host diagnostics within the check's outcome
+window. Report checks retry while there is time for another inspection and
+fail immediately on observed validation or uncaptured errors when checking
+`GpuNoErrors`. For report checks, `stable_for_ms` measures elapsed time across
+consecutive passing samples. WebGPU inspection works independently of window
+paint events on hosts that support it.
+
 `ps-qa gpu` prints page-owned devices, live resources, cumulative errors, and
 sampled frames. `ps-qa gpu-capture texture:preview` or
 `ps-qa gpu-capture canvas:#view` reads a texture or canvas and reports visible
