@@ -2017,7 +2017,7 @@ async fn run_qa_inner(
                             )
                         } else {
                             format!(
-                                "the setup value {value:?} had not reached {field:?} within {}ms; \
+                                "the setup value had not reached {field:?} within {}ms; \
                                  a baseline taken before it lands lets the setup satisfy the \
                                  check's own outcome",
                                 check_timeout(900).as_millis()
