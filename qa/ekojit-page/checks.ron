@@ -1,0 +1,7 @@
+[
+    (id: "ekojit-native-entry", expect: NativeEntry),
+    (id: "ekojit-page-ready", expect: VisibleText("Native page ready")),
+    (id: "ekojit-document-title", expect: Title("ekojit hello")),
+    (id: "ekojit-console-log", expect: Console("ekojit hello")),
+    (id: "ekojit-text-append", expect: VisibleText("Hello from ekojit")),
+]

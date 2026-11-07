@@ -179,7 +179,7 @@ pub enum Command {
         page: PathBuf,
         #[arg(long)]
         checks: PathBuf,
-        #[arg(long, default_value = "ekojit")]
+        #[arg(long, default_value = "ekojit", value_parser = ["ekojit"])]
         engine: String,
         #[arg(long)]
         plant: Option<String>,

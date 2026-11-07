@@ -29,8 +29,6 @@
 //! other by counting bytes, and only the second works with no font catalogue
 //! installed. See [`DocumentControl::act`].
 
-use blitz_dom::Document as _;
-use blitz_script::ScriptDocument;
 use blitz_traits::events::{
     BlitzImeEvent, BlitzInputEvent, BlitzWheelDelta, BlitzWheelEvent, BlitzWheelPhase, DomEvent,
     DomEventData, MouseEventButton, MouseEventButtons, Point, UiEvent,
@@ -115,7 +113,7 @@ impl DocumentControl {
     /// or a process, and only the embedder that started it can honour them.
     pub fn agent(
         &mut self,
-        document: &mut ScriptDocument,
+        document: &mut (impl crate::ControlScriptBackend + ?Sized),
         request: AgentControlRequest,
     ) -> DebugResponse {
         match request {
@@ -164,7 +162,7 @@ impl DocumentControl {
     /// stable. Both want the same actions.
     pub fn act(
         &mut self,
-        document: &mut ScriptDocument,
+        document: &mut (impl crate::ControlScriptBackend + ?Sized),
         action: AgentAction,
     ) -> Result<(), DebugError> {
         match action {
@@ -225,7 +223,7 @@ impl DocumentControl {
 
     fn input(
         &mut self,
-        document: &mut ScriptDocument,
+        document: &mut (impl crate::ControlScriptBackend + ?Sized),
         input: InputCommand,
     ) -> Result<(), DebugError> {
         match input {
@@ -312,7 +310,7 @@ impl DocumentControl {
     #[cfg(feature = "capture")]
     pub fn capture(
         &mut self,
-        document: &mut ScriptDocument,
+        document: &mut (impl crate::ControlScriptBackend + ?Sized),
         request: crate::CaptureRequest,
     ) -> Result<crate::CapturedImage, DebugError> {
         request.validate().map_err(|why| DebugError {
@@ -324,7 +322,9 @@ impl DocumentControl {
 }
 
 /// Drain the synchronous script work an action caused.
-pub fn settle(document: &mut ScriptDocument) -> Result<(), DebugError> {
+pub fn settle(
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
+) -> Result<(), DebugError> {
     for _ in 0..MAX_SETTLE_POLLS {
         if !document.poll(None) {
             document.inner_mut().resolve(0.0);
@@ -356,7 +356,7 @@ pub fn settle(document: &mut ScriptDocument) -> Result<(), DebugError> {
 /// on which fonts the machine has is a harness that reports different verdicts
 /// on CI and on a laptop.
 pub(crate) fn set_node_value(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     node_id: blitz_dom::NodeId,
     value: String,
 ) -> Result<(), DebugError> {
@@ -462,15 +462,17 @@ fn mouse_button(button: u16) -> Result<MouseEventButton, DebugError> {
 
 #[cfg(test)]
 mod tests {
-    use blitz_dom::DocumentConfig;
+    use blitz_dom::{Document as _, DocumentConfig};
+    use blitz_traits::events::DomEventData;
 
     use super::*;
+    use crate::test_document::TestDocument;
     use crate::{AgentSnapshot, Modifiers};
 
     /// A page with something to press, something to type into, and something
     /// to scroll, driven with no socket anywhere.
-    fn document() -> ScriptDocument {
-        let mut document = ScriptDocument::from_html(
+    fn document() -> TestDocument {
+        let mut document = TestDocument::from_html(
             r#"<style>
                  #scroller { height: 40px; overflow: auto; }
                  #tall { height: 400px; }
@@ -480,17 +482,17 @@ mod tests {
                <input id="date" type="date" value="2025-01-01">
                <div id="scroller"><div id="tall">tall</div></div>
                <output id="log"></output>
-               <output id="date-log"></output>
-               <script>
-                 document.getElementById('press').addEventListener('click', () => {
-                   document.getElementById('log').textContent = 'pressed';
-                 });
-                 document.getElementById('date').addEventListener('input', event => {
-                   document.getElementById('date-log').textContent = event.target.value;
-                 });
-               </script>"#,
+               <output id="date-log"></output>"#,
             DocumentConfig::default(),
         );
+        document.on("#press", "click", |document, _event, _state| {
+            set_text_content(document, "#log", "pressed")
+        });
+        document.on("#date", "input", |document, event, _state| {
+            if let DomEventData::Input(input) = &event.data {
+                set_text_content(document, "#date-log", &input.value);
+            }
+        });
         // A viewport, or every box lays out at zero width and a pointer has
         // nowhere to land.
         document
@@ -506,7 +508,18 @@ mod tests {
         document
     }
 
-    fn node(control: &mut DocumentControl, document: &mut ScriptDocument, dom_id: &str) -> u64 {
+    fn set_text_content(document: &mut blitz_dom::BaseDocument, selector: &str, value: &str) {
+        let output = document
+            .query_selector(selector)
+            .unwrap()
+            .unwrap_or_else(|| panic!("the fixture has no {selector}"));
+        let mut mutator = document.mutate();
+        mutator.remove_and_drop_all_children(output);
+        let text = mutator.create_text_node(value);
+        mutator.append_children(output, &[text]);
+    }
+
+    fn node(control: &mut DocumentControl, document: &mut TestDocument, dom_id: &str) -> u64 {
         let DebugResponse::AgentSnapshot(AgentSnapshot { nodes, .. }) = control.agent(
             document,
             AgentControlRequest::Inspect {
@@ -526,7 +539,7 @@ mod tests {
     /// What the document says an element holds, read straight from the tree
     /// rather than through the semantic surface. The point of these tests is
     /// that an action happened, not what the surface calls the result.
-    fn text(document: &ScriptDocument, selector: &str) -> String {
+    fn text(document: &TestDocument, selector: &str) -> String {
         let id = document
             .inner()
             .query_selector(selector)
@@ -683,7 +696,7 @@ mod tests {
         let mut control = DocumentControl::new();
         for request in [
             AgentControlRequest::Navigate {
-                url: "https://example.com/".into(),
+                url: "/second.html".into(),
             },
             AgentControlRequest::Relaunch,
             AgentControlRequest::Quit,

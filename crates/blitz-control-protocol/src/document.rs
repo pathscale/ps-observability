@@ -21,11 +21,9 @@ use crate::{
 #[cfg(feature = "capture")]
 use crate::{
     DebugSnapshot, FrameMetrics, FrameWindowMetrics, LayoutBounds, LayoutDiagnosticRow,
-    LayoutEdges, LayoutOffset, LayoutSize, RendererMetrics, RevisionSet, ScriptMetrics,
-    ScriptSource, SnapshotCost, SnapshotRequest, TimingStats,
+    LayoutEdges, LayoutOffset, LayoutSize, RendererMetrics, RevisionSet, SnapshotCost,
+    SnapshotRequest, TimingStats,
 };
-use blitz_dom::Document;
-use blitz_script::ScriptDocument;
 use blitz_traits::events::{
     BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, KeyState, MouseEventButton,
     MouseEventButtons, Point, PointerCoords, PointerDetails, UiEvent,
@@ -68,7 +66,7 @@ impl DocumentCapture {
 
     pub fn capture(
         &mut self,
-        document: &mut ScriptDocument,
+        document: &mut (impl crate::ControlScriptBackend + ?Sized),
         request: crate::CaptureRequest,
     ) -> Result<crate::CapturedImage, DebugError> {
         capture_document_with_surface(document, request, &mut self.surface)
@@ -107,7 +105,7 @@ impl CaptureSurface {
     }
 }
 
-/// Draw a standalone script document through the same CPU paint path used by
+/// Draw a standalone control document through the same CPU paint path used by
 /// runtime diagnostics.
 ///
 /// Headless QA hosts intentionally have no `RuntimeApplication`, but they must
@@ -116,7 +114,7 @@ impl CaptureSurface {
 /// byte-for-byte comparable.
 #[cfg(feature = "capture")]
 pub fn capture_document(
-    script_document: &mut ScriptDocument,
+    script_document: &mut (impl crate::ControlScriptBackend + ?Sized),
     request: crate::CaptureRequest,
 ) -> Result<crate::CapturedImage, DebugError> {
     DocumentCapture::new().capture(script_document, request)
@@ -124,7 +122,7 @@ pub fn capture_document(
 
 #[cfg(feature = "capture")]
 pub(crate) fn capture_document_with_surface(
-    script_document: &mut ScriptDocument,
+    script_document: &mut (impl crate::ControlScriptBackend + ?Sized),
     request: crate::CaptureRequest,
     surface: &mut Option<CaptureSurface>,
 ) -> Result<crate::CapturedImage, DebugError> {
@@ -267,7 +265,7 @@ pub(crate) fn capture_document_with_surface(
 /// `setTimeout(0)` slices of a page that yields that way, so a page doing
 /// time-sliced work answered each request seconds late. Returns how many
 /// passes made progress and how many ran.
-fn drain_for_observer(document: &mut ScriptDocument) -> (u64, u64) {
+fn drain_for_observer(document: &mut (impl crate::ControlScriptBackend + ?Sized)) -> (u64, u64) {
     const BUDGET: std::time::Duration = std::time::Duration::from_millis(16);
     let started = std::time::Instant::now();
     let (mut progressed, mut passes) = (0u64, 0u64);
@@ -284,12 +282,12 @@ fn drain_for_observer(document: &mut ScriptDocument) -> (u64, u64) {
 /// Collect the same typed diagnostic snapshot from a standalone Blitz document
 /// that the windowed runtime exposes over its control socket.
 ///
-/// Headless component hosts own a `ScriptDocument` without a Tauri event loop.
-/// Keeping snapshot collection here gives those hosts the renderer's real DOM,
-/// layout and computed paint data instead of a partial or reimplemented view.
+/// Headless component hosts can provide a document backend without a Tauri event
+/// loop. Keeping snapshot collection here gives those hosts the renderer's real
+/// DOM, layout and computed paint data instead of a partial or reimplemented view.
 #[cfg(feature = "capture")]
 pub fn snapshot_document(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     request: SnapshotRequest,
     revision: u64,
 ) -> Result<DebugSnapshot, DebugError> {
@@ -416,28 +414,8 @@ pub fn snapshot_document(
             resolve_ms: snapshot_resolve_ms,
             total_ms,
         }),
-        // The other half of a frame. Everything above this line is the
-        // engine; this is the language runtime the application actually
-        // spends its time in.
-        script: blitz_script::script_stats::latest_script_stats().map(|stats| ScriptMetrics {
-            mean_ms: stats.mean_ms,
-            p95_ms: stats.p95_ms,
-            max_ms: stats.max_ms,
-            window_polls: stats.window_polls,
-            total_polls: stats.total_polls,
-            productive_polls: stats.productive_polls,
-            spent_ms: stats.spent_ms,
-            breakdown: blitz_script::script_stats::work_breakdown()
-                .into_iter()
-                .take(12)
-                .map(|(label, calls, total_ms, worst_ms)| ScriptSource {
-                    label,
-                    calls,
-                    total_ms,
-                    worst_ms,
-                })
-                .collect(),
-        }),
+        // Script metrics are supplied by the active document backend.
+        script: document.script_metrics(),
         resident_bytes: resident_bytes(),
     };
     let dom = request
@@ -1303,7 +1281,7 @@ pub(crate) fn viewport_fixed_descendant(
 /// control revealed on hover cannot be reached any other way, and a defect that
 /// only appears on the second entry cannot be reached at all without it.
 pub fn hover_agent_node(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     node_id: u64,
 ) -> Result<(f32, f32), DebugError> {
     let (node_id, position) = resolve_agent_node(document, node_id)?;
@@ -1321,7 +1299,7 @@ pub fn hover_agent_node(
 }
 
 pub fn press_agent_key(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     key: &str,
     code: &str,
 ) -> Result<(), DebugError> {
@@ -1345,7 +1323,7 @@ pub fn press_agent_key(
 }
 
 pub fn click_agent_node(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     node_id: u64,
     count: u8,
 ) -> Result<(f32, f32), DebugError> {
@@ -1353,7 +1331,7 @@ pub fn click_agent_node(
 }
 
 pub fn focus_agent_node(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     node_id: blitz_dom::NodeId,
 ) -> Result<(), DebugError> {
     let focusable = document
@@ -1383,7 +1361,7 @@ pub fn focus_agent_node(
 /// inspector for every element on the page, because that builder names only
 /// text nodes and carries no geometry at all.
 pub fn inspect_document(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     root: Option<u64>,
     max_depth: u32,
     revision: u64,
@@ -1613,7 +1591,7 @@ pub(crate) fn node_is_individually_visible(node: &blitz_dom::Node) -> bool {
 }
 
 pub(crate) fn resolve_agent_node(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     raw_node_id: u64,
 ) -> Result<(blitz_dom::NodeId, (f32, f32)), DebugError> {
     resolve_agent_node_inner(document, raw_node_id, Area::Required)
@@ -1651,7 +1629,7 @@ pub(crate) enum Area {
 /// `visibility: hidden`, `hidden` or `aria-hidden`, and not be disabled. Those
 /// are the reasons a press should not land, and none of them is a box size.
 pub(crate) fn resolve_agent_node_inner(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     raw_node_id: u64,
     area: Area,
 ) -> Result<(blitz_dom::NodeId, (f32, f32)), DebugError> {
@@ -1729,7 +1707,7 @@ pub(crate) fn pointer_event(
 /// document's current viewport scroll. Treating both as the client position
 /// makes hit testing and component pointer math miss after `ScrollIntoView`.
 pub(crate) fn pointer_event_for_document(
-    document: &ScriptDocument,
+    document: &(impl crate::ControlScriptBackend + ?Sized),
     position: (f32, f32),
     button: MouseEventButton,
     buttons: MouseEventButtons,
@@ -1743,7 +1721,7 @@ pub(crate) fn pointer_event_for_document(
 }
 
 pub(crate) fn pointer_coords_for_document(
-    document: &ScriptDocument,
+    document: &(impl crate::ControlScriptBackend + ?Sized),
     position: (f32, f32),
 ) -> PointerCoords {
     let mut coords = pointer_coords(position);
@@ -2141,7 +2119,7 @@ pub(crate) fn diagnostic_layout_row(
 }
 
 pub(crate) fn activate_agent_node(
-    document: &mut ScriptDocument,
+    document: &mut (impl crate::ControlScriptBackend + ?Sized),
     raw_node_id: u64,
     count: u8,
 ) -> Result<(f32, f32), DebugError> {
@@ -2202,6 +2180,7 @@ pub(crate) fn activate_agent_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_document::TestDocument;
     use blitz_dom::{Document, DocumentConfig};
 
     #[test]
@@ -2221,8 +2200,8 @@ mod tests {
     /// a trigger with no padding lays out flat. Written as a style rather than
     /// reproduced by removing fonts, so the test says what it is testing and
     /// does not depend on which faces the machine running it happens to have.
-    fn document() -> ScriptDocument {
-        let mut document = ScriptDocument::from_html(
+    fn document() -> TestDocument {
+        let mut document = TestDocument::from_html(
             r#"<style>
                  button { border: 0; padding: 0; margin: 0; font-size: 0; }
                  #padded { padding: 8px 12px; }
@@ -2235,7 +2214,7 @@ mod tests {
         document
     }
 
-    fn node_id(document: &ScriptDocument, selector: &str) -> u64 {
+    fn node_id(document: &TestDocument, selector: &str) -> u64 {
         document
             .inner()
             .query_selector(selector)
@@ -2283,7 +2262,7 @@ mod tests {
         // The area gate was doing double duty. Deleting it for clicks must not
         // have opened the door to a control the author hid, which is what the
         // visibility gate above it is for.
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             r#"<button id="gone" style="display: none">Open dialog</button>"#,
             DocumentConfig::default(),
         );
@@ -2320,7 +2299,8 @@ mod tests {
 #[cfg(test)]
 mod semantic_tests {
     use super::*;
-    use blitz_dom::DocumentConfig;
+    use crate::test_document::TestDocument;
+    use blitz_dom::{Document, DocumentConfig};
 
     /// One document, reproducing every naming and role defect this module
     /// covers. Kept whole rather than split per test so a fix that repairs one
@@ -2335,7 +2315,7 @@ mod semantic_tests {
 <div role="tooltip">tooltip text</div>"#;
 
     fn tree(html: &str) -> Vec<SemanticNode> {
-        let mut document = ScriptDocument::from_html(html, DocumentConfig::default());
+        let mut document = TestDocument::from_html(html, DocumentConfig::default());
         document.inner_mut().resolve(0.0);
         match inspect_document(&mut document, None, 0, 1) {
             DebugResponse::AgentSnapshot(snapshot) => snapshot.nodes,
@@ -2448,7 +2428,7 @@ mod semantic_tests {
         // failure mode when one is pressed has to be a typed refusal and not a
         // crash inside the control server.
         let mut document =
-            ScriptDocument::from_html("<pre>plain text in a pre</pre>", DocumentConfig::default());
+            TestDocument::from_html("<pre>plain text in a pre</pre>", DocumentConfig::default());
         document.inner_mut().resolve(0.0);
         let DebugResponse::AgentSnapshot(snapshot) = inspect_document(&mut document, None, 0, 1)
         else {
@@ -2722,10 +2702,11 @@ mod semantic_tests {
 #[cfg(test)]
 mod role_projection_tests {
     use super::*;
-    use blitz_dom::DocumentConfig;
+    use crate::test_document::TestDocument;
+    use blitz_dom::{Document, DocumentConfig};
 
     fn role(html: &str) -> String {
-        let mut document = ScriptDocument::from_html(html, DocumentConfig::default());
+        let mut document = TestDocument::from_html(html, DocumentConfig::default());
         document.inner_mut().resolve(0.0);
         let id = document
             .inner()
@@ -2870,17 +2851,33 @@ mod role_projection_tests {
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
+    fn set_result(document: &mut blitz_dom::BaseDocument, value: &str) {
+        let result = document.query_selector("#result").unwrap().unwrap();
+        let mut mutator = document.mutate();
+        mutator.remove_and_drop_all_children(result);
+        let text = mutator.create_text_node(value);
+        mutator.append_children(result, &[text]);
+    }
+
+    fn append_result(document: &mut blitz_dom::BaseDocument, value: &str) {
+        let result = document.query_selector("#result").unwrap().unwrap();
+        let mut text = document.get_node(result).unwrap().text_content();
+        text.push_str(value);
+        set_result(document, &text);
+    }
+
     use crate::SemanticNode;
     use crate::document::{
         SemanticCandidate, diagnostic_layout_row, diagnostic_style_row, dom_chain_is_attached,
         element_attr, layout_chain_is_valid, layout_chain_validities, node_is_visible,
         semantic_name, semantic_role, semantic_selected,
     };
-    use blitz_dom::DocumentConfig;
+    use crate::test_document::TestDocument;
+    use blitz_dom::{Document, DocumentConfig};
 
     #[test]
     fn semantic_visibility_includes_display_none_ancestors() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<main><button id='shown'>Run</button><div style='display:none'><button id='hidden'>Hidden</button></div></main>",
             DocumentConfig::default(),
         );
@@ -2925,7 +2922,7 @@ mod runtime_tests {
 
     #[test]
     fn a_style_element_is_not_part_of_a_name() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<main>\
                <a id='logo' href='/'>\
                  <svg><style>.logo path { fill: red; }</style></svg>\
@@ -2935,9 +2932,7 @@ mod runtime_tests {
              </main>",
             DocumentConfig::default(),
         );
-        // from_html stops at the first script boundary; resume the parser so the
-        // text after the script is in the tree.
-        document.execute_scripts();
+        // HTML parsing includes the text after inert script elements.
         document.inner_mut().resolve(0.0);
         let inner = document.inner();
         let labels = crate::document::LabelIndex::build(&inner);
@@ -2977,7 +2972,7 @@ mod runtime_tests {
     /// spans is still one word, because that is what the page draws.
     #[test]
     fn stacked_lines_are_separated_and_inline_ones_are_not() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<main>\
                <div id='stacked' role='alert'>\
                  <div>This page could not load</div>\
@@ -3041,7 +3036,7 @@ mod runtime_tests {
 
     #[test]
     fn a_field_is_named_by_its_label() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<main>\
                <label for='endpoint'>Endpoint URL</label><input id='endpoint'>\
                <label>Wrapped<input id='wrapped'></label>\
@@ -3101,7 +3096,7 @@ mod runtime_tests {
 
     #[test]
     fn a_live_region_is_named_by_what_it_says() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<main>\
                <p id='refusal' role='alert'>that is not an address</p>\
                <p id='saved' role='status'>Settings saved</p>\
@@ -3139,7 +3134,7 @@ mod runtime_tests {
 
     #[test]
     fn rooted_inspection_returns_only_the_requested_dom_subtree() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<main><section id='left'><button>Left action</button></section><section id='right'><button>Right action</button></section></main>",
             DocumentConfig::default(),
         );
@@ -3168,7 +3163,7 @@ mod runtime_tests {
 
     #[test]
     fn semantic_geometry_rejects_a_detached_layout_ancestor() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<main><button id='target'>Run</button></main>",
             DocumentConfig::default(),
         );
@@ -3206,7 +3201,7 @@ mod runtime_tests {
 
     #[test]
     fn semantic_geometry_rejects_a_retained_dom_subtree() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<main><section id='removed'><button id='target'>Run</button></section></main>",
             DocumentConfig::default(),
         );
@@ -3232,7 +3227,7 @@ mod runtime_tests {
 
     #[test]
     fn semantic_selection_includes_native_and_aria_states() {
-        let document = ScriptDocument::from_html(
+        let document = TestDocument::from_html(
             r#"
             <button id="pressed" aria-pressed="true">Pressed</button>
             <div id="checked" role="radio" aria-checked="true">Checked</div>
@@ -3279,20 +3274,19 @@ mod runtime_tests {
 
     #[test]
     fn node_activation_reaches_an_offscreen_mousedown_handler() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             r#"
             <button id="target" style="position:absolute;left:-900px;width:80px;height:30px">Run</button>
             <output id="result"></output>
-            <script>
-              const target = document.getElementById("target");
-              const result = document.getElementById("result");
-              target.addEventListener("mousedown", () => result.textContent += "down ");
-              target.addEventListener("click", () => result.textContent += "click");
-            </script>
             "#,
             DocumentConfig::default(),
         );
-        document.execute_scripts();
+        document.on("#target", "mousedown", |doc, _, _| {
+            append_result(doc, "down ");
+        });
+        document.on("#target", "click", |doc, _, _| {
+            append_result(doc, "click");
+        });
         document.inner_mut().resolve(0.0);
         let (target, result) = {
             let inner = document.inner();
@@ -3319,26 +3313,25 @@ mod runtime_tests {
 
     #[test]
     fn node_activation_bubbles_to_delegated_handlers() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             r#"
             <main id="root">
               <button id="target" style="width:80px;height:30px">Run</button>
               <output id="result"></output>
             </main>
-            <script>
-              const root = document.getElementById("root");
-              const result = document.getElementById("result");
-              root.addEventListener("mousedown", event => {
-                if (event.target.id === "target") result.textContent += "down ";
-              });
-              root.addEventListener("click", event => {
-                if (event.target.id === "target") result.textContent += "click";
-              });
-            </script>
             "#,
             DocumentConfig::default(),
         );
-        document.execute_scripts();
+        document.on("#root", "mousedown", |doc, event, _| {
+            if doc.query_selector("#target").unwrap() == Some(event.target) {
+                append_result(doc, "down ");
+            }
+        });
+        document.on("#root", "click", |doc, event, _| {
+            if doc.query_selector("#target").unwrap() == Some(event.target) {
+                append_result(doc, "click");
+            }
+        });
         document.inner_mut().resolve(0.0);
         let (target, result) = {
             let inner = document.inner();
@@ -3358,28 +3351,25 @@ mod runtime_tests {
 
     #[test]
     fn node_activation_reaches_solid_style_document_delegation() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             r#"
             <main id="root">
               <button id="target" style="width:80px;height:30px">Run</button>
               <output id="result"></output>
             </main>
-            <script>
-              const target = document.getElementById("target");
-              const result = document.getElementById("result");
-              target.$$click = () => result.textContent = "delegated";
-              document.addEventListener("click", event => {
-                let node = event.target;
-                while (node) {
-                  if (node.$$click) node.$$click(event);
-                  node = node.parentNode;
-                }
-              });
-            </script>
             "#,
             DocumentConfig::default(),
         );
-        document.execute_scripts();
+        let target = document.inner().query_selector("#target").unwrap().unwrap();
+        document.on("html", "click", move |doc, event, _| {
+            let mut node = Some(event.target);
+            while let Some(id) = node {
+                if id == target {
+                    set_result(doc, "delegated");
+                }
+                node = doc.get_node(id).and_then(|node| node.parent);
+            }
+        });
         document.inner_mut().resolve(0.0);
         let (target, result) = {
             let inner = document.inner();
@@ -3399,7 +3389,7 @@ mod runtime_tests {
 
     #[test]
     fn node_activation_applies_the_native_focus_default() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             r#"<main><div id="slider" role="slider" tabindex="0" style="width:80px;height:30px">Value</div></main>"#,
             DocumentConfig::default(),
         );
@@ -3413,21 +3403,18 @@ mod runtime_tests {
 
     #[test]
     fn semantic_focus_does_not_activate_the_target() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             r#"
             <main>
               <button id="target" style="width:80px;height:30px">Start fork</button>
               <output id="result"></output>
             </main>
-            <script>
-              document.getElementById("target").addEventListener("click", () => {
-                document.getElementById("result").textContent = "activated";
-              });
-            </script>
             "#,
             DocumentConfig::default(),
         );
-        document.execute_scripts();
+        document.on("#target", "click", |doc, _, _| {
+            set_result(doc, "activated");
+        });
         document.inner_mut().resolve(0.0);
         let (target, result) = {
             let inner = document.inner();
@@ -3460,21 +3447,20 @@ mod runtime_tests {
     /// the property was always meant to hold.
     #[test]
     fn setting_a_node_value_replaces_text_and_dispatches_input() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             r#"
             <main>
               <input id="field" value="old" style="width:80px;height:30px">
               <output id="result"></output>
             </main>
-            <script>
-              const field = document.getElementById("field");
-              const result = document.getElementById("result");
-              field.addEventListener("input", event => result.textContent = event.target.value);
-            </script>
             "#,
             DocumentConfig::default(),
         );
-        document.execute_scripts();
+        document.on("#field", "input", |doc, event, _| {
+            if let blitz_traits::events::DomEventData::Input(input) = &event.data {
+                set_result(doc, &input.value);
+            }
+        });
         document.inner_mut().resolve(0.0);
         let (field, result) = {
             let inner = document.inner();
@@ -3503,19 +3489,16 @@ mod runtime_tests {
 
     #[test]
     fn node_double_click_is_one_runtime_action() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             r#"
             <button id="target" style="width:80px;height:30px">Open row</button>
             <output id="result"></output>
-            <script>
-              document.getElementById("target").addEventListener("dblclick", () => {
-                document.getElementById("result").textContent = "double";
-              });
-            </script>
             "#,
             DocumentConfig::default(),
         );
-        document.execute_scripts();
+        document.on("#target", "dblclick", |doc, _, _| {
+            set_result(doc, "double");
+        });
         let (target, result) = {
             let inner = document.inner();
             (
@@ -3537,7 +3520,7 @@ mod runtime_tests {
     fn repeated_live_captures_reuse_one_surface_and_keep_identical_pixels() {
         use blitz_traits::shell::{ColorScheme, Viewport};
 
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<body style='margin:0;background:transparent'><main style='width:320px;height:200px;background:rgba(24,32,42,.55);color:#f4f5f7'>\
                <h1>Capture cache</h1><button>Ready</button>\
              </main></body>",
@@ -3573,7 +3556,7 @@ mod runtime_tests {
         use base64::Engine as _;
         use blitz_traits::shell::{ColorScheme, Viewport};
 
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<main style='width:320px;height:200px;background:#18202a;padding:24px'>\
                <button id='target' style='width:96px;height:40px;background:#d24db8;color:#111'>Ready</button>\
              </main>",
@@ -3633,7 +3616,7 @@ mod runtime_tests {
     fn fixed_node_capture_uses_viewport_coordinates_after_document_scroll() {
         use blitz_traits::shell::{ColorScheme, Viewport};
 
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<body style='margin:0;height:1600px'>\
                <textarea id='target' style='position:fixed;left:24px;top:32px;width:240px;height:96px;background:#18202a'>theme css</textarea>\
              </body>",
@@ -3669,7 +3652,7 @@ mod runtime_tests {
     #[cfg(feature = "capture")]
     #[test]
     fn diagnostic_layout_reports_scroll_state_without_script_evaluation() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<section id='scroller' style='height:100px;overflow-y:auto'><div style='height:400px'>tail</div></section>",
             DocumentConfig::default(),
         );
@@ -3722,7 +3705,7 @@ mod runtime_tests {
     #[cfg(feature = "capture")]
     #[test]
     fn diagnostic_style_reports_resolved_font_and_border() {
-        let mut document = ScriptDocument::from_html(
+        let mut document = TestDocument::from_html(
             "<main id='target' style='font-size:1.4375rem;border:2px solid #123456'>Readable</main>",
             DocumentConfig::default(),
         );
@@ -3771,8 +3754,7 @@ mod runtime_tests {
 
     #[test]
     fn agent_action_settlement_drains_until_the_document_is_idle() {
-        let mut document =
-            ScriptDocument::from_html("<main>Ready</main>", DocumentConfig::default());
+        let mut document = TestDocument::from_html("<main>Ready</main>", DocumentConfig::default());
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = std::sync::Arc::clone(&polls);
         document.set_poll_hook(move |_, _| {
@@ -3786,8 +3768,7 @@ mod runtime_tests {
 
     #[test]
     fn agent_action_settlement_never_acks_a_still_runnable_document() {
-        let mut document =
-            ScriptDocument::from_html("<main>Busy</main>", DocumentConfig::default());
+        let mut document = TestDocument::from_html("<main>Busy</main>", DocumentConfig::default());
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = std::sync::Arc::clone(&polls);
         document.set_poll_hook(move |_, _| {

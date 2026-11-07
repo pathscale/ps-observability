@@ -24,6 +24,7 @@
 //! explaining which fields the runtime would and would not accept.
 
 use std::collections::VecDeque;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
@@ -52,6 +53,7 @@ const MAX_QUEUED_EVENTS: usize = 256;
 #[derive(Debug)]
 pub struct Descriptor {
     pub path: PathBuf,
+    validated_socket_path: PathBuf,
     pub descriptor: DebugDescriptor,
     /// The descriptor verbatim, for the dump modes. Reprinting a re-serialized
     /// struct would hide any field this build of the tool does not know about.
@@ -81,12 +83,7 @@ fn client_reactor() -> &'static nagoya::reactor::Handle {
 
 impl Descriptor {
     pub fn socket_path(&self) -> PathBuf {
-        match self.descriptor.address.strip_prefix("unix://") {
-            Some(path) => PathBuf::from(path),
-            // The Python fell back to the descriptor path with the extension
-            // swapped, and the server does name the socket that way.
-            None => self.path.with_extension("sock"),
-        }
+        self.validated_socket_path.clone()
     }
 
     /// Trap 8 in docs/performance.md: an unpinned descriptor directory keeps
@@ -95,7 +92,14 @@ impl Descriptor {
     /// control socket is the service, and a successful connection is the only
     /// liveness check that proves the descriptor can actually be used.
     fn is_reachable(&self) -> bool {
-        std::os::unix::net::UnixStream::connect(self.socket_path()).is_ok()
+        let Some(directory) = self.validated_socket_path.parent() else {
+            return false;
+        };
+        let address = format!("unix://{}", self.validated_socket_path.display());
+        let Ok(socket) = crate::control_directory::validate_socket(directory, &address) else {
+            return false;
+        };
+        std::os::unix::net::UnixStream::connect(socket).is_ok()
     }
 
     pub fn warn_if_stale(&self) {
@@ -148,16 +152,24 @@ pub fn discover(explicit: Option<&str>) -> Result<Descriptor> {
         return Ok(descriptor);
     }
 
-    let root = PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()))
-        .join("tauri-blitz-agent");
-    let mut found: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&root)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .filter_map(|path| Some((path.metadata().ok()?.modified().ok()?, path)))
-        .collect();
+    let root = crate::control_directory::default_directory();
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> =
+        if crate::control_directory::validate_directory(&root).is_ok() {
+            std::fs::read_dir(&root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .filter_map(|path| {
+                    let file = crate::control_directory::open_descriptor(&path).ok()?;
+                    let modified = file.metadata().ok()?.modified().ok()?;
+                    Some((modified, path))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
     found.sort();
 
     // Newest *reachable* instance, not simply newest.
@@ -188,7 +200,10 @@ pub fn discover(explicit: Option<&str>) -> Result<Descriptor> {
 }
 
 fn read_descriptor(path: &Path) -> Result<Descriptor> {
-    let text = std::fs::read_to_string(path)
+    let mut file = crate::control_directory::open_descriptor(path)
+        .with_context(|| format!("opening private descriptor {}", path.display()))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
         .with_context(|| format!("reading descriptor {}", path.display()))?;
     let raw: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parsing descriptor {}", path.display()))?;
@@ -205,8 +220,18 @@ fn read_descriptor(path: &Path) -> Result<Descriptor> {
             descriptor.protocol_version
         );
     }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = crate::control_directory::validate_directory(parent)
+        .with_context(|| format!("validating descriptor directory {}", parent.display()))?;
+    let validated_socket_path =
+        crate::control_directory::validate_socket(&directory, &descriptor.address)
+            .with_context(|| format!("validating descriptor socket {}", path.display()))?;
     Ok(Descriptor {
         path: path.to_path_buf(),
+        validated_socket_path,
         descriptor,
         raw,
         verified_reachable: false,
@@ -1048,14 +1073,17 @@ mod tests {
 
     #[test]
     fn descriptor_protocol_mismatch_is_rejected_before_connecting() {
-        let path = std::env::temp_dir().join(format!(
-            "ps-qa-descriptor-version-{}-{}.json",
+        let directory = std::env::temp_dir().join(format!(
+            "ps-qa-descriptor-version-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock is after the epoch")
                 .as_nanos()
         ));
+        crate::guarded_writer::create_private_dir(&directory)
+            .expect("scratch directory is created");
+        let path = directory.join("fixture.json");
         crate::guarded_writer::write_file(
             &path,
             serde_json::json!({
@@ -1076,5 +1104,6 @@ mod tests {
             "unexpected error: {error}"
         );
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir(directory);
     }
 }
