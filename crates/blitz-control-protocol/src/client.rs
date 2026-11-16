@@ -948,13 +948,25 @@ mod tests {
     const PIN_FIXTURE_ROOT_ENV: &str = "PS_OBSERVABILITY_PIN_FIXTURE_ROOT";
     const MACOS_SUN_PATH_CAPACITY: usize = 104;
 
+    fn default_fixture_root() -> PathBuf {
+        let base = if cfg!(target_os = "macos") {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let directory = base.join(format!("pso-{}", rustix::process::geteuid().as_raw()));
+        match crate::guarded_writer::create_private_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create default fixture root {}: {error}", directory.display()),
+        }
+        directory
+    }
+
     fn fixture_root() -> PathBuf {
-        let configured = std::env::var_os(PIN_FIXTURE_ROOT_ENV).unwrap_or_else(|| {
-            panic!(
-                "{PIN_FIXTURE_ROOT_ENV} is required; set it to an existing absolute directory owned by the current user and writable by that user"
-            )
-        });
-        let configured = PathBuf::from(configured);
+        let configured = std::env::var_os(PIN_FIXTURE_ROOT_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(default_fixture_root);
         assert!(configured.is_absolute(), "{PIN_FIXTURE_ROOT_ENV} must be an absolute path: {}", configured.display());
         let before = std::fs::symlink_metadata(&configured).unwrap_or_else(|error| {
             panic!("{PIN_FIXTURE_ROOT_ENV} must name an existing directory ({}): {error}", configured.display())

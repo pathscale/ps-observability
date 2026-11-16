@@ -109,6 +109,8 @@ pub fn run(
                 .arg(host)
                 .arg("--page")
                 .arg(page)
+                .arg("--engine")
+                .arg(engine)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
