@@ -32,11 +32,14 @@ fails before a client sends an action instead of guessing across versions.
 ## Pin discovery tests
 
 The pin discovery tests create private, unique child directories and remove
-only those children when each fixture is dropped. Before running them, provide
-`PS_OBSERVABILITY_PIN_FIXTURE_ROOT` as an absolute path to an existing
-directory owned by the current user and writable by that user. The tests do not
-create or clean the configured root itself. For example, after preparing an
-appropriate directory at the indicated generic path:
+only those children when each fixture is dropped. By default they place those
+children in a private `pso-<euid>` directory, under `/tmp` on macOS and under
+the system temporary directory elsewhere, and create that directory if it is
+missing. To use another root instead, set the optional override
+`PS_OBSERVABILITY_PIN_FIXTURE_ROOT` to an absolute path to an existing directory
+owned by the current user and writable by that user. The tests do not create
+or clean a configured root. For example, after preparing an appropriate
+directory at the indicated generic path:
 
 ```sh
 PS_OBSERVABILITY_PIN_FIXTURE_ROOT=/path/to/preexisting/writable/owned/directory cargo test -p blitz-control-protocol pinned_discovery -- --test-threads=1

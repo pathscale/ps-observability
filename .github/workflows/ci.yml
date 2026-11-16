@@ -43,6 +43,8 @@ jobs:
       # and `capture` because it needs the renderer, and a job that never
       # enables them would leave the semantic tree, the capture surface and the
       # in-process transport untested here.
+      - name: Clippy on the core, and both transports over it
+        run: cargo clippy -p blitz-control-protocol --all-features --all-targets -- -D warnings
       - name: The core, and both transports over it
         run: cargo test -p blitz-control-protocol --all-features
       - name: Keep the driver renderer-free

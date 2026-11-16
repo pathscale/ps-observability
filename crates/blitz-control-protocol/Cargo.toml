@@ -59,8 +59,8 @@ capture = [
     "dep:blitz-shell",
     "dep:blitz-debug-control",
     # Where the frame timings and the sampling guard are: `blitz-shell` keeps
-    # both behind this feature, and it forwards to `blitz-script/debug-control`
-    # for the script half of the same capture.
+    # both behind this feature. The script half of the same capture comes from
+    # the host's `ControlScriptBackend::script_metrics`, not from a script crate.
     "blitz-shell/debug-control",
 ]
 server = ["dep:nagoya", "dep:futures", "dep:rustix", "dep:libc"]
