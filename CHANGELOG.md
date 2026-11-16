@@ -1,5 +1,18 @@
 # Changelog
 
+## ps-qa 0.9.9
+
+- Run hosted and native-page hosts under a `--supervise-host` / `--supervise-native-host` supervisor that leads its own process group and stops the host when the runner's stdin pipe closes.
+- Require a private, effective-uid-owned control directory for every hosted run, and accept only announced descriptors contained in it.
+- Restrict `native-page --engine` to `ekojit`, bound the native host to 60 seconds, and report per-entry native counts and text in the outcome.
+
+## blitz-control-protocol 0.8.0
+
+- Breaking: drop the `ps-blitz-script` dependency. The `engine` and `capture` document functions (`DocumentControl`, `snapshot_document`, `capture_document`, `inspect_document`, `settle` and the node actions) now take any `ControlScriptBackend`, which hosts implement on their document owner. Script metrics come from `ControlScriptBackend::script_metrics`.
+- Breaking: require the ps-blitz 0.7 crates. `ps-blitz-dom`, `ps-blitz-traits`, `ps-blitz-paint` and `ps-blitz-shell` move from `^0.6.2` to `^0.7.0`, and hosts must move to the same line because the public API takes `blitz_dom` types.
+- Create the server control directory as a private directory (per effective uid outside macOS), validate descriptors and sockets for ownership, permissions and containment before use, and reap dead instances by pid without spawning `ps`.
+- Detect hex and unaligned base64 forms of registered secrets in the guarded writer.
+
 ## ps-qa 0.9.6
 
 - Make resource caps explicit application parameters, bound reads and latency allocations, and drain child output through the shared nagoya executor.
